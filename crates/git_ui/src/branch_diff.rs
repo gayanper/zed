@@ -38,7 +38,7 @@ use workspace::{
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
-use zed_actions::agent::ReviewBranchDiff;
+use zed_actions::agent::{ReviewBranchDiff, SendReviewComments};
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
@@ -388,8 +388,7 @@ impl BranchDiff {
         });
     }
 
-    fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
-        let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
+    fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {        let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return;
         };
         let Some(repo) = self.repo(cx) else {
@@ -429,6 +428,27 @@ impl BranchDiff {
                 }
             })
             .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let comments_text = self.diff.update(cx, |diff, cx| {
+            diff.take_formatted_review_comments_for_agent(cx)
+        });
+        if comments_text.is_empty() {
+            return;
+        }
+        window.dispatch_action(
+            SendReviewComments {
+                comments_text: comments_text.into(),
+            }
+            .boxed_clone(),
+            cx,
+        );
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -636,6 +656,7 @@ impl Render for BranchDiff {
         div()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
+            .on_action(cx.listener(Self::send_review_to_agent))
             .child(self.diff.clone())
     }
 }

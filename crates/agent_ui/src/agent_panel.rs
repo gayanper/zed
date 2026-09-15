@@ -27,7 +27,7 @@ use zed_actions::{
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
+        ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent, SendReviewComments,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -575,6 +575,99 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
+                            }),
+                            true,
+                            AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .register_action(|workspace, action: &SendReviewComments, window, cx| {
+                    let comments_text = action.comments_text.to_string();
+                    if comments_text.trim().is_empty() {
+                        return;
+                    }
+                    let message_text =
+                        format!("Please address these review comments:\n{comments_text}");
+
+                    // Focus wins: a focused terminal (center, dock, or agent-panel
+                    // surface) receives the text via bracketed paste. Insert-only.
+                    if let Some(terminal_view) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<TerminalView>(cx))
+                        .filter(|view| view.focus_handle(cx).is_focused(window))
+                    {
+                        terminal_view.update(cx, |view, cx| {
+                            view.terminal().update(cx, |terminal, _| {
+                                terminal.paste(&message_text);
+                            });
+                            window.focus(&view.focus_handle(cx), cx);
+                        });
+                        return;
+                    }
+                    if workspace
+                        .panel::<TerminalPanel>(cx)
+                        .is_some_and(|panel| panel.focus_handle(cx).contains_focused(window, cx))
+                        && let Some(terminal_view) = workspace
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<TerminalView>(cx))
+                    {
+                        terminal_view.update(cx, |view, cx| {
+                            view.terminal().update(cx, |terminal, _| {
+                                terminal.paste(&message_text);
+                            });
+                            window.focus(&view.focus_handle(cx), cx);
+                        });
+                        return;
+                    }
+
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+                    if panel
+                        .read(cx)
+                        .visible_terminal_view()
+                        .is_some_and(|view| view.focus_handle(cx).is_focused(window))
+                        && let Some(terminal_id) = panel.read(cx).active_terminal_id()
+                        && let Some(agent_terminal) =
+                            panel.read(cx).terminals.get(&terminal_id)
+                    {
+                        let view = agent_terminal.view.clone();
+                        view.update(cx, |view, cx| {
+                            view.terminal().update(cx, |terminal, _| {
+                                terminal.paste(&message_text);
+                            });
+                            window.focus(&view.focus_handle(cx), cx);
+                        });
+                        return;
+                    }
+
+                    // Zed fallback: insert into the active thread's editor without submitting.
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    panel.update(cx, |panel, cx| {
+                        if let Some(conversation_view) = panel.active_conversation_view()
+                            && let Some(active_thread) =
+                                conversation_view.read(cx).active_thread().cloned()
+                        {
+                            active_thread.update(cx, |thread, cx| {
+                                thread.active_editor(cx).update(cx, |editor, cx| {
+                                    editor.insert_text(&message_text, window, cx);
+                                });
+                            });
+                            return;
+                        }
+                        // No active thread: open one with the comments pre-filled, not submitted.
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                    message_text,
+                                ))],
+                                auto_submit: false,
                             }),
                             true,
                             AgentThreadSource::GitPanel,

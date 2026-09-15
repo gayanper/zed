@@ -218,6 +218,27 @@ impl ProjectDiff {
         self.diff.update(cx, |diff, cx| diff.autoscroll(cx));
     }
 
+    fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let comments_text = self.diff.update(cx, |diff, cx| {
+            diff.take_formatted_review_comments_for_agent(cx)
+        });
+        if comments_text.is_empty() {
+            return;
+        }
+        window.dispatch_action(
+            zed_actions::agent::SendReviewComments {
+                comments_text: comments_text.into(),
+            }
+            .boxed_clone(),
+            cx,
+        );
+    }
+
     fn new(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
@@ -583,8 +604,11 @@ impl Item for ProjectDiff {
 }
 
 impl Render for ProjectDiff {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.diff.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(cx.listener(Self::send_review_to_agent))
+            .child(self.diff.clone())
     }
 }
 

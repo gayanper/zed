@@ -1565,10 +1565,16 @@ import { AiPaneTabContext } from 'context';
         cx.run_until_parked();
     }
 
-    // Test 1: Diff view with feature flag enabled
-    // Enable the feature flag
+    // Test 1: Diff view with review comments enabled
+    // Enable the setting
     cx.update(|cx| {
-        cx.update_flags(true, vec!["diff-review".to_string()]);
+        agent_settings::AgentSettings::override_global(
+            agent_settings::AgentSettings {
+                enable_diff_review_comments: true,
+                ..agent_settings::AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
     });
 
     let workspace_window: WindowHandle<Workspace> = cx
@@ -1619,10 +1625,16 @@ import { AiPaneTabContext } from 'context';
         update_baseline,
     )?;
 
-    // Test 2: Diff view with feature flag disabled
-    // Disable the feature flag
+    // Test 2: Diff view with review comments disabled
+    // Disable the setting
     cx.update(|cx| {
-        cx.update_flags(false, vec![]);
+        agent_settings::AgentSettings::override_global(
+            agent_settings::AgentSettings {
+                enable_diff_review_comments: false,
+                ..agent_settings::AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
     });
 
     // Refresh window
@@ -1643,10 +1655,16 @@ import { AiPaneTabContext } from 'context';
         update_baseline,
     )?;
 
-    // Test 3: Regular editor with flag enabled (should NOT show button)
-    // Re-enable the feature flag
+    // Test 3: Regular editor with setting enabled (should NOT show button)
+    // Re-enable the setting
     cx.update(|cx| {
-        cx.update_flags(true, vec!["diff-review".to_string()]);
+        agent_settings::AgentSettings::override_global(
+            agent_settings::AgentSettings {
+                enable_diff_review_comments: true,
+                ..agent_settings::AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
     });
 
     // Create a new window with just a regular editor

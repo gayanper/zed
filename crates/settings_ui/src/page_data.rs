@@ -9107,6 +9107,25 @@ fn ai_page(cx: &App) -> SettingsPage {
                 metadata: None,
                 files: USER,
             }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Enable Diff Review Comments",
+                description: "Whether to show the review-comment button in diff gutters, allowing comments with line ranges to be collected and sent to the active agent.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.enable_diff_review_comments"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.enable_diff_review_comments.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .enable_diff_review_comments = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
         ]);
 
         items.extend([

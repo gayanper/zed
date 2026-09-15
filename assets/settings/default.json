@@ -1385,6 +1385,11 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to show the review-comment button in diff gutters,
+    // allowing comments with line ranges to be collected and sent to the active agent.
+    //
+    // Default: true
+    "enable_diff_review_comments": true,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

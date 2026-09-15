@@ -627,6 +627,17 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// Inserts pre-formatted diff review comments (one `file: line-range: body` line
+    /// per comment) into the active agent: focused terminal wins, otherwise the
+    /// active Zed thread. Insert-only, never auto-submits.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendReviewComments {
+        /// Pre-formatted review comments, one line per comment.
+        pub comments_text: SharedString,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

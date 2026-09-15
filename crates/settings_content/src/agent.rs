@@ -369,6 +369,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether to show the review-comment button in diff gutters,
+    /// allowing comments with line ranges to be collected and sent to the active agent.
+    ///
+    /// Default: true
+    pub enable_diff_review_comments: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

@@ -744,13 +744,114 @@ impl Editor {
         }
         cx.notify();
     }
+}
 
+/// A single review comment with its file and line range, ready to send to an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommentForAgent {
+    pub file_path: String,
+    pub line_label: String,
+    pub body: String,
+}
+
+impl Editor {
     /// Returns the total count of stored review comments across all hunks.
-    pub(super) fn total_review_comment_count(&self) -> usize {
+    pub fn total_review_comment_count(&self) -> usize {
         self.stored_review_comments
             .iter()
             .map(|(_, v)| v.len())
             .sum()
+    }
+
+    /// Collects all stored review comments with resolved file paths and 1-based line ranges.
+    /// Non-destructive; use `take_formatted_review_comments_for_agent` to consume after sending.
+    pub fn review_comments_for_agent(&self, cx: &App) -> Vec<ReviewCommentForAgent> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut comments = Vec::new();
+        for (hunk_key, stored) in &self.stored_review_comments {
+            let file_path = hunk_key.file_path.as_unix_str().to_string();
+            let file_path = if file_path.is_empty() {
+                "(unknown file)".to_string()
+            } else {
+                file_path
+            };
+            for stored_comment in stored {
+                let start_point = stored_comment.range.start.to_point(&snapshot);
+                let end_point = stored_comment.range.end.to_point(&snapshot);
+                let buffer_ranges =
+                    snapshot.range_to_buffer_ranges(start_point..end_point);
+                let mut ranges: Vec<(u32, u32)> = buffer_ranges
+                    .iter()
+                    .map(|(buffer_snapshot, range, _)| {
+                        let start = buffer_snapshot.offset_to_point(range.start.0).row;
+                        let end = buffer_snapshot.offset_to_point(range.end.0).row;
+                        (start, end)
+                    })
+                    .collect();
+                if ranges.is_empty() {
+                    // Fall back to multibuffer rows when no excerpt maps back.
+                    ranges.push((start_point.row, end_point.row));
+                }
+                let line_label = ranges
+                    .iter()
+                    .map(|(start, end)| {
+                        if start == end {
+                            format!("Line {}", start + 1)
+                        } else {
+                            format!("Lines {}-{}", start + 1, end + 1)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ⋯ ");
+                let body = stored_comment
+                    .comment
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if body.is_empty() {
+                    continue;
+                }
+                comments.push(ReviewCommentForAgent {
+                    file_path: file_path.clone(),
+                    line_label,
+                    body,
+                });
+            }
+        }
+        comments
+    }
+
+    /// Formats all stored comments as one `file: line-range: body` line per comment.
+    pub fn formatted_review_comments_for_agent(&self, cx: &App) -> String {
+        self.review_comments_for_agent(cx)
+            .iter()
+            .map(|comment| {
+                format!(
+                    "{}:{}: {}",
+                    comment.file_path, comment.line_label, comment.body
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Formats all stored comments and clears storage (dismissing overlays).
+    /// Call after successfully handing the text to the active agent.
+    pub fn take_formatted_review_comments_for_agent(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let text = self.formatted_review_comments_for_agent(cx);
+        if !text.is_empty() {
+            self.dismiss_all_diff_review_overlays(cx);
+            self.stored_review_comments.clear();
+            self.next_review_comment_id = 0;
+            cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+            cx.notify();
+        }
+        text
     }
 
     /// Adds a new review comment to a specific hunk.

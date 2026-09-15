@@ -27,18 +27,6 @@ impl FeatureFlag for AcpBetaFeatureFlag {
 }
 register_feature_flag!(AcpBetaFeatureFlag);
 
-pub struct DiffReviewFeatureFlag;
-
-impl FeatureFlag for DiffReviewFeatureFlag {
-    const NAME: &'static str = "diff-review";
-    type Value = PresenceFlag;
-
-    fn enabled_for_staff() -> bool {
-        false
-    }
-}
-register_feature_flag!(DiffReviewFeatureFlag);
-
 /// Gates the `create_thread` and `list_agents_and_models` tools, which let
 /// the agent spawn independent sibling threads that show up in the agent
 /// panel sidebar.
