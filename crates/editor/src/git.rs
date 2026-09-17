@@ -1556,6 +1556,9 @@ impl Editor {
                     window.focus(&focus_handle, cx);
 
                     entry.insert(inline_editor);
+
+                    // Re-render the block so the inline editor becomes visible.
+                    self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
                 }
             }
         }
@@ -1567,7 +1570,7 @@ impl Editor {
     pub(super) fn confirm_edit_review_comment(
         &mut self,
         comment_id: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Get the new text from the inline editor
@@ -1602,11 +1605,11 @@ impl Editor {
         }
 
         // Remove the inline editor and its subscription
-        if let Some(hunk_key) = hunk_key {
+        if let Some(hunk_key) = &hunk_key {
             if let Some(overlay) = self
                 .diff_review_overlays
                 .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
             {
                 overlay.inline_edit_editors.remove(&comment_id);
                 overlay.inline_edit_subscriptions.remove(&comment_id);
@@ -1615,13 +1618,18 @@ impl Editor {
 
         // Clear editing state
         self.set_comment_editing(comment_id, false, cx);
+
+        // Re-render the block so the row returns to display mode.
+        if let Some(hunk_key) = hunk_key {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
     }
 
     /// Cancels an inline edit of a review comment.
     pub(super) fn cancel_edit_review_comment(
         &mut self,
         comment_id: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Find which hunk this comment belongs to
@@ -1637,12 +1645,12 @@ impl Editor {
             });
 
         // Remove the inline editor and its subscription
-        if let Some(hunk_key) = hunk_key {
+        if let Some(hunk_key) = &hunk_key {
             let snapshot = self.buffer.read(cx).snapshot(cx);
             if let Some(overlay) = self
                 .diff_review_overlays
                 .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
             {
                 overlay.inline_edit_editors.remove(&comment_id);
                 overlay.inline_edit_subscriptions.remove(&comment_id);
@@ -1651,6 +1659,11 @@ impl Editor {
 
         // Clear editing state
         self.set_comment_editing(comment_id, false, cx);
+
+        // Re-render the block so the row returns to display mode.
+        if let Some(hunk_key) = hunk_key {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
     }
 
     /// Action handler for ConfirmEditReviewComment.
@@ -2894,6 +2907,7 @@ impl Editor {
                     comments,
                     comments_expanded,
                     inline_editors,
+                    editor_handle,
                     user_avatar_uri,
                     avatar_size,
                     action_icon_size,
@@ -2907,6 +2921,7 @@ impl Editor {
         comments: Vec<StoredReviewComment>,
         expanded: bool,
         inline_editors: HashMap<usize, Entity<Editor>>,
+        editor_handle: &WeakEntity<Editor>,
         user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
@@ -2961,6 +2976,7 @@ impl Editor {
                     Self::render_comment_row(
                         comment,
                         inline_editor,
+                        editor_handle,
                         user_avatar_uri.clone(),
                         avatar_size,
                         action_icon_size,
@@ -2973,6 +2989,7 @@ impl Editor {
     fn render_comment_row(
         comment: StoredReviewComment,
         inline_editor: Option<Entity<Editor>>,
+        editor_handle: &WeakEntity<Editor>,
         user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
@@ -3067,8 +3084,68 @@ impl Editor {
                     )
                     .into_any_element()
             } else {
-                // Display mode: no action buttons for now (edit/delete not yet implemented)
-                gpui::Empty.into_any_element()
+                // Display mode: edit and delete buttons for the stored comment.
+                // Wired directly to the parent editor (like the Add/Close buttons):
+                // global dispatch misses the parent handler when focus sits in a
+                // prompt or inline editor instead of the parent chain.
+                let editor_handle_for_edit = editor_handle.clone();
+                let editor_handle_for_delete = editor_handle.clone();
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-edit-{comment_id}"),
+                            IconName::Pencil,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Edit"))
+                        .on_click(move |_, window, cx| {
+                            if let Some(editor) = editor_handle_for_edit.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.edit_review_comment(
+                                        &crate::actions::EditReviewComment { id: comment_id },
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                window.dispatch_action(
+                                    Box::new(crate::actions::EditReviewComment { id: comment_id }),
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-delete-{comment_id}"),
+                            IconName::Trash,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Delete"))
+                        .on_click(move |_, window, cx| {
+                            if let Some(editor) = editor_handle_for_delete.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.delete_review_comment(
+                                        &crate::actions::DeleteReviewComment { id: comment_id },
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                window.dispatch_action(
+                                    Box::new(crate::actions::DeleteReviewComment {
+                                        id: comment_id,
+                                    }),
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .into_any_element()
             })
     }
 

@@ -46165,6 +46165,201 @@ fn test_diff_review_comment_leaves_gutter_indication_after_close(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn test_diff_review_edit_comment_via_action(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    // Add a comment, then move focus away to simulate the state when the
+    // row's Edit button is clicked.
+    let comment_id = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.insert("Original text", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+            window.focus(&editor.focus_handle(cx), cx);
+            editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .map(|comment| comment.id)
+                .next()
+                .unwrap()
+        })
+        .unwrap();
+
+    // Dispatch the action the row's Edit button sends.
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.edit_review_comment(&EditReviewComment { id: comment_id }, window, cx);
+        })
+        .unwrap();
+
+    // Retype in the inline editor and confirm, as the row's Confirm button does.
+    editor
+        .update(cx, |editor, window, cx| {
+            let inline_editor = editor
+                .diff_review_overlays
+                .iter()
+                .filter_map(|overlay| overlay.inline_edit_editors.get(&comment_id))
+                .cloned()
+                .next()
+                .expect("edit action must open an inline editor for the comment");
+            inline_editor.update(cx, |inline_editor, cx| {
+                inline_editor.clear(window, cx);
+                inline_editor.insert("Edited text", window, cx);
+            });
+            editor.confirm_edit_review_comment_action(
+                &ConfirmEditReviewComment { id: comment_id },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            let comments: Vec<_> = editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .collect();
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].comment, "Edited text");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_delete_comment_via_action(cx: &mut TestAppContext) {
+    use std::any::TypeId;
+
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let marker = TypeId::of::<super::git::ReviewCommentGutterMarker>();
+
+    let (first_id, second_id) = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            for text in ["First", "Second"] {
+                if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                    prompt_editor.update(cx, |pe, cx| {
+                        pe.insert(text, window, cx);
+                    });
+                }
+                editor.submit_diff_review_comment(window, cx);
+            }
+            window.focus(&editor.focus_handle(cx), cx);
+            let mut ids = editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .map(|comment| comment.id);
+            (ids.next().unwrap(), ids.next().unwrap())
+        })
+        .unwrap();
+
+    // Dispatch the action the row's Delete button sends.
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.delete_review_comment(&DeleteReviewComment { id: first_id }, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let remaining: Vec<_> = editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .collect();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, second_id);
+            assert!(
+                editor.gutter_highlights.contains_key(&marker),
+                "gutter mark must persist while a comment remains"
+            );
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.delete_review_comment(&DeleteReviewComment { id: second_id }, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 0);
+            let empty = editor
+                .gutter_highlights
+                .get(&marker)
+                .map(|(_, ranges)| ranges.is_empty())
+                .unwrap_or(true);
+            assert!(empty, "gutter mark must clear with the last comment");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_edit_button_path_with_prompt_focused(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    let comment_id = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.insert("Editable", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+            editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .map(|comment| comment.id)
+                .next()
+                .unwrap()
+        })
+        .unwrap();
+
+    // Exercise exactly what the row's Edit button does on click: call the
+    // handler directly on the parent editor while focus stays in the prompt
+    // editor. (Global dispatch misses the parent handler in that focus state,
+    // which is why the buttons bypass it.)
+    editor
+        .update(cx, |editor, window, cx| {
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                window.focus(&prompt_editor.focus_handle(cx), cx);
+            }
+            editor.edit_review_comment(&EditReviewComment { id: comment_id }, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            let inline_open = editor
+                .diff_review_overlays
+                .iter()
+                .any(|overlay| overlay.inline_edit_editors.contains_key(&comment_id));
+            assert!(
+                inline_open,
+                "the Edit button path must open the inline editor regardless of focus"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_empty_comment_not_submitted(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
