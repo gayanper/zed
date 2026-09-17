@@ -628,8 +628,9 @@ pub mod agent {
     }
 
     /// Inserts pre-formatted diff review comments (one `file: line-range: body` line
-    /// per comment) into the active agent: focused terminal wins, otherwise the
-    /// active Zed thread. Insert-only, never auto-submits.
+    /// per comment) into the focused agent's input: focused terminal wins,
+    /// otherwise the active Zed thread. Insert-only, never auto-submits, and
+    /// never appends a trailing newline that terminal agents would consume as Enter.
     #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = agent)]
     #[serde(deny_unknown_fields)]

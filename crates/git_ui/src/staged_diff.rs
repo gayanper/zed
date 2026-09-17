@@ -1,12 +1,13 @@
 use crate::{
     diff_multibuffer::DiffMultibuffer,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
+    project_diff::render_send_review_to_agent_button,
 };
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkStatus;
 use editor::{
     DiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
-    actions::{GoToHunk, GoToPreviousHunk},
+    actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
 use git::{Commit, UnstageAll, UnstageAndNext};
 use gpui::{
@@ -212,13 +213,42 @@ impl StagedDiff {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
 
         Self {
             diff,
             project,
             workspace: workspace.downgrade(),
-            _diff_event_subscription: diff_event_subscription,
+            _diff_event_subscription: Subscription::join(
+                diff_event_subscription,
+                diff_observation,
+            ),
         }
+    }
+
+    pub fn total_review_comment_count(&self, cx: &App) -> usize {
+        self.diff.read(cx).total_review_comment_count()
+    }
+
+    fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let comments_text = self.diff.update(cx, |diff, cx| {
+            diff.take_formatted_review_comments_for_agent(cx)
+        });
+        if comments_text.is_empty() {
+            return;
+        }
+        window.dispatch_action(
+            zed_actions::agent::SendReviewComments {
+                comments_text: comments_text.into(),
+            }
+            .boxed_clone(),
+            cx,
+        );
     }
 
     fn button_states(&self, cx: &App) -> ButtonStates {
@@ -487,14 +517,18 @@ impl SerializableItem for StagedDiff {
 }
 
 impl Render for StagedDiff {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.diff.clone()
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(cx.listener(Self::send_review_to_agent))
+            .child(self.diff.clone())
     }
 }
 
 pub struct StagedDiffToolbar {
     staged_diff: Option<WeakEntity<StagedDiff>>,
     workspace: WeakEntity<Workspace>,
+    _subscription: Option<Subscription>,
 }
 
 impl StagedDiffToolbar {
@@ -502,6 +536,7 @@ impl StagedDiffToolbar {
         Self {
             staged_diff: None,
             workspace: workspace.weak_handle(),
+            _subscription: None,
         }
     }
 
@@ -556,9 +591,11 @@ impl ToolbarItemView for StagedDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.staged_diff = active_pane_item
-            .and_then(|item| item.act_as::<StagedDiff>(cx))
-            .map(|entity| entity.downgrade());
+        let staged_diff = active_pane_item.and_then(|item| item.act_as::<StagedDiff>(cx));
+        self._subscription = staged_diff
+            .as_ref()
+            .map(|entity| cx.observe(entity, |_, _, cx| cx.notify()));
+        self.staged_diff = staged_diff.map(|entity| entity.downgrade());
         if self.staged_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
@@ -582,6 +619,7 @@ impl Render for StagedDiffToolbar {
         };
         let focus_handle = staged_diff.focus_handle(cx);
         let button_states = staged_diff.read(cx).button_states(cx);
+        let review_count = staged_diff.read(cx).total_review_comment_count(cx);
 
         let diff = staged_diff.read(cx).diff.read(cx);
         let (additions, deletions) = diff.calculate_changed_lines(cx);
@@ -684,6 +722,15 @@ impl Render for StagedDiffToolbar {
                         this.dispatch_action(&Commit, window, cx);
                     })),
             )
+            .when(review_count > 0, |el| {
+                el.child(Divider::vertical()).child(
+                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&SendReviewToAgent, window, cx)
+                        }),
+                    ),
+                )
+            })
     }
 }
 

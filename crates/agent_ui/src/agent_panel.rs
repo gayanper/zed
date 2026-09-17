@@ -592,7 +592,9 @@ pub fn init(cx: &mut App) {
                         format!("Please address these review comments:\n{comments_text}");
 
                     // Focus wins: a focused terminal (center, dock, or agent-panel
-                    // surface) receives the text via bracketed paste. Insert-only.
+                    // surface) receives the text via bracketed paste. Insert-only,
+                    // never submitted: no trailing newline, so terminal agents
+                    // don't consume it as Enter.
                     if let Some(terminal_view) = workspace
                         .active_item(cx)
                         .and_then(|item| item.act_as::<TerminalView>(cx))
@@ -643,12 +645,34 @@ pub fn init(cx: &mut App) {
                         return;
                     }
 
-                    // Zed fallback: insert into the active thread's editor without submitting.
+                    // Sidebar-active terminal thread wins over opening a new native
+                    // thread: the user explicitly selected it in the thread sidebar,
+                    // even if window focus is currently in the diff view.
+                    // Insert-only, no trailing Enter.
+                    if let Some(terminal_id) = panel.read(cx).active_terminal_id()
+                        && let Some(agent_terminal) =
+                            panel.read(cx).terminals.get(&terminal_id)
+                    {
+                        let view = agent_terminal.view.clone();
+                        view.update(cx, |view, cx| {
+                            view.terminal().update(cx, |terminal, _| {
+                                terminal.paste(&message_text);
+                            });
+                            window.focus(&view.focus_handle(cx), cx);
+                        });
+                        return;
+                    }
+
+                    // Zed fallback: insert into the active thread's input without
+                    // submitting, like AddSelectionToThread.
                     workspace.focus_panel::<AgentPanel>(window, cx);
                     panel.update(cx, |panel, cx| {
                         if let Some(conversation_view) = panel.active_conversation_view()
-                            && let Some(active_thread) =
-                                conversation_view.read(cx).active_thread().cloned()
+                            && let Some(active_thread) = conversation_view
+                                .read(cx)
+                                .active_thread()
+                                .cloned()
+                                .or_else(|| conversation_view.read(cx).root_thread_view())
                         {
                             active_thread.update(cx, |thread, cx| {
                                 thread.active_editor(cx).update(cx, |editor, cx| {
@@ -657,7 +681,8 @@ pub fn init(cx: &mut App) {
                             });
                             return;
                         }
-                        // No active thread: open one with the comments pre-filled, not submitted.
+                        // No active thread: open one with the comments pre-filled,
+                        // not submitted.
                         panel.external_thread(
                             None,
                             None,
@@ -7035,6 +7060,216 @@ mod tests {
         assert!(is_known_terminal_agent_command("codex"));
         assert!(!is_known_terminal_agent_command("cargo"));
         assert!(!is_known_terminal_agent_command("internal-agent"));
+    }
+
+    async fn send_review_comments_test_setup(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<AgentPanel>,
+        VisualTestContext,
+    ) {
+        use crate::conversation_view::tests::init_test;
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({ "file.txt": "" }))
+            .await;
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut vcx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut vcx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        (workspace, panel, vcx)
+    }
+
+    #[gpui::test]
+    async fn test_send_review_comments_uses_active_sidebar_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut vcx) = send_review_comments_test_setup(cx).await;
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("ok".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut vcx);
+        let thread_id_before = active_thread_id(&panel, &vcx);
+
+        workspace.update_in(&mut vcx, |_workspace, window, cx| {
+            window.dispatch_action(
+                SendReviewComments {
+                    comments_text: "src/main.rs:Line 1: fix this".into(),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let thread_id_after = active_thread_id(&panel, &vcx);
+        assert_eq!(
+            thread_id_before, thread_id_after,
+            "send review to agent should reuse the active sidebar thread, not open a new one"
+        );
+
+        // Insert-only, like AddSelectionToThread: text lands in the input,
+        // nothing is submitted.
+        let thread_view =
+            panel.read_with(&vcx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let (editor_text, entries_len, status) =
+            thread_view.read_with(&vcx, |view, cx| {
+                (
+                    view.message_editor.read(cx).text(cx).to_string(),
+                    view.thread.read(cx).entries().len(),
+                    view.thread.read(cx).status(),
+                )
+            });
+        assert!(
+            editor_text.contains("fix this"),
+            "first click must insert review text into the active thread input, got: {editor_text:?}"
+        );
+        assert_eq!(
+            entries_len, 0,
+            "insert-only: no new entries should be submitted"
+        );
+        assert_eq!(
+            status,
+            ThreadStatus::Idle,
+            "insert-only: thread should stay idle, not start generating"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_send_review_comments_creates_thread_when_none_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut vcx) = send_review_comments_test_setup(cx).await;
+
+        assert!(
+            panel.read_with(&vcx, |panel, cx| panel.active_thread_id(cx).is_none()),
+            "test precondition: no active thread"
+        );
+
+        // Register the shared stub server so the newly created thread can connect.
+        crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+
+        workspace.update_in(&mut vcx, |_workspace, window, cx| {
+            window.dispatch_action(
+                SendReviewComments {
+                    comments_text: "src/main.rs:Line 1: fix this".into(),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        assert!(
+            panel
+                .read_with(&vcx, |panel, cx| panel.active_thread_id(cx).is_some()),
+            "send review to agent should open a new thread when none is active"
+        );
+
+        // Pre-filled, not submitted: input contains the text, no entries sent.
+        let thread_view =
+            panel.read_with(&vcx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let (editor_text, entries_len) = thread_view.read_with(&vcx, |view, cx| {
+            (
+                view.message_editor.read(cx).text(cx).to_string(),
+                view.thread.read(cx).entries().len(),
+            )
+        });
+        assert!(
+            editor_text.contains("fix this"),
+            "new thread input should be pre-filled, got: {editor_text:?}"
+        );
+        assert_eq!(
+            entries_len, 0,
+            "insert-only: new thread must not auto-submit"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_send_review_comments_single_dispatch_while_generating(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut vcx) = send_review_comments_test_setup(cx).await;
+
+        // Pending connection: prompt never resolves, so the thread stays generating.
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection, &mut vcx);
+        send_message(&panel, &mut vcx);
+        panel.read_with(&vcx, |panel, cx| {
+            let thread = panel.active_agent_thread(cx).unwrap();
+            assert_ne!(
+                thread.read(cx).status(),
+                ThreadStatus::Idle,
+                "test precondition: thread should be generating"
+            );
+        });
+        let entries_before = panel.read_with(&vcx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .unwrap()
+                .read(cx)
+                .thread
+                .read(cx)
+                .entries()
+                .len()
+        });
+
+        workspace.update_in(&mut vcx, |_workspace, window, cx| {
+            window.dispatch_action(
+                SendReviewComments {
+                    comments_text: "src/main.rs:Line 1: fix this".into(),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        // Insert-only even while generating: first click appends to the input,
+        // never queues or submits, so no second click is needed to see the text.
+        let thread_view =
+            panel.read_with(&vcx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let (queued, editor_text, entries_len) =
+            thread_view.read_with(&vcx, |view, cx| {
+                (
+                    view.message_queue.len(),
+                    view.message_editor.read(cx).text(cx).to_string(),
+                    view.thread.read(cx).entries().len(),
+                )
+            });
+        assert!(
+            editor_text.contains("fix this"),
+            "first click must insert review text into the input, got: {editor_text:?}"
+        );
+        assert_eq!(
+            queued, 0,
+            "insert-only: nothing should be queued while generating"
+        );
+        assert_eq!(
+            entries_len, entries_before,
+            "insert-only: no new entries should be submitted"
+        );
     }
 
     #[test]

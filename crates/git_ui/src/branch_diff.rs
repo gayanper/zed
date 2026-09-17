@@ -364,11 +364,15 @@ impl BranchDiff {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
         Self {
             diff,
             project,
             workspace: workspace.downgrade(),
-            _diff_event_subscription: diff_event_subscription,
+            _diff_event_subscription: Subscription::join(
+                diff_event_subscription,
+                diff_observation,
+            ),
         }
     }
 
@@ -724,11 +728,15 @@ impl SerializableItem for BranchDiff {
 
 pub struct BranchDiffToolbar {
     branch_diff: Option<WeakEntity<BranchDiff>>,
+    _subscription: Option<Subscription>,
 }
 
 impl BranchDiffToolbar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { branch_diff: None }
+        Self {
+            branch_diff: None,
+            _subscription: None,
+        }
     }
 
     fn branch_diff(&self, _: &App) -> Option<Entity<BranchDiff>> {
@@ -755,9 +763,11 @@ impl ToolbarItemView for BranchDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.branch_diff = active_pane_item
-            .and_then(|item| item.act_as::<BranchDiff>(cx))
-            .map(|entity| entity.downgrade());
+        let branch_diff = active_pane_item.and_then(|item| item.act_as::<BranchDiff>(cx));
+        self._subscription = branch_diff
+            .as_ref()
+            .map(|entity| cx.observe(entity, |_, _, cx| cx.notify()));
+        self.branch_diff = branch_diff.map(|entity| entity.downgrade());
         if self.branch_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {

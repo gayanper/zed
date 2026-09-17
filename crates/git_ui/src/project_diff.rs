@@ -754,6 +754,7 @@ pub(crate) mod persistence {
 pub struct ProjectDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
     workspace: WeakEntity<Workspace>,
+    _subscription: Option<Subscription>,
 }
 
 impl ProjectDiffToolbar {
@@ -761,6 +762,7 @@ impl ProjectDiffToolbar {
         Self {
             project_diff: None,
             workspace: workspace.weak_handle(),
+            _subscription: None,
         }
     }
 
@@ -813,9 +815,11 @@ impl ToolbarItemView for ProjectDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.project_diff = active_pane_item
-            .and_then(|item| item.act_as::<ProjectDiff>(cx))
-            .map(|entity| entity.downgrade());
+        let project_diff = active_pane_item.and_then(|item| item.act_as::<ProjectDiff>(cx));
+        self._subscription = project_diff
+            .as_ref()
+            .map(|entity| cx.observe(entity, |_, _, cx| cx.notify()));
+        self.project_diff = project_diff.map(|entity| entity.downgrade());
         if self.project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {

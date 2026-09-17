@@ -45876,6 +45876,40 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comments_formatted_for_agent(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(Point::new(0, 0));
+        let key = test_hunk_key_with_anchor("src/main.rs", anchor);
+
+        add_test_comment(editor, key, "Fix this nil check", cx);
+
+        let formatted = editor.formatted_review_comments_for_agent(cx);
+        assert!(
+            formatted.contains("src/main.rs"),
+            "formatted payload should include file path, got: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("Fix this nil check"),
+            "formatted payload should include comment body, got: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("Line"),
+            "formatted payload should include a line label, got: {formatted:?}"
+        );
+
+        let taken = editor.take_formatted_review_comments_for_agent(cx);
+        assert_eq!(taken, formatted);
+        assert_eq!(editor.total_review_comment_count(), 0);
+        assert!(editor.formatted_review_comments_for_agent(cx).is_empty());
+    });
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
