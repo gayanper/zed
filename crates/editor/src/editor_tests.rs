@@ -45984,6 +45984,187 @@ fn test_diff_review_overlay_dismiss_via_cancel(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_submit_via_button_without_focus(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    // Show overlay (focuses the prompt editor, like the real flow).
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        })
+        .unwrap();
+
+    // Type a comment, then simulate what clicking the "Add comment" IconButton
+    // does: focus leaves the prompt editor (moves to the button/parent).
+    editor
+        .update(cx, |editor, window, cx| {
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.insert("Button click comment", window, cx);
+                });
+            }
+            window.focus(&editor.focus_handle(cx), cx);
+        })
+        .unwrap();
+
+    // Dispatch the action the Add button sends. Before the fix this no-ops
+    // because submit looks up the overlay by focused prompt editor.
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.submit_diff_review_comment_action(&SubmitDiffReviewComment, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(
+                editor.total_review_comment_count(),
+                1,
+                "Add-comment button must submit even when the click moved focus away from the prompt editor"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_close_hides_widget_but_keeps_pending_count(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    // Show overlay, type a comment, submit it (overlay stays open with stored comment).
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.insert("Keep me after close", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert!(!editor.diff_review_overlays.is_empty());
+        })
+        .unwrap();
+
+    // Pressing the widget's Close button hides the widget...
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert!(
+                !editor.diff_review_overlays.is_empty(),
+                "overlay should exist before close"
+            );
+            editor.dismiss_all_diff_review_overlays(cx);
+        })
+        .unwrap();
+
+    // ...but the pending review comment (and its count) must survive:
+    // Close means hide, not delete. Deleting is the per-row Delete action.
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert!(
+                editor.diff_review_overlays.is_empty(),
+                "close should hide the widget"
+            );
+            assert_eq!(
+                editor.total_review_comment_count(),
+                1,
+                "close must not delete the pending review comment"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_comment_leaves_gutter_indication_after_close(cx: &mut TestAppContext) {
+    use std::any::TypeId;
+
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let marker = TypeId::of::<super::git::ReviewCommentGutterMarker>();
+    let highlight_range_count = |editor: &Editor| {
+        editor
+            .gutter_highlights
+            .get(&marker)
+            .map(|(_, ranges)| ranges.len())
+            .unwrap_or(0)
+    };
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.insert("Visible after close", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+
+    // Highlight present while the widget is open.
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(
+                highlight_range_count(editor),
+                1,
+                "stored review comment must mark its gutter range"
+            );
+        })
+        .unwrap();
+
+    // Hide the widget via Close: the gutter mark must persist so the commented
+    // line can still be found while scrolling.
+    editor
+        .update(cx, |editor, _window, cx| {
+            editor.dismiss_all_diff_review_overlays(cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert!(
+                editor.diff_review_overlays.is_empty(),
+                "close should hide the widget"
+            );
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(
+                highlight_range_count(editor),
+                1,
+                "stored review comment must leave a gutter indication after close"
+            );
+        })
+        .unwrap();
+
+    // Sending the comments clears both the count and the gutter marks.
+    editor
+        .update(cx, |editor, _window, cx| {
+            editor.take_all_review_comments(cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 0);
+            assert_eq!(
+                highlight_range_count(editor),
+                0,
+                "gutter indication must clear once comments are sent"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_empty_comment_not_submitted(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

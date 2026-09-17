@@ -166,6 +166,11 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// Gutter-highlight marker for stored review comment ranges. Closing the
+/// comment widget hides the input but keeps stored comments, so these
+/// persistent gutter bars are the visible indication of commented lines.
+pub(super) struct ReviewCommentGutterMarker;
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -695,11 +700,18 @@ impl Editor {
     /// Stores the diff review comment locally.
     /// Comments are stored per-hunk and can later be batch-submitted to the Agent panel.
     pub fn submit_diff_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Find the overlay that currently has focus
+        // Find the overlay that currently has focus. Clicking the "Add comment"
+        // button moves focus away from the prompt editor, so fall back to the
+        // overlay with a non-empty prompt (button path) instead of dropping it.
         let overlay_index = self
             .diff_review_overlays
             .iter()
-            .position(|overlay| overlay.prompt_editor.focus_handle(cx).is_focused(window));
+            .position(|overlay| overlay.prompt_editor.focus_handle(cx).is_focused(window))
+            .or_else(|| {
+                self.diff_review_overlays.iter().position(|overlay| {
+                    !overlay.prompt_editor.read(cx).text(cx).trim().is_empty()
+                })
+            });
         let Some(overlay_index) = overlay_index else {
             return;
         };
@@ -726,6 +738,68 @@ impl Editor {
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
 
         cx.notify();
+    }
+
+    /// Submits the prompt of the overlay for the given hunk, independent of
+    /// which editor currently has focus. Used by the "Add comment" button,
+    /// whose click moves focus away from the prompt editor.
+    pub(crate) fn submit_diff_review_comment_for_hunk(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some(overlay_index) = self.diff_review_overlays.iter().position(|overlay| {
+            Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot)
+        }) else {
+            return;
+        };
+        let overlay = &self.diff_review_overlays[overlay_index];
+
+        let comment_text = overlay.prompt_editor.read(cx).text(cx).trim().to_string();
+        if comment_text.is_empty() {
+            return;
+        }
+
+        let anchor_range = overlay.anchor_range.clone();
+        let hunk_key = overlay.hunk_key.clone();
+
+        self.add_review_comment(hunk_key.clone(), comment_text, anchor_range, cx);
+
+        if let Some(overlay) = self.diff_review_overlays.get(overlay_index) {
+            overlay.prompt_editor.update(cx, |editor, cx| {
+                editor.clear(window, cx);
+            });
+        }
+
+        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+
+        cx.notify();
+    }
+
+    /// Dismisses the overlay for the given hunk, independent of focus. Used by
+    /// the widget's Close button. Stored comments for the hunk are kept; only
+    /// the input block is removed.
+    pub(crate) fn dismiss_diff_review_overlay_for_hunk(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut removed_block_ids = HashSet::default();
+        self.diff_review_overlays.retain(|overlay| {
+            if Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot) {
+                removed_block_ids.insert(overlay.block_id);
+                false
+            } else {
+                true
+            }
+        });
+        if !removed_block_ids.is_empty() {
+            self.remove_blocks(removed_block_ids, None, cx);
+            cx.notify();
+        }
     }
 
     /// Returns the prompt editor for the diff review overlay, if one is active.
@@ -837,6 +911,26 @@ impl Editor {
             .join("\n")
     }
 
+    /// Rebuilds gutter highlights from stored review comment ranges. Called
+    /// after every stored-comment mutation so commented lines stay marked
+    /// while scrolling, including after the widget is closed (Close hides the
+    /// input but keeps stored comments by design).
+    fn refresh_review_comment_gutter_highlights(&mut self, cx: &mut Context<Self>) {
+        let ranges: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .collect();
+        self.clear_gutter_highlights::<ReviewCommentGutterMarker>(cx);
+        for range in ranges {
+            self.insert_gutter_highlight::<ReviewCommentGutterMarker>(
+                range,
+                |cx| cx.theme().colors().text_accent,
+                cx,
+            );
+        }
+    }
+
     /// Formats all stored comments and clears storage (dismissing overlays).
     /// Call after successfully handing the text to the active agent.
     pub fn take_formatted_review_comments_for_agent(
@@ -848,6 +942,7 @@ impl Editor {
             self.dismiss_all_diff_review_overlays(cx);
             self.stored_review_comments.clear();
             self.next_review_comment_id = 0;
+            self.refresh_review_comment_gutter_highlights(cx);
             cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
             cx.notify();
         }
@@ -881,6 +976,7 @@ impl Editor {
                 .push((hunk_key, vec![stored_comment]));
         }
 
+        self.refresh_review_comment_gutter_highlights(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.total_review_comment_count(),
         });
@@ -1269,6 +1365,7 @@ impl Editor {
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(index) = comments.iter().position(|c| c.id == id) {
                 comments.remove(index);
+                self.refresh_review_comment_gutter_highlights(cx);
                 cx.emit(EditorEvent::ReviewCommentsChanged {
                     total_count: self.total_review_comment_count(),
                 });
@@ -1342,6 +1439,7 @@ impl Editor {
 
         let new_count = self.total_review_comment_count();
         if new_count != original_count {
+            self.refresh_review_comment_gutter_highlights(cx);
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: new_count,
             });
@@ -2736,7 +2834,11 @@ impl Editor {
                             .py_1()
                             .child(prompt_editor.clone()),
                     )
-                    .child(
+                    .child({
+                        let editor_handle_for_close = editor_handle.clone();
+                        let hunk_key_for_close = hunk_key.clone();
+                        let editor_handle_for_add = editor_handle.clone();
+                        let hunk_key_for_add = hunk_key.clone();
                         h_flex()
                             .flex_shrink_0()
                             .gap_1()
@@ -2745,9 +2847,21 @@ impl Editor {
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Close"))
-                                    .on_click(|_, window, cx| {
-                                        window
-                                            .dispatch_action(Box::new(crate::actions::Cancel), cx);
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(editor) = editor_handle_for_close.upgrade() {
+                                            editor.update(cx, |editor, cx| {
+                                                editor.dismiss_diff_review_overlay_for_hunk(
+                                                    &hunk_key_for_close,
+                                                    cx,
+                                                );
+                                            });
+                                            window.focus(&editor.focus_handle(cx), cx);
+                                        } else {
+                                            window.dispatch_action(
+                                                Box::new(crate::actions::Cancel),
+                                                cx,
+                                            );
+                                        }
                                     }),
                             )
                             .child(
@@ -2755,14 +2869,24 @@ impl Editor {
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Add comment"))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(crate::actions::SubmitDiffReviewComment),
-                                            cx,
-                                        );
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(editor) = editor_handle_for_add.upgrade() {
+                                            editor.update(cx, |editor, cx| {
+                                                editor.submit_diff_review_comment_for_hunk(
+                                                    &hunk_key_for_add,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        } else {
+                                            window.dispatch_action(
+                                                Box::new(crate::actions::SubmitDiffReviewComment),
+                                                cx,
+                                            );
+                                        }
                                     }),
-                            ),
-                    ),
+                            )
+                    }),
             )
             // Expandable comments section (only shown when there are comments)
             .when(comment_count > 0, |el| {
@@ -3025,6 +3149,7 @@ impl Editor {
         let comments = std::mem::take(&mut self.stored_review_comments);
         // Reset the ID counter since all comments have been taken
         self.next_review_comment_id = 0;
+        self.refresh_review_comment_gutter_highlights(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
         cx.notify();
         comments
