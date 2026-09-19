@@ -46308,7 +46308,7 @@ fn test_diff_review_delete_comment_via_action(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_diff_review_edit_button_path_with_prompt_focused(cx: &mut TestAppContext) {
+fn test_diff_review_edit_and_confirm_button_paths_with_prompt_focused(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
@@ -46345,15 +46345,43 @@ fn test_diff_review_edit_button_path_with_prompt_focused(cx: &mut TestAppContext
         })
         .unwrap();
 
+    // Move focus away from the inline editor, as clicking the Confirm button
+    // does, then exercise the parent-editor callback used by that button.
+    editor
+        .update(cx, |editor, window, cx| {
+            let inline_editor = editor
+                .diff_review_overlays
+                .iter()
+                .filter_map(|overlay| overlay.inline_edit_editors.get(&comment_id))
+                .cloned()
+                .next()
+                .expect("edit action must open an inline editor for the comment");
+            inline_editor.update(cx, |inline_editor, cx| {
+                inline_editor.clear(window, cx);
+                inline_editor.insert("Confirmed text", window, cx);
+            });
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.confirm_edit_review_comment(comment_id, window, cx);
+        })
+        .unwrap();
+
     editor
         .update(cx, |editor, _window, _cx| {
+            let comments: Vec<_> = editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .collect();
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].comment, "Confirmed text");
+            assert!(!comments[0].is_editing);
             let inline_open = editor
                 .diff_review_overlays
                 .iter()
                 .any(|overlay| overlay.inline_edit_editors.contains_key(&comment_id));
             assert!(
-                inline_open,
-                "the Edit button path must open the inline editor regardless of focus"
+                !inline_open,
+                "the Confirm button path must remove the inline editor regardless of focus"
             );
         })
         .unwrap();

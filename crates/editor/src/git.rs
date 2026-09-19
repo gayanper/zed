@@ -3046,6 +3046,7 @@ impl Editor {
             })
             .child(if is_editing {
                 // Editing mode: show close and confirm buttons
+                let editor_handle_for_confirm = editor_handle.clone();
                 h_flex()
                     .gap_1()
                     .child(
@@ -3074,12 +3075,18 @@ impl Editor {
                         .icon_size(action_icon_size)
                         .tooltip(Tooltip::text("Confirm"))
                         .on_click(move |_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(crate::actions::ConfirmEditReviewComment {
-                                    id: comment_id,
-                                }),
-                                cx,
-                            );
+                            if let Some(editor) = editor_handle_for_confirm.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.confirm_edit_review_comment(comment_id, window, cx);
+                                });
+                            } else {
+                                window.dispatch_action(
+                                    Box::new(crate::actions::ConfirmEditReviewComment {
+                                        id: comment_id,
+                                    }),
+                                    cx,
+                                );
+                            }
                         }),
                     )
                     .into_any_element()
