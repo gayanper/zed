@@ -50,7 +50,20 @@ If you always run the same CLI in Terminal Threads, set the `agent.terminal_init
 
 The command is sent to the shell as if you had typed it, so it is interpreted by your configured shell—including on Windows and in remote or WSL projects—and the terminal remains a regular interactive shell after the command exits. It runs when creating a new Terminal Thread and when recreating a saved Terminal Thread after reopening a project.
 
-You can also configure this from the Settings UI under **AI**, via the "Terminal Thread Init Command" field.
+To choose from multiple CLIs in the new-thread menu, configure named commands:
+
+```json [settings]
+{
+  "agent": {
+    "terminal_init_command": [
+      { "name": "Claude", "command": "claude" },
+      { "name": "Codex", "command": "codex" }
+    ]
+  }
+}
+```
+
+Zed shows each name with the Terminal icon. It remembers the selected command for that Terminal Thread and uses the same command when it recreates the thread.
 
 ## Terminal Thread Titles {#terminal-thread-titles}
 

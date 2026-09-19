@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    SettingsStore, SidebarDockPosition, SidebarSide, TerminalInitCommand, ThinkingBlockDisplay,
+    ToolPermissionMode, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -242,7 +242,7 @@ pub struct AgentSettings {
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
-    pub terminal_init_command: Option<String>,
+    pub terminal_init_command: Option<TerminalInitCommand>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
@@ -828,7 +828,11 @@ impl Settings for AgentSettings {
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             terminal_init_command: agent
                 .terminal_init_command
-                .filter(|command| !command.trim().is_empty()),
+                .and_then(|command| match command {
+                    TerminalInitCommand::Command(command) if command.trim().is_empty() => None,
+                    TerminalInitCommand::Profiles(profiles) if profiles.is_empty() => None,
+                    command => Some(command),
+                }),
             thinking_display: agent.thinking_display.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
@@ -1171,8 +1175,9 @@ mod tests {
         SettingsStore::update_global(cx, |store, cx| {
             let new_text = store
                 .new_text_for_update("{}".to_string(), |settings| {
-                    settings.agent.get_or_insert_default().terminal_init_command =
-                        Some(" claude --resume ".to_string());
+                    settings.agent.get_or_insert_default().terminal_init_command = Some(
+                        TerminalInitCommand::Command(" claude --resume ".to_string()),
+                    );
                 })
                 .unwrap();
             assert!(
@@ -1182,10 +1187,10 @@ mod tests {
             store.set_user_settings(&new_text, cx).unwrap();
         });
         assert_eq!(
-            AgentSettings::get_global(cx)
-                .terminal_init_command
-                .as_deref(),
-            Some(" claude --resume ")
+            AgentSettings::get_global(cx).terminal_init_command.as_ref(),
+            Some(&TerminalInitCommand::Command(
+                " claude --resume ".to_string()
+            ))
         );
 
         SettingsStore::update_global(cx, |store, cx| {
@@ -1208,6 +1213,37 @@ mod tests {
             AgentSettings::get_global(cx)
                 .terminal_init_command
                 .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn test_terminal_init_command_profiles(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "terminal_init_command": [{ "name": "Claude", "command": "claude --resume" }, { "name": "Codex", "command": "codex" }] } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            AgentSettings::get_global(cx).terminal_init_command,
+            Some(TerminalInitCommand::Profiles(vec![
+                settings::TerminalInitCommandProfile {
+                    name: "Claude".to_string(),
+                    command: "claude --resume".to_string(),
+                },
+                settings::TerminalInitCommandProfile {
+                    name: "Codex".to_string(),
+                    command: "codex".to_string(),
+                },
+            ]))
         );
     }
 
