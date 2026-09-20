@@ -297,9 +297,9 @@ impl DiffMultibuffer {
     /// Formats and clears stored review comments. Call after handing text to the agent.
     pub(crate) fn take_formatted_review_comments_for_agent(&self, cx: &mut App) -> String {
         self.editor.update(cx, |editor, cx| {
-            editor
-                .rhs_editor()
-                .update(cx, |editor, cx| editor.take_formatted_review_comments_for_agent(cx))
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.take_formatted_review_comments_for_agent(cx)
+            })
         })
     }
 

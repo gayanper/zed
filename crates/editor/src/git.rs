@@ -708,9 +708,9 @@ impl Editor {
             .iter()
             .position(|overlay| overlay.prompt_editor.focus_handle(cx).is_focused(window))
             .or_else(|| {
-                self.diff_review_overlays.iter().position(|overlay| {
-                    !overlay.prompt_editor.read(cx).text(cx).trim().is_empty()
-                })
+                self.diff_review_overlays
+                    .iter()
+                    .position(|overlay| !overlay.prompt_editor.read(cx).text(cx).trim().is_empty())
             });
         let Some(overlay_index) = overlay_index else {
             return;
@@ -734,6 +734,7 @@ impl Editor {
             });
         }
 
+        window.focus(&self.focus_handle(cx), cx);
         // Refresh the overlay to update the block height for the new comment
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
 
@@ -750,9 +751,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let Some(overlay_index) = self.diff_review_overlays.iter().position(|overlay| {
-            Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot)
-        }) else {
+        let Some(overlay_index) = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+        else {
             return;
         };
         let overlay = &self.diff_review_overlays[overlay_index];
@@ -773,6 +776,7 @@ impl Editor {
             });
         }
 
+        window.focus(&self.focus_handle(cx), cx);
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
 
         cx.notify();
@@ -852,8 +856,7 @@ impl Editor {
             for stored_comment in stored {
                 let start_point = stored_comment.range.start.to_point(&snapshot);
                 let end_point = stored_comment.range.end.to_point(&snapshot);
-                let buffer_ranges =
-                    snapshot.range_to_buffer_ranges(start_point..end_point);
+                let buffer_ranges = snapshot.range_to_buffer_ranges(start_point..end_point);
                 let mut ranges: Vec<(u32, u32)> = buffer_ranges
                     .iter()
                     .map(|(buffer_snapshot, range, _)| {
@@ -933,10 +936,7 @@ impl Editor {
 
     /// Formats all stored comments and clears storage (dismissing overlays).
     /// Call after successfully handing the text to the active agent.
-    pub fn take_formatted_review_comments_for_agent(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> String {
+    pub fn take_formatted_review_comments_for_agent(&mut self, cx: &mut Context<Self>) -> String {
         let text = self.formatted_review_comments_for_agent(cx);
         if !text.is_empty() {
             self.dismiss_all_diff_review_overlays(cx);
@@ -3101,29 +3101,28 @@ impl Editor {
                     .flex_shrink_0()
                     .gap_1()
                     .child(
-                        IconButton::new(
-                            format!("diff-review-edit-{comment_id}"),
-                            IconName::Pencil,
-                        )
-                        .icon_color(ui::Color::Muted)
-                        .icon_size(action_icon_size)
-                        .tooltip(Tooltip::text("Edit"))
-                        .on_click(move |_, window, cx| {
-                            if let Some(editor) = editor_handle_for_edit.upgrade() {
-                                editor.update(cx, |editor, cx| {
-                                    editor.edit_review_comment(
-                                        &crate::actions::EditReviewComment { id: comment_id },
-                                        window,
+                        IconButton::new(format!("diff-review-edit-{comment_id}"), IconName::Pencil)
+                            .icon_color(ui::Color::Muted)
+                            .icon_size(action_icon_size)
+                            .tooltip(Tooltip::text("Edit"))
+                            .on_click(move |_, window, cx| {
+                                if let Some(editor) = editor_handle_for_edit.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.edit_review_comment(
+                                            &crate::actions::EditReviewComment { id: comment_id },
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                } else {
+                                    window.dispatch_action(
+                                        Box::new(crate::actions::EditReviewComment {
+                                            id: comment_id,
+                                        }),
                                         cx,
                                     );
-                                });
-                            } else {
-                                window.dispatch_action(
-                                    Box::new(crate::actions::EditReviewComment { id: comment_id }),
-                                    cx,
-                                );
-                            }
-                        }),
+                                }
+                            }),
                     )
                     .child(
                         IconButton::new(

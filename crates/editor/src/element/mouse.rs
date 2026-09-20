@@ -1,8 +1,8 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use collections::HashMap;
 use agent_settings::AgentSettings;
+use collections::HashMap;
 use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DispatchPhase, Element, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,

@@ -37,9 +37,9 @@ use crate::{
         scroll_amount::ScrollAmount,
     },
 };
+use agent_settings::AgentSettings;
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use agent_settings::AgentSettings;
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,

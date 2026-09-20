@@ -772,12 +772,9 @@ impl ProjectDiffToolbar {
 
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(project_diff) = self.project_diff(cx) {
-            project_diff.focus_handle(cx).focus(window, cx);
+            let focus_handle = project_diff.focus_handle(cx);
+            focus_handle.dispatch_action(action, window, cx);
         }
-        let action = action.boxed_clone();
-        cx.defer(move |cx| {
-            cx.dispatch_action(action.as_ref());
-        })
     }
 
     fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {

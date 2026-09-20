@@ -244,10 +244,7 @@ impl UnstagedDiff {
             diff,
             project,
             workspace: workspace.downgrade(),
-            _diff_event_subscription: Subscription::join(
-                diff_event_subscription,
-                diff_observation,
-            ),
+            _diff_event_subscription: Subscription::join(diff_event_subscription, diff_observation),
         }
     }
 
@@ -591,12 +588,9 @@ impl UnstagedDiffToolbar {
 
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(unstaged_diff) = self.unstaged_diff(cx) {
-            unstaged_diff.focus_handle(cx).focus(window, cx);
+            let focus_handle = unstaged_diff.focus_handle(cx);
+            focus_handle.dispatch_action(action, window, cx);
         }
-        let action = action.boxed_clone();
-        cx.defer(move |cx| {
-            cx.dispatch_action(action.as_ref());
-        })
     }
 
     fn stage_selected_unstaged_hunks(
