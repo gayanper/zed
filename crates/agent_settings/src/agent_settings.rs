@@ -30,6 +30,8 @@ pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
+pub const REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT: &str =
+    "Please address these review comments:";
 
 /// Bounds on the width of the threads list. They constrain the configured
 /// default as well as the width the user drags to, so that no width the sidebar
@@ -250,6 +252,7 @@ pub struct AgentSettings {
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
     pub enable_diff_review_comments: bool,
+    pub review_comments_prompt_prefix: String,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
 }
@@ -840,6 +843,9 @@ impl Settings for AgentSettings {
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             enable_diff_review_comments: agent.enable_diff_review_comments.unwrap_or(true),
+            review_comments_prompt_prefix: agent
+                .review_comments_prompt_prefix
+                .unwrap_or_else(|| REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT.to_string()),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
         }

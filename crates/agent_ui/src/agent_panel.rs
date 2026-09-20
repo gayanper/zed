@@ -589,8 +589,10 @@ pub fn init(cx: &mut App) {
                     if comments_text.trim().is_empty() {
                         return;
                     }
-                    let message_text =
-                        format!("Please address these review comments:\n{comments_text}");
+                    let message_text = format!(
+                        "{}\n{comments_text}",
+                        AgentSettings::get_global(cx).review_comments_prompt_prefix
+                    );
 
                     // Focus wins: a focused terminal (center, dock, or agent-panel
                     // surface) receives the text via bracketed paste. Insert-only,
@@ -7242,6 +7244,74 @@ mod tests {
             panel.read_with(&vcx, |panel, cx| panel.active_thread_id(cx).is_none()),
             "pasting review comments into a terminal must not create an agent thread"
         );
+    }
+
+    #[gpui::test]
+    async fn test_send_review_comments_uses_configured_prompt_prefix(cx: &mut TestAppContext) {
+        let (workspace, panel, mut vcx) = send_review_comments_test_setup(cx).await;
+        let terminal_id = TerminalId::new();
+
+        panel
+            .update_in(&mut vcx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    Some(PathBuf::from("/project")),
+                    Some("Terminal".into()),
+                    None,
+                    None,
+                    true,
+                    true,
+                    None,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+            .expect("display-only terminal should be inserted");
+        vcx.run_until_parked();
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .agent
+                        .get_or_insert_default()
+                        .review_comments_prompt_prefix = Some(String::new());
+                });
+            });
+        });
+
+        let terminal = panel.read_with(&vcx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        terminal.update(&mut vcx, |terminal, _| {
+            terminal.take_input_log();
+        });
+
+        workspace.update_in(&mut vcx, |_workspace, window, cx| {
+            window.dispatch_action(
+                SendReviewComments {
+                    comments_text: "fix this".into(),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let pasted: String = terminal
+            .update(&mut vcx, |terminal, _| terminal.take_input_log())
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
+            .collect();
+        assert_eq!(pasted, "\rfix this");
     }
 
     #[gpui::test]

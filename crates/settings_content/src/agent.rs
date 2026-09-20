@@ -388,6 +388,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub enable_diff_review_comments: Option<bool>,
+    /// Prompt prefix inserted before collected review comments when sending them to the agent.
+    ///
+    /// Default: "Please address these review comments:"
+    pub review_comments_prompt_prefix: Option<String>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///
