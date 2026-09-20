@@ -601,12 +601,7 @@ pub fn init(cx: &mut App) {
                         .and_then(|item| item.act_as::<TerminalView>(cx))
                         .filter(|view| view.focus_handle(cx).is_focused(window))
                     {
-                        terminal_view.update(cx, |view, cx| {
-                            view.terminal().update(cx, |terminal, _| {
-                                terminal.paste(&message_text);
-                            });
-                            window.focus(&view.focus_handle(cx), cx);
-                        });
+                        paste_text_into_terminal(terminal_view, &message_text, window, cx);
                         return;
                     }
                     if workspace
@@ -616,12 +611,7 @@ pub fn init(cx: &mut App) {
                             .active_item(cx)
                             .and_then(|item| item.act_as::<TerminalView>(cx))
                     {
-                        terminal_view.update(cx, |view, cx| {
-                            view.terminal().update(cx, |terminal, _| {
-                                terminal.paste(&message_text);
-                            });
-                            window.focus(&view.focus_handle(cx), cx);
-                        });
+                        paste_text_into_terminal(terminal_view, &message_text, window, cx);
                         return;
                     }
 
@@ -636,12 +626,7 @@ pub fn init(cx: &mut App) {
                         && let Some(agent_terminal) = panel.read(cx).terminals.get(&terminal_id)
                     {
                         let view = agent_terminal.view.clone();
-                        view.update(cx, |view, cx| {
-                            view.terminal().update(cx, |terminal, _| {
-                                terminal.paste(&message_text);
-                            });
-                            window.focus(&view.focus_handle(cx), cx);
-                        });
+                        paste_text_into_terminal(view, &message_text, window, cx);
                         return;
                     }
 
@@ -653,12 +638,7 @@ pub fn init(cx: &mut App) {
                         && let Some(agent_terminal) = panel.read(cx).terminals.get(&terminal_id)
                     {
                         let view = agent_terminal.view.clone();
-                        view.update(cx, |view, cx| {
-                            view.terminal().update(cx, |terminal, _| {
-                                terminal.paste(&message_text);
-                            });
-                            window.focus(&view.focus_handle(cx), cx);
-                        });
+                        paste_text_into_terminal(view, &message_text, window, cx);
                         return;
                     }
 
@@ -851,12 +831,7 @@ pub fn init(cx: &mut App) {
                                     );
                                     if !text.is_empty() {
                                         let view = agent_terminal.view.clone();
-                                        view.update(cx, |view, cx| {
-                                            view.terminal().update(cx, |terminal, _| {
-                                                terminal.paste(&text);
-                                            });
-                                            window.focus(&view.focus_handle(cx), cx);
-                                        });
+                                        paste_text_into_terminal(view, &text, window, cx);
                                     }
                                 }
                             });
@@ -914,6 +889,20 @@ fn format_selection_for_terminal(
         }
         AgentContextSelection::Terminal(texts) => texts.join("\n"),
     }
+}
+
+fn paste_text_into_terminal(
+    terminal_view: Entity<TerminalView>,
+    text: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    terminal_view.update(cx, |view, cx| {
+        view.terminal().update(cx, |terminal, _| {
+            terminal.paste(text);
+        });
+        window.focus(&view.focus_handle(cx), cx);
+    });
 }
 
 /// Path for a terminal mention: relative to the terminal cwd if possible, else absolute.
@@ -7173,7 +7162,7 @@ mod tests {
         let thread_view = panel.read_with(&vcx, |panel, cx| panel.active_thread_view(cx).unwrap());
         let (editor_text, entries_len, status) = thread_view.read_with(&vcx, |view, cx| {
             (
-                view.message_editor.read(cx).text(cx).to_string(),
+                view.message_editor.read(cx).text(cx),
                 view.thread.read(cx).entries().len(),
                 view.thread.read(cx).status(),
             )
@@ -7190,6 +7179,68 @@ mod tests {
             status,
             ThreadStatus::Idle,
             "insert-only: thread should stay idle, not start generating"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_send_review_comments_pastes_into_active_terminal_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut vcx) = send_review_comments_test_setup(cx).await;
+        let terminal_id = TerminalId::new();
+
+        panel
+            .update_in(&mut vcx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    Some(PathBuf::from("/project")),
+                    Some("Terminal".into()),
+                    None,
+                    None,
+                    true,
+                    true,
+                    None,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+            .expect("display-only terminal should be inserted");
+        vcx.run_until_parked();
+
+        let terminal = panel.read_with(&vcx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        terminal.update(&mut vcx, |terminal, _| {
+            terminal.take_input_log();
+        });
+
+        workspace.update_in(&mut vcx, |_workspace, window, cx| {
+            window.dispatch_action(
+                SendReviewComments {
+                    comments_text: "fix this".into(),
+                }
+                .boxed_clone(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let pasted: String = terminal
+            .update(&mut vcx, |terminal, _| terminal.take_input_log())
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
+            .collect();
+        assert_eq!(pasted, "Please address these review comments:\rfix this");
+        assert!(!pasted.ends_with('\r'));
+        assert!(
+            panel.read_with(&vcx, |panel, cx| panel.active_thread_id(cx).is_none()),
+            "pasting review comments into a terminal must not create an agent thread"
         );
     }
 
@@ -7225,7 +7276,7 @@ mod tests {
         let thread_view = panel.read_with(&vcx, |panel, cx| panel.active_thread_view(cx).unwrap());
         let (editor_text, entries_len) = thread_view.read_with(&vcx, |view, cx| {
             (
-                view.message_editor.read(cx).text(cx).to_string(),
+                view.message_editor.read(cx).text(cx),
                 view.thread.read(cx).entries().len(),
             )
         });
@@ -7283,7 +7334,7 @@ mod tests {
         let (queued, editor_text, entries_len) = thread_view.read_with(&vcx, |view, cx| {
             (
                 view.message_queue.len(),
-                view.message_editor.read(cx).text(cx).to_string(),
+                view.message_editor.read(cx).text(cx),
                 view.thread.read(cx).entries().len(),
             )
         });
