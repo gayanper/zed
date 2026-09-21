@@ -1011,8 +1011,8 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             enable_diff_review_comments: true,
-            review_comments_prompt_prefix:
-                agent_settings::REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT.to_string(),
+            review_comments_prompt_prefix: agent_settings::REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT
+                .to_string(),
             sidebar_side: Default::default(),
             threads_sidebar_default_width: px(300.),
             threads_sidebar_auto_open: true,

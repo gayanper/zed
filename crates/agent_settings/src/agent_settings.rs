@@ -30,8 +30,7 @@ pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
-pub const REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT: &str =
-    "Please address these review comments:";
+pub const REVIEW_COMMENTS_PROMPT_PREFIX_DEFAULT: &str = "Please address these review comments:";
 
 /// Bounds on the width of the threads list. They constrain the configured
 /// default as well as the width the user drags to, so that no width the sidebar
