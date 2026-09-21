@@ -921,7 +921,7 @@ actions!(
         /// Toggles diff display for selected hunks.
         #[action(deprecated_aliases = ["editor::ToggleHunkDiff"])]
         ToggleSelectedDiffHunks,
-        /// Stores the diff review comment locally (for later batch submission).
+        /// Stores the current review comment locally (for later batch submission).
         SubmitDiffReviewComment,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,

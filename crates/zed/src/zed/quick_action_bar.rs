@@ -5,8 +5,8 @@ use agent_settings::AgentSettings;
 use editor::actions::{
     AddSelectionAbove, AddSelectionBelow, CodeActionSource, DuplicateLineDown, GoToDiagnostic,
     GoToHunk, GoToPreviousDiagnostic, GoToPreviousHunk, MoveLineDown, MoveLineUp, SelectAll,
-    SelectLargerSyntaxNode, SelectNext, SelectSmallerSyntaxNode, ToggleCodeActions,
-    ToggleDiagnostics, ToggleGoToLine, ToggleInlineDiagnostics,
+    SelectLargerSyntaxNode, SelectNext, SelectSmallerSyntaxNode, SendReviewToAgent,
+    ToggleCodeActions, ToggleDiagnostics, ToggleGoToLine, ToggleInlineDiagnostics,
 };
 use editor::code_context_menus::{CodeContextMenu, ContextMenuOrigin};
 use editor::{Editor, EditorSettings};
@@ -30,7 +30,11 @@ use workspace::item::ItemBufferKind;
 use workspace::{
     ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, item::ItemHandle,
 };
-use zed_actions::{agent::AddSelectionToThread, assistant::InlineAssist, outline::ToggleOutline};
+use zed_actions::{
+    agent::{AddSelectionToThread, SendReviewComments},
+    assistant::InlineAssist,
+    outline::ToggleOutline,
+};
 
 const MAX_CODE_ACTION_MENU_LINES: u32 = 16;
 
@@ -139,6 +143,7 @@ impl Render for QuickActionBar {
         let minimap_enabled = supports_minimap && editor_value.minimap().is_some();
         let has_available_code_actions = editor_value.has_available_code_actions_for_selection();
         let code_action_enabled = editor_value.code_actions_enabled_for_toolbar(cx);
+        let review_comment_count = editor_value.total_review_comment_count();
         let focus_handle = editor_value.focus_handle(cx);
 
         let search_button = (editor.buffer_kind(cx) == ItemBufferKind::Singleton).then(|| {
@@ -165,12 +170,41 @@ impl Render for QuickActionBar {
             IconName::ZedAssistant,
             false,
             Box::new(InlineAssist::default()),
-            focus_handle,
+            focus_handle.clone(),
             "Inline Assist",
             move |_, window, cx| {
                 window.dispatch_action(Box::new(InlineAssist::default()), cx);
             },
         );
+
+        let send_review_to_agent_button = (review_comment_count > 0).then(|| {
+            let editor = editor.clone();
+            let focus_handle = focus_handle.clone();
+            QuickActionBarButton::new(
+                "send review comments to agent",
+                IconName::Send,
+                false,
+                Box::new(SendReviewToAgent),
+                focus_handle,
+                format!("Send Review to Agent ({review_comment_count})"),
+                move |_, window, cx| {
+                    let comments_text = editor.update(cx, |editor, cx| {
+                        editor.take_formatted_review_comments_for_agent(cx)
+                    });
+                    if comments_text.is_empty() {
+                        return;
+                    }
+
+                    window.dispatch_action(
+                        SendReviewComments {
+                            comments_text: comments_text.into(),
+                        }
+                        .boxed_clone(),
+                        cx,
+                    );
+                },
+            )
+        });
 
         let code_actions_dropdown = code_action_enabled.then(|| {
             let is_deployed = {
@@ -713,6 +747,10 @@ impl Render for QuickActionBar {
                 AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button,
                 |bar| bar.child(assistant_button),
             )
+            .when(
+                AgentSettings::get_global(cx).enable_diff_review_comments,
+                |bar| bar.children(send_review_to_agent_button),
+            )
             .children(code_actions_dropdown)
             .children(editor_selections_dropdown)
             .child(editor_settings_dropdown)
@@ -786,11 +824,13 @@ impl ToolbarItemView for QuickActionBar {
                     mut inlay_hints_enabled,
                     mut supports_inlay_hints,
                     mut supports_semantic_tokens,
+                    mut review_comment_count,
                 ) = editor.update(cx, |editor, cx| {
                     (
                         editor.inlay_hints_enabled(),
                         editor.supports_inlay_hints(cx),
                         editor.supports_semantic_tokens(cx),
+                        editor.total_review_comment_count(),
                     )
                 });
                 self._inlay_hints_enabled_subscription =
@@ -799,19 +839,23 @@ impl ToolbarItemView for QuickActionBar {
                             new_inlay_hints_enabled,
                             new_supports_inlay_hints,
                             new_supports_semantic_tokens,
+                            new_review_comment_count,
                         ) = editor.update(cx, |editor, cx| {
                             (
                                 editor.inlay_hints_enabled(),
                                 editor.supports_inlay_hints(cx),
                                 editor.supports_semantic_tokens(cx),
+                                editor.total_review_comment_count(),
                             )
                         });
                         let should_notify = inlay_hints_enabled != new_inlay_hints_enabled
                             || supports_inlay_hints != new_supports_inlay_hints
-                            || supports_semantic_tokens != new_supports_semantic_tokens;
+                            || supports_semantic_tokens != new_supports_semantic_tokens
+                            || review_comment_count != new_review_comment_count;
                         inlay_hints_enabled = new_inlay_hints_enabled;
                         supports_inlay_hints = new_supports_inlay_hints;
                         supports_semantic_tokens = new_supports_semantic_tokens;
+                        review_comment_count = new_review_comment_count;
                         if should_notify {
                             cx.notify()
                         }

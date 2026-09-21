@@ -156,15 +156,24 @@ pub(super) struct DiffReviewDragState {
     current_anchor: Anchor,
 }
 
-/// Identifies a specific hunk in the diff buffer.
-/// Used as a key to group comments by their location.
+/// Identifies a review comment thread by location and scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewCommentScope {
+    DiffReview,
+    Editor,
+}
+
 #[derive(Clone, Debug)]
-pub(super) struct DiffHunkKey {
+pub(super) struct ReviewThreadKey {
     /// The file path (relative to worktree) this hunk belongs to.
     pub(super) file_path: Arc<util::rel_path::RelPath>,
     /// An anchor at the start of the hunk. This tracks position as the buffer changes.
     pub(super) hunk_start_anchor: Anchor,
+    /// The context where this comment thread was created.
+    pub(super) scope: ReviewCommentScope,
 }
+
+pub(super) type DiffHunkKey = ReviewThreadKey;
 
 /// Gutter-highlight marker for stored review comment ranges. Closing the
 /// comment widget hides the input but keeps stored comments, so these
@@ -596,6 +605,7 @@ impl Editor {
         let new_hunk_key = DiffHunkKey {
             file_path,
             hunk_start_anchor,
+            scope: self.review_comment_scope(),
         };
 
         // Check if we already have an overlay for this hunk
@@ -967,7 +977,8 @@ impl Editor {
 
         // Find existing entry for this hunk or add a new one
         if let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
-            k.file_path == hunk_key.file_path
+            k.scope == hunk_key.scope
+                && k.file_path == hunk_key.file_path
                 && k.hunk_start_anchor.to_point(&snapshot) == key_point
         }) {
             comments.push(stored_comment);
@@ -1219,6 +1230,14 @@ impl Editor {
         self.show_diff_review_button
     }
 
+    fn review_comment_scope(&self) -> ReviewCommentScope {
+        if self.diff_hunk_renderer.is_some() {
+            ReviewCommentScope::DiffReview
+        } else {
+            ReviewCommentScope::Editor
+        }
+    }
+
     pub(super) fn render_diff_review_button(
         &self,
         display_row: DisplayRow,
@@ -1338,7 +1357,9 @@ impl Editor {
         self.stored_review_comments
             .iter()
             .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
+                k.scope == key.scope
+                    && k.file_path == key.file_path
+                    && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
             .map(|(_, comments)| comments.as_slice())
             .unwrap_or(&[])
@@ -1354,7 +1375,9 @@ impl Editor {
         self.stored_review_comments
             .iter()
             .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
+                k.scope == key.scope
+                    && k.file_path == key.file_path
+                    && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
             .map(|(_, v)| v.len())
             .unwrap_or(0)
@@ -2704,7 +2727,8 @@ impl Editor {
 
     /// Compares two DiffHunkKeys for equality by resolving their anchors.
     fn hunk_keys_match(a: &DiffHunkKey, b: &DiffHunkKey, snapshot: &MultiBufferSnapshot) -> bool {
-        a.file_path == b.file_path
+        a.scope == b.scope
+            && a.file_path == b.file_path
             && a.hunk_start_anchor.to_point(snapshot) == b.hunk_start_anchor.to_point(snapshot)
     }
 

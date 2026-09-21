@@ -1162,7 +1162,7 @@ pub struct Editor {
     /// Active diff review overlays. Multiple overlays can be open simultaneously
     /// when hunks have comments stored.
     pub(crate) diff_review_overlays: Vec<DiffReviewOverlay>,
-    /// Stored review comments grouped by hunk.
+    /// Stored review comments grouped by thread key.
     /// Uses a Vec instead of HashMap because DiffHunkKey contains an Anchor
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
@@ -2408,7 +2408,7 @@ impl Editor {
             show_runnables: None,
             show_bookmarks: None,
             show_breakpoints: None,
-            show_diff_review_button: false,
+            show_diff_review_button: full_mode,
             show_wrap_guides: None,
             show_indent_guides,
             buffers_with_disabled_indent_guides: HashSet::default(),

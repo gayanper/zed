@@ -45703,6 +45703,7 @@ fn test_hunk_key(file_path: &str) -> DiffHunkKey {
             Arc::from(util::rel_path::RelPath::from_unix_str(file_path).unwrap())
         },
         hunk_start_anchor: Anchor::Min,
+        scope: super::git::ReviewCommentScope::DiffReview,
     }
 }
 
@@ -45715,6 +45716,7 @@ fn test_hunk_key_with_anchor(file_path: &str, anchor: Anchor) -> DiffHunkKey {
             Arc::from(util::rel_path::RelPath::from_unix_str(file_path).unwrap())
         },
         hunk_start_anchor: anchor,
+        scope: super::git::ReviewCommentScope::DiffReview,
     }
 }
 
@@ -46506,6 +46508,7 @@ fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: anchor,
+                scope: super::git::ReviewCommentScope::DiffReview,
             };
             editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
             assert_eq!(editor.total_review_comment_count(), 1);
@@ -46549,6 +46552,7 @@ fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext)
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: anchor,
+                scope: super::git::ReviewCommentScope::DiffReview,
             };
             editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
             assert_eq!(editor.total_review_comment_count(), 1);
@@ -46591,10 +46595,12 @@ fn test_comments_stored_for_multiple_hunks(cx: &mut TestAppContext) {
         let key1 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file1.rs").unwrap()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
         let key2 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file2.rs").unwrap()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
 
         // Add comments to first hunk
@@ -46663,10 +46669,12 @@ fn test_same_hunk_detected_by_matching_keys(cx: &mut TestAppContext) {
         let key1 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
         let key2 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
 
         // Add comment to first key
@@ -46684,6 +46692,7 @@ fn test_same_hunk_detected_by_matching_keys(cx: &mut TestAppContext) {
         let different_file_key = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("other.rs").unwrap()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
 
         // Different file should not find the comment
@@ -46692,6 +46701,40 @@ fn test_same_hunk_detected_by_matching_keys(cx: &mut TestAppContext) {
             0,
             "Different file should not find the comment"
         );
+    });
+}
+
+#[gpui::test]
+fn test_review_comment_scope_separates_threads(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(Point::new(0, 0));
+
+        let diff_scope_key = DiffHunkKey {
+            file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
+            hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
+        };
+        let editor_scope_key = DiffHunkKey {
+            file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
+            hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::Editor,
+        };
+
+        editor.add_review_comment(
+            diff_scope_key.clone(),
+            "Diff scoped comment".to_string(),
+            anchor..anchor,
+            cx,
+        );
+
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(editor.hunk_comment_count(&diff_scope_key, &snapshot), 1);
+        assert_eq!(editor.hunk_comment_count(&editor_scope_key, &snapshot), 0);
     });
 }
 
@@ -46931,6 +46974,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let key = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::empty()),
             hunk_start_anchor: anchor,
+            scope: super::git::ReviewCommentScope::DiffReview,
         };
 
         // No comments: base height of 2
