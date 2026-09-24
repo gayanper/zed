@@ -146,6 +146,7 @@
       "ctrl-shift-alt-backspace": "editor::GoToNextChange",
       "alt-enter": "editor::OpenSelectionsInMultibuffer",
       "ctrl-alt-f": "text_finder::Toggle",
+      "alt-shift-c": "editor::AddDiffReviewComment",
     },
   },
   {

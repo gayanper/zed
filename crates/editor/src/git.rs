@@ -6,7 +6,10 @@ use ::git::{
     status::FileStatus,
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
+use agent_settings::AgentSettings;
 use project::git_store::Repository;
+use project::DisableAiSettings;
+use settings::Settings;
 
 #[derive(Clone)]
 struct ResolvedDiffHunk {
@@ -1372,6 +1375,44 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.submit_diff_review_comment(window, cx);
+    }
+
+    /// Action handler for AddDiffReviewComment. Keyboard equivalent of the
+    /// gutter `+` button: opens the review input for the current
+    /// selection (or cursor line), in every editor where the button is active.
+    pub(super) fn add_diff_review_comment_action(
+        &mut self,
+        _: &AddDiffReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            cx.propagate();
+            return;
+        }
+        if !AgentSettings::get_global(cx).enable_diff_review_comments {
+            cx.propagate();
+            return;
+        }
+        if DisableAiSettings::is_ai_disabled_for_buffer(
+            self.buffer.read(cx).as_singleton().as_ref(),
+            cx,
+        ) {
+            cx.propagate();
+            return;
+        }
+        let snapshot = self.snapshot(window, cx);
+        let selection = *self.selections.newest_anchor();
+        let start = selection
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row();
+        let end = selection
+            .end
+            .to_display_point(&snapshot.display_snapshot)
+            .row();
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        self.show_diff_review_overlay(start..end, window, cx);
     }
 
     /// Returns comments for a specific hunk, ordered by creation time.

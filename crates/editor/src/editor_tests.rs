@@ -46031,6 +46031,87 @@ fn test_diff_review_submit_via_button_without_focus(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_add_diff_review_comment_opens_overlay_at_cursor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            editor.set_show_diff_review_button(true, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.add_diff_review_comment_action(&AddDiffReviewComment, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert!(
+                editor.diff_review_prompt_editor().is_some(),
+                "AddDiffReviewComment must open the review input at the cursor line"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_add_diff_review_comment_noop_when_button_hidden(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.add_diff_review_comment_action(&AddDiffReviewComment, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert!(
+                editor.diff_review_prompt_editor().is_none(),
+                "AddDiffReviewComment must not open input when the review button is disabled"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_add_diff_review_comment_focuses_existing_overlay(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            editor.set_show_diff_review_button(true, cx);
+        })
+        .unwrap();
+
+    for _ in 0..2 {
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.add_diff_review_comment_action(&AddDiffReviewComment, window, cx);
+            })
+            .unwrap();
+    }
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(
+                editor.diff_review_overlays.len(),
+                1,
+                "re-invoking must focus the existing overlay, not duplicate it"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_close_hides_widget_but_keeps_pending_count(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

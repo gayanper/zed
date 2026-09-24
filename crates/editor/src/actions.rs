@@ -923,6 +923,8 @@ actions!(
         ToggleSelectedDiffHunks,
         /// Stores the current review comment locally (for later batch submission).
         SubmitDiffReviewComment,
+        /// Opens a review-comment input for the current selection or cursor line.
+        AddDiffReviewComment,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,
         /// Sends all stored review comments to the Agent panel.
