@@ -1317,6 +1317,56 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 800
     pub max_width: Option<PixelSetting>,
+    /// The modifier key that, when held while clicking in the markdown
+    /// preview, jumps to the clicked location in the source file.
+    ///
+    /// Default: alt
+    pub click_to_source_modifier: Option<MarkdownPreviewClickModifier>,
+}
+
+/// The modifier key that triggers click-to-source navigation in the
+/// markdown preview.
+///
+/// Default: alt
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownPreviewClickModifier {
+    /// Click-to-source navigation is disabled.
+    None,
+    /// Maps to `Alt` on Linux and Windows and to `Option` on macOS.
+    #[default]
+    Alt,
+    /// Maps to `Control` on all platforms.
+    #[serde(alias = "ctrl")]
+    Ctrl,
+    /// Maps to the platform key: `Command` on macOS, `Windows` key on
+    /// Windows, `Super` key on Linux.
+    #[serde(alias = "cmd", alias = "cmd_or_ctrl")]
+    Cmd,
+}
+
+impl MarkdownPreviewClickModifier {
+    pub fn matches(&self, modifiers: &gpui::Modifiers) -> bool {
+        match self {
+            MarkdownPreviewClickModifier::None => false,
+            MarkdownPreviewClickModifier::Alt => modifiers.alt,
+            MarkdownPreviewClickModifier::Ctrl => modifiers.control,
+            MarkdownPreviewClickModifier::Cmd => modifiers.platform,
+        }
+    }
 }
 
 /// The settings for the image viewer.

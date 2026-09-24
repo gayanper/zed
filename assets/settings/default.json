@@ -127,6 +127,19 @@
     // The maximum width, in pixels, of the rendered markdown content when
     // limit_content_width is enabled.
     "max_width": 800,
+    // The modifier key that, when held while clicking in the markdown
+    // preview, jumps to the clicked location in the source file.
+    //
+    // 1. Maps to `Alt` on Linux and Windows and to `Option` on MacOS:
+    //    "alt"
+    // 2. Maps to `Control` on all platforms:
+    //    "ctrl"
+    // 3. Maps to `Command` on MacOS, the `Windows` key on Windows and the
+    //    `Super` key on Linux:
+    //    "cmd"
+    // 4. Disables click-to-source navigation:
+    //    "none"
+    "click_to_source_modifier": "alt",
   },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //

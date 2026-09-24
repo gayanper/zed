@@ -1140,18 +1140,18 @@ impl MarkdownPreviewView {
         if let Some(active_editor) = active_editor {
             let editor_for_checkbox = active_editor.clone();
             let view_handle = cx.entity().downgrade();
+            let workspace = self.workspace.clone();
             markdown_element = markdown_element
-                .on_source_click(move |source_index, click_count, window, cx| {
-                    if click_count == 1 {
-                        Self::change_selection_to_source_index(
-                            &active_editor,
-                            source_index,
-                            false,
-                            window,
-                            cx,
-                        );
-                    }
-                    false
+                .on_source_click(move |source_index, click_count, modifiers, window, cx| {
+                    Self::handle_source_click(
+                        &workspace,
+                        &active_editor,
+                        source_index,
+                        click_count,
+                        modifiers,
+                        window,
+                        cx,
+                    )
                 })
                 .on_checkbox_toggle(move |source_range, new_checked, window, cx| {
                     Self::apply_checkbox_toggle_to_editor(
@@ -1165,6 +1165,37 @@ impl MarkdownPreviewView {
         }
 
         markdown_element
+    }
+
+    fn handle_source_click(
+        workspace: &WeakEntity<Workspace>,
+        editor: &Entity<Editor>,
+        source_index: usize,
+        click_count: usize,
+        modifiers: &gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if click_count == 1
+            && MarkdownPreviewSettings::get_global(cx)
+                .click_to_source_modifier
+                .matches(modifiers)
+        {
+            Self::change_selection_to_source_index(editor, source_index, false, window, cx);
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(editor, true, true, window, cx);
+                });
+                window.focus(&editor.read(cx).focus_handle(cx), cx);
+            } else {
+                Self::change_selection_to_source_index(editor, source_index, true, window, cx);
+            }
+            return true;
+        }
+        if click_count == 1 {
+            Self::change_selection_to_source_index(editor, source_index, false, window, cx);
+        }
+        false
     }
 
     fn apply_checkbox_toggle_to_editor(
@@ -2210,7 +2241,8 @@ mod tests {
     use fs::FakeFs;
     use gpui::UpdateGlobal as _;
     use gpui::{
-        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, WindowHandle, px,
+        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext,
+        WindowHandle, px,
     };
     use language::{Buffer, DiskState, Point};
     use project::{Project, ProjectPath};
@@ -2252,6 +2284,71 @@ mod tests {
             filter_non_rendered_matches(vec![58..65, 1..9, 30..37], &non_rendered_ranges),
             vec![58..65, 1..9]
         );
+    }
+
+    #[gpui::test]
+    async fn modifier_click_in_preview_navigates_to_source(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({"guide.md": "# Guide\n\nHello world\n"}),
+            false,
+        )
+        .await;
+        let item =
+            open_project_file(cx, &project, &multi_workspace, "guide.md", None, false).await;
+        let editor = item
+            .downcast::<Editor>()
+            .expect("guide.md should open in an editor");
+
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        // Cover the same pane, so the source editor is hidden behind the preview.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let preview = MarkdownPreviewView::create_markdown_view(
+                workspace,
+                editor.clone(),
+                window,
+                cx,
+            );
+            let pane = workspace.active_pane().clone();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(preview), true, true, None, window, cx);
+            });
+        });
+        let navigated = cx.update(|window, cx| {
+            // "world" starts at byte offset 15 in "# Guide\n\nHello world\n".
+            MarkdownPreviewView::handle_source_click(
+                &workspace.downgrade(),
+                &editor,
+                15,
+                1,
+                &Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(navigated, "alt-click should navigate to the source editor");
+
+        editor.update_in(&mut cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 6)
+            );
+            assert!(
+                editor.focus_handle(cx).is_focused(window),
+                "source editor should be focused after modifier-click"
+            );
+        });
+        workspace.read_with(&cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).map(|item| item.item_id()),
+                Some(editor.entity_id()),
+                "source editor should be revealed after modifier-click"
+            );
+        });
     }
 
     #[gpui::test]

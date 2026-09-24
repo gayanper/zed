@@ -34,7 +34,7 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
+    ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad, relative,
@@ -65,7 +65,8 @@ const MERMAID_ZOOM_DEBOUNCE: Duration = Duration::from_millis(300);
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
-type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
+type SourceClickCallback =
+    Box<dyn Fn(usize, usize, &Modifiers, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
 /// Invoked when a mermaid diagram's zoom level changes (via scroll gesture or
 /// the reset button), so a scroll container can keep the diagram anchored.
@@ -1813,7 +1814,7 @@ impl MarkdownElement {
 
     pub fn on_source_click(
         mut self,
-        handler: impl Fn(usize, usize, &mut Window, &mut App) -> bool + 'static,
+        handler: impl Fn(usize, usize, &Modifiers, &mut Window, &mut App) -> bool + 'static,
     ) -> Self {
         self.on_source_click = Some(Box::new(handler));
         self
@@ -2327,7 +2328,13 @@ impl MarkdownElement {
                                 Ok(ix) | Err(ix) => ix,
                             };
                             if let Some(handler) = on_source_click.as_ref() {
-                                let blocked = handler(source_index, event.click_count, window, cx);
+                                let blocked = handler(
+                                    source_index,
+                                    event.click_count,
+                                    &event.modifiers,
+                                    window,
+                                    cx,
+                                );
                                 if blocked {
                                     markdown.selection = Selection::default();
                                     markdown.pressed_link = None;
@@ -6881,6 +6888,56 @@ mod tests {
         });
         cx.run_until_parked();
         cx
+    }
+
+    #[gpui::test]
+    fn test_source_click_receives_event_modifiers(cx: &mut TestAppContext) {
+        struct SourceClickView {
+            markdown: Entity<Markdown>,
+            clicks: Rc<RefCell<Vec<(usize, usize, Modifiers)>>>,
+        }
+
+        impl Render for SourceClickView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                    .on_source_click(
+                        move |source_index, click_count, modifiers, _, _| {
+                            clicks.borrow_mut().push((
+                                source_index,
+                                click_count,
+                                *modifiers,
+                            ));
+                            true
+                        },
+                    )
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, cx| SourceClickView {
+                markdown: cx.new(|cx| Markdown::new("Hello world".into(), None, None, cx)),
+                clicks,
+            }
+        });
+        cx.run_until_parked();
+
+        cx.simulate_click(
+            point(px(8.), px(8.)),
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        );
+        cx.run_until_parked();
+
+        let clicks = clicks.borrow();
+        assert_eq!(clicks.len(), 1, "expected one source click");
+        assert_eq!(clicks[0].1, 1);
+        assert!(clicks[0].2.alt, "expected alt modifier to be forwarded");
     }
 
     #[gpui::test]
