@@ -208,12 +208,13 @@ pub(super) struct DiffReviewOverlay {
     /// Key: comment ID, Value: Editor entity for inline editing.
     pub(super) inline_edit_editors: HashMap<usize, Entity<Editor>>,
     /// Subscriptions for inline edit editors' action handlers.
-    /// Key: comment ID, Value: Subscription keeping the Newline action handler alive.
+    /// Key: comment ID, Value: Subscription keeping the submit action handler alive.
     pub(super) inline_edit_subscriptions: HashMap<usize, Subscription>,
     /// The current user's avatar URI for display in comment rows.
     pub(super) user_avatar_uri: Option<SharedUri>,
-    /// Subscription to keep the action handler alive.
-    _subscription: Subscription,
+    /// Subscriptions keeping the prompt editor action handler and live-height
+    /// observer alive.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DiffReviewDragState {
@@ -240,6 +241,9 @@ impl StoredReviewComment {
 }
 
 impl Editor {
+    pub(super) const REVIEW_PROMPT_MIN_LINES: usize = 1;
+    pub(super) const REVIEW_PROMPT_MAX_LINES: usize = 8;
+
     pub fn diff_hunks_in_ranges<'a>(
         &'a self,
         ranges: &'a [Range<Anchor>],
@@ -638,30 +642,51 @@ impl Editor {
         // Use the hunk key we already computed
         let hunk_key = new_hunk_key;
 
-        // Create the prompt editor for the review input
+        // Create the prompt editor for the review input. Multiline with
+        // soft-wrap so long input wraps and grows; cmd-enter submits.
         let prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
+            let mut editor = Editor::auto_height(
+                Self::REVIEW_PROMPT_MIN_LINES,
+                Self::REVIEW_PROMPT_MAX_LINES,
+                window,
+                cx,
+            );
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             editor.set_placeholder_text("Add a review comment...", window, cx);
             editor
         });
 
-        // Register the Newline action on the prompt editor to submit the review
+        // Register cmd-enter (SubmitDiffReviewComment) on the prompt editor to
+        // submit the review. Plain Enter inserts a newline by default.
         let parent_editor = cx.entity().downgrade();
-        let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
+        let hunk_key_for_submit = hunk_key.clone();
+        let action_subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
             prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
-                move |_: &crate::actions::Newline, window, cx| {
+                let hunk_key_for_submit = hunk_key_for_submit.clone();
+                move |_: &crate::actions::SubmitDiffReviewComment, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
                         editor.update(cx, |editor, cx| {
-                            editor.submit_diff_review_comment(window, cx);
+                            editor.submit_diff_review_comment_for_hunk(
+                                &hunk_key_for_submit,
+                                window,
+                                cx,
+                            );
                         });
                     }
                 }
             })
         });
 
+        // Keep the overlay block height in sync while typing (multiline/wrap
+        // growth). The refresh itself is window-independent.
+        let hunk_key_for_observe = hunk_key.clone();
+        let height_subscription = cx.observe(&prompt_editor, move |this, _, cx| {
+            this.refresh_overlay_height_without_window(&hunk_key_for_observe, cx);
+        });
+
         // Calculate initial height based on existing comments for this hunk
-        let initial_height = self.calculate_overlay_height(&hunk_key, true, &buffer_snapshot);
+        let initial_height = self.calculate_overlay_height(&hunk_key, true, &buffer_snapshot, cx);
 
         // Create the overlay block
         let prompt_editor_for_render = prompt_editor.clone();
@@ -697,7 +722,7 @@ impl Editor {
             inline_edit_editors: HashMap::default(),
             inline_edit_subscriptions: HashMap::default(),
             user_avatar_uri,
-            _subscription: subscription,
+            _subscriptions: vec![action_subscription, height_subscription],
         });
 
         // Focus the prompt editor
@@ -723,6 +748,7 @@ impl Editor {
                     .position(|overlay| !overlay.prompt_editor.read(cx).text(cx).trim().is_empty())
             });
         let Some(overlay_index) = overlay_index else {
+            cx.propagate();
             return;
         };
         let overlay = &self.diff_review_overlays[overlay_index];
@@ -766,6 +792,7 @@ impl Editor {
             .iter()
             .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
         else {
+            cx.propagate();
             return;
         };
         let overlay = &self.diff_review_overlays[overlay_index];
@@ -896,7 +923,7 @@ impl Editor {
                     .map(str::trim)
                     .filter(|line| !line.is_empty())
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join("\n");
                 if body.is_empty() {
                     continue;
                 }
@@ -1545,21 +1572,30 @@ impl Editor {
                         .map(|c| c.comment.clone())
                         .unwrap_or_default();
 
-                    // Create inline editor
+                    // Create inline editor (multiline, wrapped; cmd-enter confirms)
                     let parent_editor = cx.entity().downgrade();
                     let inline_editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
+                        let mut editor = Editor::auto_height(
+                            Self::REVIEW_PROMPT_MIN_LINES,
+                            Self::REVIEW_PROMPT_MAX_LINES,
+                            window,
+                            cx,
+                        );
+                        editor.set_soft_wrap_mode(
+                            language::language_settings::SoftWrap::EditorWidth,
+                            cx,
+                        );
                         editor.set_text(&*comment_text, window, cx);
                         // Select all text for easy replacement
                         editor.select_all(&crate::actions::SelectAll, window, cx);
                         editor
                     });
 
-                    // Register the Newline action to confirm the edit
+                    // Register cmd-enter (SubmitDiffReviewComment) to confirm the edit
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Newline, window, cx| {
+                            move |_: &crate::actions::SubmitDiffReviewComment, window, cx| {
                                 if let Some(editor) = parent_editor.upgrade() {
                                     editor.update(cx, |editor, cx| {
                                         editor.confirm_edit_review_comment(comment_id, window, cx);
@@ -2296,24 +2332,52 @@ impl Editor {
     }
 
     /// Calculates the appropriate block height for the diff review overlay.
-    /// Height is in lines: 2 for input row, 1 for header when comments exist,
-    /// and 2 lines per comment when expanded.
+    /// Height is in lines: prompt editor rows (clamped to max) + 1 for header
+    /// when comments exist, plus one line per row of each stored comment.
     pub(super) fn calculate_overlay_height(
         &self,
         hunk_key: &DiffHunkKey,
         comments_expanded: bool,
         snapshot: &MultiBufferSnapshot,
+        cx: &App,
     ) -> u32 {
-        let comment_count = self.hunk_comment_count(hunk_key, snapshot);
-        let base_height: u32 = 2; // Input row with avatar and buttons
+        let prompt_rows = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, snapshot))
+            .map(|overlay| {
+                let text = overlay.prompt_editor.read(cx).text(cx);
+                // Buffer rows; soft-wrapped display rows grow the inner editor
+                // element and scroll past the max.
+                let rows = text.split('\n').count().max(1) as u32;
+                // +1 for the avatar/button row padding.
+                (rows + 1).min(Self::REVIEW_PROMPT_MAX_LINES as u32 + 1)
+            })
+            .unwrap_or(2);
+        let base_height: u32 = prompt_rows;
 
-        if comment_count == 0 {
+        let comment_rows: u32 = self
+            .stored_review_comments
+            .iter()
+            .find(|(key, _)| {
+                key.scope == hunk_key.scope
+                    && key.file_path == hunk_key.file_path
+                    && key.hunk_start_anchor.to_point(snapshot)
+                        == hunk_key.hunk_start_anchor.to_point(snapshot)
+            })
+            .map(|(_, comments)| {
+                comments
+                    .iter()
+                    .map(|comment| comment.comment.split('\n').count().max(1) as u32 + 1)
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        if comment_rows == 0 {
             base_height
         } else if comments_expanded {
-            // Header (1 line) + 2 lines per comment
-            base_height + 1 + (comment_count as u32 * 2)
+            base_height + 1 + comment_rows
         } else {
-            // Just header when collapsed
             base_height + 1
         }
     }
@@ -2680,6 +2744,16 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_overlay_height_without_window(hunk_key, cx);
+    }
+
+    /// Window-independent core of the overlay refresh, so live-typing
+    /// observers (which have no `Window`) can keep the block height in sync.
+    fn refresh_overlay_height_without_window(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        cx: &mut Context<Self>,
+    ) {
         // Extract all needed data from overlay first to avoid borrow conflicts
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let (comments_expanded, block_id, prompt_editor) = {
@@ -2700,7 +2774,7 @@ impl Editor {
 
         // Calculate new height
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let new_height = self.calculate_overlay_height(hunk_key, comments_expanded, &snapshot);
+        let new_height = self.calculate_overlay_height(hunk_key, comments_expanded, &snapshot, cx);
 
         // Update the block height using resize_blocks (avoids flicker)
         let mut heights = HashMap::default();

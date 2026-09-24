@@ -164,7 +164,7 @@
   {
     "context": "Editor && mode == auto_height",
     "bindings": {
-      "ctrl-enter": "editor::Newline",
+      "ctrl-enter": "editor::SubmitDiffReviewComment",
       "shift-enter": "editor::Newline",
       "ctrl-shift-enter": "editor::NewlineBelow",
     },

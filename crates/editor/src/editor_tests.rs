@@ -46490,6 +46490,78 @@ fn test_diff_review_inline_edit_flow(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_prompt_supports_multiline(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            assert!(
+                !prompt_editor.read(cx).mode().is_single_line(),
+                "review prompt must not be single-line"
+            );
+            prompt_editor.update(cx, |pe, cx| {
+                pe.set_text("line one\nline two\nline three", window, cx);
+            });
+            assert_eq!(
+                prompt_editor.read(cx).text(cx),
+                "line one\nline two\nline three"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_submit_preserves_multiline(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |pe, cx| {
+                    pe.set_text("first line\nsecond line", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let agent_comments = editor.review_comments_for_agent(cx);
+            assert_eq!(agent_comments.len(), 1);
+            assert_eq!(agent_comments[0].body, "first line\nsecond line");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_review_comments_for_agent_preserves_newlines(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let key = test_hunk_key("");
+        add_test_comment(editor, key, "first line\nsecond line", cx);
+        let agent_comments = editor.review_comments_for_agent(cx);
+        assert_eq!(agent_comments.len(), 1);
+        assert!(
+            agent_comments[0].body.contains('\n'),
+            "agent body must preserve newlines, got: {:?}",
+            agent_comments[0].body
+        );
+    });
+}
+
+#[gpui::test]
 fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -46978,7 +47050,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         };
 
         // No comments: base height of 2
-        let height_no_comments = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_no_comments = editor.calculate_overlay_height(&key, true, &snapshot, cx);
         assert_eq!(
             height_no_comments, 2,
             "Base height should be 2 with no comments"
@@ -46990,7 +47062,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With comments expanded: base (2) + header (1) + 2 per comment
-        let height_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_expanded = editor.calculate_overlay_height(&key, true, &snapshot, cx);
         assert_eq!(
             height_expanded,
             2 + 1 + 2, // base + header + 1 comment * 2
@@ -46998,7 +47070,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // With comments collapsed: base (2) + header (1)
-        let height_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
+        let height_collapsed = editor.calculate_overlay_height(&key, false, &snapshot, cx);
         assert_eq!(
             height_collapsed,
             2 + 1, // base + header only
@@ -47012,7 +47084,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With 3 comments expanded
-        let height_3_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_3_expanded = editor.calculate_overlay_height(&key, true, &snapshot, cx);
         assert_eq!(
             height_3_expanded,
             2 + 1 + (3 * 2), // base + header + 3 comments * 2
@@ -47020,7 +47092,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // Collapsed height stays the same regardless of comment count
-        let height_3_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
+        let height_3_collapsed = editor.calculate_overlay_height(&key, false, &snapshot, cx);
         assert_eq!(
             height_3_collapsed,
             2 + 1, // base + header only
