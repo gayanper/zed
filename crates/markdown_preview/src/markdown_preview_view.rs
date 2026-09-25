@@ -1141,11 +1141,13 @@ impl MarkdownPreviewView {
             let editor_for_checkbox = active_editor.clone();
             let view_handle = cx.entity().downgrade();
             let workspace = self.workspace.clone();
+            let preview_id = cx.entity_id();
             markdown_element = markdown_element
                 .on_source_click(move |source_index, click_count, modifiers, window, cx| {
                     Self::handle_source_click(
                         &workspace,
                         &active_editor,
+                        preview_id,
                         source_index,
                         click_count,
                         modifiers,
@@ -1170,6 +1172,7 @@ impl MarkdownPreviewView {
     fn handle_source_click(
         workspace: &WeakEntity<Workspace>,
         editor: &Entity<Editor>,
+        preview_id: EntityId,
         source_index: usize,
         click_count: usize,
         modifiers: &gpui::Modifiers,
@@ -1184,11 +1187,26 @@ impl MarkdownPreviewView {
             Self::change_selection_to_source_index(editor, source_index, false, window, cx);
             if let Some(workspace) = workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.activate_item(editor, true, true, window, cx);
+                    if !workspace.activate_item(editor, true, true, window, cx) {
+                        cx.global_mut::<SuppressedAutoPreviews>()
+                            .0
+                            .insert(editor.entity_id());
+                        let origin = workspace
+                            .pane_for_item_id(preview_id)
+                            .unwrap_or_else(|| workspace.active_pane().clone());
+                        let target = workspace.adjacent_pane_of(&origin, window, cx);
+                        workspace.add_item(
+                            target,
+                            Box::new(editor.clone()),
+                            None,
+                            true,
+                            true,
+                            window,
+                            cx,
+                        );
+                    }
                 });
                 window.focus(&editor.read(cx).focus_handle(cx), cx);
-            } else {
-                Self::change_selection_to_source_index(editor, source_index, true, window, cx);
             }
             return true;
         }
@@ -2288,37 +2306,32 @@ mod tests {
 
     #[gpui::test]
     async fn modifier_click_in_preview_navigates_to_source(cx: &mut TestAppContext) {
-        let (project, workspace, multi_workspace) = markdown_workspace(
-            cx,
-            json!({"guide.md": "# Guide\n\nHello world\n"}),
-            false,
-        )
-        .await;
-        let item =
-            open_project_file(cx, &project, &multi_workspace, "guide.md", None, false).await;
+        let (project, workspace, multi_workspace) =
+            markdown_workspace(cx, json!({"guide.md": "# Guide\n\nHello world\n"}), false).await;
+        let item = open_project_file(cx, &project, &multi_workspace, "guide.md", None, false).await;
         let editor = item
             .downcast::<Editor>()
             .expect("guide.md should open in an editor");
 
         let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
         // Cover the same pane, so the source editor is hidden behind the preview.
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            let preview = MarkdownPreviewView::create_markdown_view(
-                workspace,
-                editor.clone(),
-                window,
-                cx,
-            );
+        let preview_id = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let preview =
+                MarkdownPreviewView::create_markdown_view(workspace, editor.clone(), window, cx);
+            let id = preview.entity_id();
             let pane = workspace.active_pane().clone();
             pane.update(cx, |pane, cx| {
                 pane.add_item(Box::new(preview), true, true, None, window, cx);
             });
+            id
         });
+
         let navigated = cx.update(|window, cx| {
             // "world" starts at byte offset 15 in "# Guide\n\nHello world\n".
             MarkdownPreviewView::handle_source_click(
                 &workspace.downgrade(),
                 &editor,
+                preview_id,
                 15,
                 1,
                 &Modifiers {

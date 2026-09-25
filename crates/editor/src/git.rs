@@ -5,10 +5,10 @@ use ::git::{
     Oid, Restore, blame::BlameEntry, commit::ParsedCommitMessage, repository::RepoPath,
     status::FileStatus,
 };
-use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use agent_settings::AgentSettings;
-use project::git_store::Repository;
+use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::DisableAiSettings;
+use project::git_store::Repository;
 use settings::Settings;
 
 #[derive(Clone)]
@@ -1411,7 +1411,11 @@ impl Editor {
             .end
             .to_display_point(&snapshot.display_snapshot)
             .row();
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         self.show_diff_review_overlay(start..end, window, cx);
     }
 

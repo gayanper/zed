@@ -34,12 +34,7 @@ mod tests {
     use super::*;
     use gpui::Modifiers;
 
-    fn modifiers_with(
-        control: bool,
-        alt: bool,
-        platform: bool,
-        shift: bool,
-    ) -> Modifiers {
+    fn modifiers_with(control: bool, alt: bool, platform: bool, shift: bool) -> Modifiers {
         Modifiers {
             control,
             alt,
@@ -80,11 +75,10 @@ mod tests {
 
     #[test]
     fn click_modifier_parses_from_settings_content() {
-        let content: settings::SettingsContent =
-            serde_json::from_value(serde_json::json!({
-                "markdown_preview": {"click_to_source_modifier": "cmd"}
-            }))
-            .unwrap();
+        let content: settings::SettingsContent = serde_json::from_value(serde_json::json!({
+            "markdown_preview": {"click_to_source_modifier": "cmd"}
+        }))
+        .unwrap();
         let settings = MarkdownPreviewSettings::from_settings(&content);
         assert_eq!(
             settings.click_to_source_modifier,

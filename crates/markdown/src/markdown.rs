@@ -34,8 +34,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad, relative,
     size,
@@ -65,8 +65,7 @@ const MERMAID_ZOOM_DEBOUNCE: Duration = Duration::from_millis(300);
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
-type SourceClickCallback =
-    Box<dyn Fn(usize, usize, &Modifiers, &mut Window, &mut App) -> bool>;
+type SourceClickCallback = Box<dyn Fn(usize, usize, &Modifiers, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
 /// Invoked when a mermaid diagram's zoom level changes (via scroll gesture or
 /// the reset button), so a scroll container can keep the diagram anchored.
@@ -6901,16 +6900,12 @@ mod tests {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let clicks = self.clicks.clone();
                 MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
-                    .on_source_click(
-                        move |source_index, click_count, modifiers, _, _| {
-                            clicks.borrow_mut().push((
-                                source_index,
-                                click_count,
-                                *modifiers,
-                            ));
-                            true
-                        },
-                    )
+                    .on_source_click(move |source_index, click_count, modifiers, _, _| {
+                        clicks
+                            .borrow_mut()
+                            .push((source_index, click_count, *modifiers));
+                        true
+                    })
             }
         }
 
