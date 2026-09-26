@@ -1174,6 +1174,11 @@
     // Threads Sidebar. Applies when `default_open_behavior` or
     // `cli_default_open_behavior` is set to "existing_window".
     "threads_sidebar_auto_open": true,
+    // Whether to filter the Threads Sidebar to only show threads
+    // belonging to the current worktree. When enabled, threads from
+    // other worktrees are hidden; when disabled, threads from all
+    // worktrees are shown.
+    "threads_filter_by_current_worktree": false,
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.
     "default_width": 640,

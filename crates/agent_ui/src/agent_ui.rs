@@ -1016,6 +1016,7 @@ mod tests {
             sidebar_side: Default::default(),
             threads_sidebar_default_width: px(300.),
             threads_sidebar_auto_open: true,
+            threads_filter_by_current_worktree: false,
             thinking_display: Default::default(),
         };
 

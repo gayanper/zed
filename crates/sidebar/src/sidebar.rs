@@ -27,6 +27,7 @@ use editor::Editor;
 use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
+use fs::Fs;
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
     FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
@@ -885,6 +886,16 @@ impl Sidebar {
                 this.width = width;
                 cx.notify();
             }
+
+            let thread_scope = if AgentSettings::get_global(cx).threads_filter_by_current_worktree {
+                ThreadScope::CurrentWorktree
+            } else {
+                ThreadScope::All
+            };
+            if this.thread_scope != thread_scope {
+                this.thread_scope = thread_scope;
+                this.schedule_update_entries(false, cx);
+            }
         })
         .detach();
 
@@ -977,7 +988,11 @@ impl Sidebar {
             width_set_by_user: false,
             focus_handle,
             filter_editor,
-            thread_scope: ThreadScope::All,
+            thread_scope: if AgentSettings::get_global(cx).threads_filter_by_current_worktree {
+                ThreadScope::CurrentWorktree
+            } else {
+                ThreadScope::All
+            },
             rename_editor,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             contents: SidebarContents::default(),
@@ -3461,6 +3476,13 @@ impl Sidebar {
             ThreadScope::All => ThreadScope::CurrentWorktree,
             ThreadScope::CurrentWorktree => ThreadScope::All,
         };
+        let filtered = self.thread_scope == ThreadScope::CurrentWorktree;
+        settings::update_settings_file(<dyn Fs>::global(cx), cx, move |settings, _| {
+            settings
+                .agent
+                .get_or_insert_default()
+                .threads_filter_by_current_worktree = Some(filtered);
+        });
         self.schedule_update_entries(false, cx);
     }
 

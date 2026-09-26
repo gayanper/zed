@@ -217,6 +217,7 @@ pub struct AgentSettings {
     pub sidebar_side: SidebarDockPosition,
     pub threads_sidebar_default_width: Pixels,
     pub threads_sidebar_auto_open: bool,
+    pub threads_filter_by_current_worktree: bool,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
@@ -779,6 +780,7 @@ impl Settings for AgentSettings {
                 .into_gpui()
                 .clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH),
             threads_sidebar_auto_open: agent.threads_sidebar_auto_open.unwrap(),
+            threads_filter_by_current_worktree: agent.threads_filter_by_current_worktree.unwrap(),
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),
             max_content_width: if agent.limit_content_width.unwrap() {

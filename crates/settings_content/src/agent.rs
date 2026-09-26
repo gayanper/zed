@@ -250,6 +250,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub threads_sidebar_auto_open: Option<bool>,
+    /// Whether to filter the Threads Sidebar to only show threads
+    /// belonging to the current worktree.
+    ///
+    /// When enabled, threads from other worktrees are hidden from the
+    /// Threads Sidebar. When disabled, threads from all worktrees are shown.
+    ///
+    /// Default: false
+    pub threads_filter_by_current_worktree: Option<bool>,
     /// Default fixed width in pixels when the agent panel is docked to the left or right and
     /// `flexible` is false.
     ///
