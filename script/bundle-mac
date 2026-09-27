@@ -7,6 +7,8 @@ build_flag="--release"
 target_dir="release"
 open_result=false
 local_install=false
+local_build=false
+skip_remote_server=false
 can_code_sign=false
 
 # This must match the team in the provisioning profile.
@@ -23,6 +25,8 @@ Options:
   -d    Compile in debug mode
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
+  -l    Local fast build: skip LTO and distribution-only steps (symbols,
+        notarization, DMG license, remote server) for a same-machine DMG.
   -h    Display this help and exit.
   "
 }
@@ -37,6 +41,7 @@ do
             target_dir="debug"
             ;;
         i) local_install=true;;
+        l) local_build=true;;
         h)
            help_info
            exit 0
@@ -46,12 +51,31 @@ done
 
 shift $((OPTIND-1))
 
+if [[ "$local_build" = true ]]; then
+    # Fastest local release: keep `--release` (stable target dir and
+    # cargo-bundle flags) but drop thin-LTO, widen codegen units, and skip
+    # every distribution-only step below (debug symbols, strip, sentry,
+    # remote server, DMG license, notarization).
+    export CARGO_PROFILE_RELEASE_LTO=false
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+    export CARGO_INCREMENTAL=true
+    skip_remote_server=true
+fi
 
-# Get release channel
-pushd crates/zed
-channel=$(<RELEASE_CHANNEL)
-export ZED_RELEASE_CHANNEL="${channel}"
-popd
+
+# Get release channel. Prefer an already-exported ZED_RELEASE_CHANNEL so local
+# builds don't have to rewrite crates/zed/RELEASE_CHANNEL (bumping its mtime
+# invalidates cargo's cache for the release_channel crate and everything
+# downstream, even when the content is unchanged). When set, the
+# release_channel crate bakes it in via env! and never reads the file.
+if [[ -z "${ZED_RELEASE_CHANNEL:-}" ]]; then
+    pushd crates/zed
+    channel=$(<RELEASE_CHANNEL)
+    popd
+    export ZED_RELEASE_CHANNEL="${channel}"
+else
+    channel="${ZED_RELEASE_CHANNEL}"
+fi
 
 export ZED_BUNDLE=true
 export CARGO_BUNDLE_SKIP_BUILD=true
@@ -81,16 +105,30 @@ else
     exit 1
 fi
 
-# Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+# Generate the licenses first, so they can be baked into the binaries.
+# For local builds the output only changes when dependencies or the template
+# change, so skip regeneration when it is already up to date.
+if [[ "$local_build" = true && -f assets/licenses.md && assets/licenses.md -nt Cargo.lock && assets/licenses.md -nt script/licenses/zed-licenses.toml && assets/licenses.md -nt script/licenses/template.md.hbs ]] || [[ "${ZED_SKIP_LICENSES:-}" == "1" ]]; then
+    echo "Skipping license generation (up to date)"
+else
+    script/generate-licenses
+fi
 
-rustup target add $target_triple
+if rustup target list --installed 2>/dev/null | grep -qx "${target_triple}"; then
+    echo "Target ${target_triple} already installed"
+else
+    rustup target add $target_triple
+fi
 
 echo "Compiling zed binaries"
 cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+if [[ "$skip_remote_server" = true ]]; then
+    echo "Skipping remote_server build (local build)"
+else
+    # Build remote_server in separate invocation to prevent feature unification from other crates
+    # from influencing dynamic libraries required by it.
+    cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -193,7 +231,16 @@ function sign_app_binaries() {
     mkdir -p "${app_path}/Contents/Frameworks"
 
     echo "Downloading git binary"
-    download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
+    git_cache_dir="target/git-cache/${target_triple}-${GIT_VERSION_SHA}"
+    cached_git_binary="${git_cache_dir}/git"
+    if [[ -x "$cached_git_binary" ]]; then
+        echo "Reusing cached git binary at ${cached_git_binary}"
+        cp "$cached_git_binary" "${app_path}/Contents/MacOS/git"
+    else
+        download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
+        mkdir -p "$git_cache_dir"
+        cp "${app_path}/Contents/MacOS/git" "$cached_git_binary"
+    fi
 
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
     cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
@@ -251,25 +298,34 @@ function sign_app_binaries() {
         rm -rf ${dmg_source_directory}
         mkdir -p ${dmg_source_directory}
         mv "${app_path}" "${dmg_source_directory}"
-        notarization_key_file=$(mktemp)
 
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
         ln -s /Applications ${dmg_source_directory}
 
-        echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        if [[ "$local_build" = true ]]; then
+            # ULFO (lzfse) is the fastest DMG format to create on modern
+            # macOS and needs no license agreement for same-machine use.
+            echo "Creating fast local DMG at ${dmg_file_path} using ${dmg_source_directory}"
+            hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format ULFO "${dmg_file_path}"
+        else
+            echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
+            hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+
+            echo "Adding license agreement to DMG"
+            if ! command -v dmg-license &> /dev/null; then
+                npm install --global dmg-license minimist
+            fi
+            dmg-license script/terms/terms.json "${dmg_file_path}"
+        fi
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
         rm ${dmg_source_directory}/Applications
 
-        echo "Adding license agreement to DMG"
-        npm install --global dmg-license minimist
-        dmg-license script/terms/terms.json "${dmg_file_path}"
-
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
+            notarization_key_file=$(mktemp)
             /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
             echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
             "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
@@ -311,7 +367,9 @@ function extract_debug_symbols() {
 }
 
 function upload_debug_symbols() {
-    if [ "$local_install" = true ]; then
+    if [ "$local_build" = true ]; then
+        echo "local build; skipping sentry upload and symbol extraction."
+    elif [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
@@ -341,7 +399,7 @@ upload_debug_symbols
 # Sentry receives the extracted zed.dwarf, not the binary, so debug symbols
 # must be extracted before the binaries are stripped below. The .dwarf files
 # also keep symbols recoverable when the sentry upload is skipped.
-if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
+if [[ "$target_dir" == "release" && "$local_install" != true && "$local_build" != true ]]; then
     extract_debug_symbols
     strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
@@ -352,5 +410,9 @@ cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ "$skip_remote_server" = true ]]; then
+    echo "Skipping remote_server signing and packaging (local build)"
+else
+    sign_binary "target/${target_triple}/${target_dir}/remote_server"
+    gzip -f --stdout --best "target/${target_triple}/${target_dir}/remote_server" > "target/zed-remote-server-macos-${arch_suffix}.gz"
+fi
