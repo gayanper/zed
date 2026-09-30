@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Build a Zed DMG for use on this machine, reusing cargo's build cache.
+#
+# Self-contained on purpose: it does not modify or depend on changes to
+# upstream scripts (script/bundle-mac) or tracked files, so it never causes
+# merge conflicts when rebasing onto main.
+#
+# Caching notes:
+# - ZED_RELEASE_CHANNEL is exported instead of rewriting crates/zed/RELEASE_CHANNEL,
+#   because bumping that file's mtime invalidates release_channel and every crate
+#   depending on it.
+# - Every env var and flag that feeds cargo's fingerprint is fixed here, so
+#   consecutive runs only recompile what changed.
+# - LTO is disabled and incremental compilation is enabled for the release profile.
+# - crates/zed/Cargo.toml is restored with its original mtime after cargo-bundle.
+# - sccache is used automatically when installed.
+# - The bundled git binary, licenses and rustup target are only fetched/generated once.
+
+set -euo pipefail
+
+channel="${ZED_RELEASE_CHANNEL:-nightly}"
+open_result=false
+local_install=false
+
+help_info() {
+  echo "
+Usage: ${0##*/} [options] [target-triple=host]
+Build a local Zed DMG with maximal build caching.
+
+Options:
+  -c <channel>  Release channel: dev, nightly, preview, stable (default: nightly)
+  -o            Open the directory containing the DMG (or the app with -i).
+  -i            Install the app into /Applications instead of only creating the DMG.
+  -h            Display this help and exit.
+"
+}
+
+while getopts 'c:oih' flag; do
+    case "${flag}" in
+        c) channel="${OPTARG}";;
+        o) open_result=true;;
+        i) local_install=true;;
+        h) help_info; exit 0;;
+        *) help_info; exit 1;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [[ ! -d "./script" || ! -f "crates/zed/Cargo.toml" ]]; then
+    echo "This script must be run from the root of the repository."
+    exit 1
+fi
+
+if [[ ! -d "crates/zed/contents/${channel}" ]]; then
+    echo "Unknown release channel: ${channel}"
+    exit 1
+fi
+
+target_triple=$(rustc --version --verbose | sed -n 's/^host: //p')
+if [[ $# -gt 0 && -n "$1" ]]; then
+    target_triple="$1"
+fi
+case "$target_triple" in
+    aarch64-apple-darwin) arch_suffix="aarch64"; git_arch="arm64";;
+    x86_64-apple-darwin) arch_suffix="x86_64"; git_arch="x64";;
+    *) echo "Unsupported architecture $target_triple"; exit 1;;
+esac
+
+export ZED_RELEASE_CHANNEL="${channel}"
+export ZED_BUNDLE=true
+export CARGO_BUNDLE_SKIP_BUILD=true
+export CXXFLAGS="-stdlib=libc++"
+export CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+export CARGO_PROFILE_RELEASE_INCREMENTAL=true
+if [[ -z "${RUSTC_WRAPPER:-}" ]] && command -v sccache &> /dev/null; then
+    # sccache cannot cache incremental builds, so let it handle the
+    # non-workspace crates while cargo's incremental cache handles the rest.
+    export RUSTC_WRAPPER=sccache
+fi
+
+target_dir="target/${target_triple}/release"
+cache_dir="target/local-dmg-cache"
+mkdir -p "$cache_dir"
+
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [[ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+fi
+
+if ! rustup target list --installed 2>/dev/null | grep -qx "${target_triple}"; then
+    rustup target add "$target_triple"
+fi
+
+if [[ -f assets/licenses.md \
+    && assets/licenses.md -nt Cargo.lock \
+    && assets/licenses.md -nt script/licenses/zed-licenses.toml \
+    && assets/licenses.md -nt script/licenses/template.md.hbs ]]; then
+    echo "Licenses up to date"
+else
+    script/generate-licenses
+fi
+
+echo "Compiling zed binaries (${channel}, ${target_triple})"
+cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --target "$target_triple"
+
+echo "Creating application bundle"
+manifest="crates/zed/Cargo.toml"
+manifest_backup="${cache_dir}/Cargo.toml.backup"
+cp -p "$manifest" "$manifest_backup"
+restore_manifest() {
+    if [[ -f "$manifest_backup" ]]; then
+        mv "$manifest_backup" "$manifest"
+    fi
+}
+trap restore_manifest EXIT
+sed -i '' "s/package.metadata.bundle-${channel}/package.metadata.bundle/" "$manifest"
+app_path=$(cd crates/zed && cargo bundle --release --target "$target_triple" --select-workspace-root | xargs)
+restore_manifest
+echo "Bundled ${app_path}"
+
+document_icon_source="crates/zed/resources/Document.icns"
+if [[ -f "$document_icon_source" ]]; then
+    mkdir -p "${app_path}/Contents/Resources"
+    cp "$document_icon_source" "${app_path}/Contents/Resources/Document.icns"
+fi
+
+cp "${target_dir}/zed" "${app_path}/Contents/MacOS/zed"
+cp "${target_dir}/cli" "${app_path}/Contents/MacOS/cli"
+
+rm -rf "${app_path}/Contents/Frameworks"
+mkdir -p "${app_path}/Contents/Frameworks"
+
+git_version="v2.43.3"
+git_version_sha="fa29823"
+cached_git="${cache_dir}/git-${git_version}-${git_version_sha}-${git_arch}"
+if [[ ! -x "$cached_git" ]]; then
+    echo "Downloading git binary"
+    git_tmp_dir=$(mktemp -d)
+    curl --silent --fail --location \
+        "https://github.com/desktop/dugite-native/releases/download/${git_version}/dugite-native-${git_version}-${git_version_sha}-macOS-${git_arch}.tar.gz" \
+        | tar -xz -C "$git_tmp_dir" -f - bin/git
+    mv "${git_tmp_dir}/bin/git" "$cached_git"
+    rm -rf "$git_tmp_dir"
+fi
+cp "$cached_git" "${app_path}/Contents/MacOS/git"
+
+cp "crates/zed/contents/${channel}/embedded.provisionprofile" "${app_path}/Contents/"
+
+# Associated domains require Zed's signing identity, so they are dropped for local signing.
+sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements \
+    > "${app_path}/Contents/Resources/zed.entitlements"
+codesign --force --deep --entitlements "${app_path}/Contents/Resources/zed.entitlements" \
+    --sign "${MACOS_SIGNING_KEY:--}" "${app_path}"
+
+bundle_name=$(basename "$app_path")
+
+if [[ "$local_install" = true ]]; then
+    rm -rf "/Applications/${bundle_name}"
+    mv "$app_path" "/Applications/${bundle_name}"
+    echo "Installed /Applications/${bundle_name}"
+    if [[ "$open_result" = true ]]; then
+        open "/Applications/${bundle_name}"
+    fi
+    exit 0
+fi
+
+dmg_source_directory="${target_dir}/dmg"
+dmg_file_path="${target_dir}/Zed-${arch_suffix}.dmg"
+rm -rf "$dmg_source_directory"
+mkdir -p "$dmg_source_directory"
+mv "$app_path" "$dmg_source_directory"
+ln -s /Applications "${dmg_source_directory}/Applications"
+# ULFO (lzfse) is the fastest compressed format to create; no license
+# agreement or notarization is needed for same-machine use.
+hdiutil create -volname Zed -srcfolder "$dmg_source_directory" -ov -format ULFO "$dmg_file_path"
+# A symlink to /Applications inside the repo makes Zed index it when editing this repo.
+rm "${dmg_source_directory}/Applications"
+
+echo "Created ${dmg_file_path}"
+if [[ "$open_result" = true ]]; then
+    open "$target_dir"
+fi
