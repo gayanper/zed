@@ -228,6 +228,29 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_show_selection_comment_button(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_selection_comment_button != show {
+            self.show_selection_comment_button = show;
+            cx.notify();
+        }
+    }
+
+    pub fn show_selection_comment_button(&self) -> bool {
+        self.show_selection_comment_button
+    }
+
+    pub fn show_cursor_comment_button(&self) -> bool {
+        self.show_cursor_comment_button
+    }
+
+    /// Shows the comment button even when the newest selection is empty.
+    pub fn set_show_cursor_comment_button(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_cursor_comment_button != show {
+            self.show_cursor_comment_button = show;
+            cx.notify();
+        }
+    }
+
     fn set_show_scrollbars(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_scrollbars = ScrollbarAxes {
             horizontal: show,

@@ -1,5 +1,5 @@
 [package]
-name = "markdown_preview"
+name = "agent_comments"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -9,36 +9,28 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [lib]
-path = "src/markdown_preview.rs"
+path = "src/agent_comments.rs"
 doctest = false
 
-[features]
-test-support = []
-
 [dependencies]
-agent_comments.workspace = true
-anyhow.workspace = true
-db.workspace = true
+collections.workspace = true
 editor.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
-markdown.workspace = true
-project.workspace = true
-settings.workspace = true
-theme.workspace = true
-theme_settings.workspace = true
+multi_buffer.workspace = true
 ui.workspace = true
-urlencoding.workspace = true
 util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
-buffer_diff.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 fs.workspace = true
-gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
+util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

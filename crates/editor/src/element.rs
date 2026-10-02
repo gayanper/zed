@@ -2115,6 +2115,80 @@ impl EditorElement {
         Some(button)
     }
 
+    fn layout_selection_comment_button(
+        &self,
+        display_row: DisplayRow,
+        line_layout: &LineWithInvisibles,
+        crease_trailer: Option<&CreaseTrailerLayout>,
+        em_width: Pixels,
+        content_origin: gpui::Point<Pixels>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+        line_height: Pixels,
+        snapshot: &EditorSnapshot,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let editor = self.editor.read(cx);
+        if !editor.focus_handle.is_focused(window) || editor.selections.pending_anchor().is_some() {
+            return None;
+        }
+        let newest_selection = editor.selections.newest_anchor();
+        let is_cursor = newest_selection
+            .start
+            .cmp(&newest_selection.end, snapshot.buffer_snapshot())
+            .is_eq();
+        // The cursor icon is not debounced, so it must not wait on the
+        // selection flag.
+        let visible = if is_cursor {
+            editor.show_cursor_comment_button
+        } else {
+            editor.show_selection_comment_button
+        };
+        if !visible {
+            return None;
+        }
+
+        let icon_size = IconSize::Small;
+        let focus_handle = editor.focus_handle.clone();
+        let mut button = IconButton::new("selection_comment_button", IconName::Chat)
+            .icon_size(icon_size)
+            .shape(ui::IconButtonShape::Square)
+            .style(ButtonStyle::Filled)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Comment for Agent",
+                    &zed_actions::agent_comments::ToggleComment,
+                    &focus_handle,
+                    cx,
+                )
+            })
+            .on_click(|_, window, cx| {
+                window
+                    .dispatch_action(zed_actions::agent_comments::ToggleComment.boxed_clone(), cx);
+            })
+            .into_any_element();
+
+        let line_end = if let Some(crease_trailer) = crease_trailer {
+            crease_trailer.bounds.right()
+        } else {
+            Pixels::from(
+                ScrollPixelOffset::from(content_origin.x + line_layout.width)
+                    - scroll_pixel_position.x,
+            )
+        };
+        let start_x = line_end + em_width;
+        let start_y = content_origin.y
+            + (((display_row.as_f64() - scroll_position.y) as f32) * line_height)
+            + (line_height / 2.0)
+            - (icon_size.square(window, cx) / 2.);
+
+        let absolute_offset = point(start_x, start_y);
+        button.layout_as_root(AvailableSpace::min_size(), window, cx);
+        button.prepaint_as_root(absolute_offset, AvailableSpace::min_size(), window, cx);
+        Some(button)
+    }
+
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -5885,6 +5959,7 @@ impl EditorElement {
                 self.paint_inline_diagnostics(layout, window, cx);
                 self.paint_inline_blame(layout, window, cx);
                 self.paint_inline_code_actions(layout, window, cx);
+                self.paint_selection_comment_button(layout, window, cx);
                 self.paint_diff_hunk_controls(layout, window, cx);
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
@@ -6617,6 +6692,19 @@ impl EditorElement {
         if let Some(mut inline_code_actions) = layout.inline_code_actions.take() {
             window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
                 inline_code_actions.paint(window, cx);
+            })
+        }
+    }
+
+    fn paint_selection_comment_button(
+        &mut self,
+        layout: &mut EditorLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(mut selection_comment_button) = layout.selection_comment_button.take() {
+            window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
+                selection_comment_button.paint(window, cx);
             })
         }
     }
@@ -9430,6 +9518,7 @@ impl Element for EditorElement {
 
                     let mut inline_blame_layout = None;
                     let mut inline_code_actions = None;
+                    let mut selection_comment_button = None;
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
                         if (start_row..end_row).contains(&display_row)
@@ -9453,6 +9542,19 @@ impl Element for EditorElement {
                                 crease_trailers.get(line_ix),
                             ) {
                                 let crease_trailer_layout = crease_trailer.as_ref();
+                                selection_comment_button = self.layout_selection_comment_button(
+                                    display_row,
+                                    line_layout,
+                                    crease_trailer_layout,
+                                    em_width,
+                                    content_origin,
+                                    scroll_position,
+                                    scroll_pixel_position,
+                                    line_height,
+                                    &snapshot,
+                                    window,
+                                    cx,
+                                );
                                 if let Some(layout) = self.layout_inline_blame(
                                     display_row,
                                     row_info,
@@ -9990,6 +10092,7 @@ impl Element for EditorElement {
                         point_diagnostic_underline_offset,
                         inline_blame_layout,
                         inline_code_actions,
+                        selection_comment_button,
                         blocks,
                         spacer_blocks,
                         cursors,
@@ -10207,6 +10310,7 @@ pub struct EditorLayout {
     point_diagnostic_underline_offset: Pixels,
     inline_blame_layout: Option<InlineBlameLayout>,
     inline_code_actions: Option<AnyElement>,
+    selection_comment_button: Option<AnyElement>,
     blocks: Vec<BlockLayout>,
     spacer_blocks: Vec<BlockLayout>,
     highlighted_ranges: Vec<(Range<DisplayPoint>, Hsla)>,

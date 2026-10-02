@@ -392,6 +392,19 @@ pub mod toast {
     );
 }
 
+pub mod agent_comments {
+    use gpui::actions;
+
+    actions!(
+        agent_comments,
+        [
+            /// Comments for the agent on the selection, or opens or closes the
+            /// agent comment under the cursor.
+            ToggleComment,
+        ]
+    );
+}
+
 pub mod command_palette {
     use gpui::actions;
 

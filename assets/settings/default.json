@@ -1281,6 +1281,8 @@
     },
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
+    // Whether to allow commenting on editor and markdown preview text for the agent.
+    "enable_comments": false,
     "default_profile": "write",
     "profiles": {
       "write": {

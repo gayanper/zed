@@ -739,6 +739,7 @@ fn main() {
         workspace::init(app_state.clone(), cx);
         ui_prompt::init(cx);
 
+        agent_comments::init(cx);
         go_to_line::init(cx);
         file_finder::init(cx);
         tab_switcher::init(cx);

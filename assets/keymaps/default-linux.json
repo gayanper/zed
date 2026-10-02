@@ -1677,4 +1677,25 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "ctrl-alt-m": "agent_comments::ToggleComment",
+    },
+  },
+  {
+    "context": "AgentCommentInput",
+    "bindings": {
+      "tab": "agent_comments::FocusNext",
+      "shift-tab": "agent_comments::FocusPrevious",
+    },
+  },
+  {
+    "context": "AgentCommentInput > Editor",
+    "bindings": {
+      "ctrl-enter": "agent_comments::Submit",
+      "tab": "agent_comments::FocusNext",
+      "shift-tab": "agent_comments::FocusPrevious",
+    },
+  },
 ]

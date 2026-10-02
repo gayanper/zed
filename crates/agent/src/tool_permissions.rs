@@ -598,6 +598,7 @@ mod tests {
                 threshold: agent_settings::AutoCompactThreshold::DEFAULT,
             },
             enable_feedback: false,
+            enable_comments: false,
             expand_edit_card: true,
             expand_terminal_card: true,
             terminal_init_command: None,

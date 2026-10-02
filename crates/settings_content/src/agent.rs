@@ -351,6 +351,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub enable_feedback: Option<bool>,
+    /// Whether to allow commenting on editor and markdown preview text for the agent.
+    ///
+    /// Default: false
+    pub enable_comments: Option<bool>,
     /// Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     ///
     /// Default: true

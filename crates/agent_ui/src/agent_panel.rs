@@ -13,6 +13,9 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
+use agent_comments::{
+    ActiveCommentStore, AgentCommentStore, AgentCommentStoreEvent, InsertPendingComments,
+};
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
@@ -949,6 +952,7 @@ struct AgentTerminal {
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
     has_notification: bool,
+    comment_store: Entity<AgentCommentStore>,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
@@ -1136,6 +1140,7 @@ pub struct AgentPanel {
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
     _settings_subscription: Subscription,
+    _visible_comment_store_subscription: Option<Subscription>,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
 
@@ -1506,7 +1511,8 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if this.remove_retained_thread(thread_id).is_some() {
+                if let Some(conversation_view) = this.remove_retained_thread(thread_id) {
+                    Self::clear_agent_comments(&conversation_view, cx);
                     cx.notify();
                 }
             },
@@ -1514,6 +1520,8 @@ impl AgentPanel {
 
         let _settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
             this.cleanup_retained_threads(cx);
+            this.sync_active_comment_store(cx);
+            cx.notify();
         });
 
         cx.on_release(|this, cx| {
@@ -1558,6 +1566,7 @@ impl AgentPanel {
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
             _settings_subscription,
+            _visible_comment_store_subscription: None,
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
@@ -2242,6 +2251,7 @@ impl AgentPanel {
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
+            comment_store: cx.new(|_| AgentCommentStore::default()),
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -3307,7 +3317,14 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.remove_retained_thread(&id);
+        let removed_view = self.remove_retained_thread(&id).or_else(|| {
+            self.active_conversation_view()
+                .filter(|conversation_view| conversation_view.read(cx).thread_id == id)
+                .cloned()
+        });
+        if let Some(conversation_view) = removed_view {
+            Self::clear_agent_comments(&conversation_view, cx);
+        }
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
@@ -4268,7 +4285,10 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.is_idle_for_retention()
+                // Pending agent comments live only in the view, so keep it.
+                thread.connection().supports_load_session()
+                    && thread.is_idle_for_retention()
+                    && view.read(cx).agent_comment_store().read(cx).is_empty()
             })
             .collect::<Vec<_>>();
 
@@ -4339,6 +4359,7 @@ impl AgentPanel {
                     this._thread_view_subscription =
                         Self::subscribe_to_active_thread_view(&server_view, window, cx);
                     this.observe_active_draft_for_empty_editor(&server_view, cx);
+                    this.sync_active_comment_store(cx);
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
                     cx.notify();
@@ -4370,7 +4391,57 @@ impl AgentPanel {
                 None
             }
         };
+        self.sync_active_comment_store(cx);
         self.serialize(cx);
+    }
+
+    /// Comments belong to their session, so they go when it is closed or
+    /// archived, even while something else still holds its view.
+    fn clear_agent_comments(conversation_view: &Entity<ConversationView>, cx: &mut App) {
+        let store = conversation_view.read(cx).agent_comment_store().clone();
+        store.update(cx, |store, cx| store.clear(cx));
+    }
+
+    fn comments_enabled(cx: &App) -> bool {
+        let settings = AgentSettings::get_global(cx);
+        settings.enabled(cx) && settings.enable_comments
+    }
+
+    /// The visible session's comment store and title.
+    fn visible_comment_store(&self, cx: &App) -> Option<(Entity<AgentCommentStore>, SharedString)> {
+        if !Self::comments_enabled(cx) {
+            return None;
+        }
+        match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
+                let conversation_view = conversation_view.read(cx);
+                Some((
+                    conversation_view.agent_comment_store().clone(),
+                    conversation_view.title(cx),
+                ))
+            }
+            BaseView::Terminal { terminal_id } => self
+                .terminals
+                .get(terminal_id)
+                .map(|terminal| (terminal.comment_store.clone(), terminal.title(cx))),
+            BaseView::Uninitialized => None,
+        }
+    }
+
+    /// Sends new agent comments to the visible session, and shows only its
+    /// comments in editors.
+    fn sync_active_comment_store(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_comment_store(cx);
+        self._visible_comment_store_subscription = visible.as_ref().map(|(store, _)| {
+            cx.subscribe(store, |_, _, _: &AgentCommentStoreEvent, cx| cx.notify())
+        });
+        let (store, title) = match visible {
+            Some((store, title)) => (Some(store), title),
+            None => (None, SharedString::default()),
+        };
+        ActiveCommentStore::global(cx).update(cx, |active_store, cx| {
+            active_store.set(store.as_ref(), title, cx)
+        });
     }
 
     fn visible_surface(&self) -> VisibleSurface<'_> {
@@ -6194,6 +6265,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .children(self.render_agent_comments_button(cx))
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
@@ -6210,6 +6282,118 @@ impl AgentPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(toolbar_content)
+    }
+
+    fn render_agent_comments_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (store, _) = self.visible_comment_store(cx)?;
+        let count = store.read(cx).len();
+        if count == 0 {
+            return None;
+        }
+        let tooltip = if count == 1 {
+            "Insert 1 pending comment into prompt".to_string()
+        } else {
+            format!("Insert {count} pending comments into prompt")
+        };
+        let focus_handle = self.focus_handle.clone();
+        Some(
+            Button::new("agent-comments-insert", count.to_string())
+                .start_icon(Icon::new(IconName::Chat).size(IconSize::Small))
+                .label_size(LabelSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in(
+                        tooltip.clone(),
+                        &InsertPendingComments,
+                        &focus_handle,
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.insert_agent_comments(window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Inserts the visible session's pending agent comments into its prompt,
+    /// without submitting it, and removes them from the session.
+    fn insert_agent_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((store, _)) = self.visible_comment_store(cx) else {
+            return;
+        };
+        match self.visible_surface() {
+            VisibleSurface::Uninitialized => {}
+            VisibleSurface::AgentThread(conversation_view) => {
+                let Some(thread_view) = conversation_view
+                    .read(cx)
+                    .active_thread()
+                    .cloned()
+                    .or_else(|| conversation_view.read(cx).root_thread_view())
+                else {
+                    return;
+                };
+                let comments = store.update(cx, |store, cx| {
+                    store.take_pending_comments(
+                        |buffer, cx| {
+                            let file = buffer.file()?;
+                            Some(file.path().display(file.path_style(cx)).into_owned().into())
+                        },
+                        cx,
+                    )
+                });
+                let text = agent_comments::format_comments(&comments);
+                if text.is_empty() {
+                    return;
+                }
+                let message_editor = thread_view.read(cx).message_editor.clone();
+                message_editor.update(cx, |editor, cx| editor.insert_text(&text, window, cx));
+                window.focus(&message_editor.focus_handle(cx), cx);
+            }
+            VisibleSurface::Terminal(terminal_view) => {
+                let terminal_view = terminal_view.clone();
+                let working_directory = terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .working_directory()
+                    .or_else(|| {
+                        self.active_terminal_id()
+                            .and_then(|terminal_id| self.terminals.get(&terminal_id))
+                            .and_then(|terminal| terminal.working_directory.clone())
+                    });
+                let project = self.project.clone();
+                let path_style = project.read(cx).path_style(cx);
+                let comments = store.update(cx, |store, cx| {
+                    store.take_pending_comments(
+                        |buffer, cx| {
+                            let project_path = buffer.project_path(cx)?;
+                            Some(
+                                mention_path_for_terminal(
+                                    &project,
+                                    &project_path,
+                                    working_directory.as_deref(),
+                                    path_style,
+                                    cx,
+                                )
+                                .into(),
+                            )
+                        },
+                        cx,
+                    )
+                });
+                let text = agent_comments::format_comments(&comments);
+                if text.is_empty() {
+                    return;
+                }
+                // Bracketed paste with no trailing newline, so the terminal
+                // agent doesn't treat it as Enter.
+                terminal_view.update(cx, |view, cx| {
+                    view.terminal()
+                        .update(cx, |terminal, _| terminal.paste(&text));
+                    window.focus(&view.focus_handle(cx), cx);
+                });
+            }
+        }
     }
 
     fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
@@ -6509,6 +6693,9 @@ impl Render for AgentPanel {
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
                 this.new_thread(action, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertPendingComments, window, cx| {
+                this.insert_agent_comments(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
@@ -9426,6 +9613,311 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    async fn setup_agent_comments(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Entity<AgentPanel>, VisualTestContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            agent_comments::init(cx);
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(true);
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/project", json!({ "file.txt": "one two\nthree\n" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        (workspace, panel, cx)
+    }
+
+    fn active_comment_store(cx: &mut VisualTestContext) -> Option<Entity<AgentCommentStore>> {
+        cx.update(|_, cx| agent_comments::active_comment_store(cx))
+    }
+
+    fn visible_comment_store(
+        panel: &Entity<AgentPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<AgentCommentStore> {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .visible_comment_store(cx)
+                .expect("a session should be visible")
+                .0
+        })
+    }
+
+    /// Comments on `range` of `file.txt` through the editor, as the user would.
+    async fn comment_in_editor(
+        workspace: &Entity<Workspace>,
+        range: std::ops::Range<language::Point>,
+        body: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/project/file.txt"),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("file should open");
+        let editor = item
+            .downcast::<Editor>()
+            .expect("file should open in an editor");
+        editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([range])
+            });
+        });
+        cx.dispatch_action(zed_actions::agent_comments::ToggleComment);
+        cx.run_until_parked();
+        cx.simulate_input(body);
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_agent_comments_go_to_the_visible_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        assert!(active_comment_store(&mut cx).is_none(), "no session yet");
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let first_store = visible_comment_store(&panel, &mut cx);
+        assert_eq!(
+            active_comment_store(&mut cx).map(|store| store.entity_id()),
+            Some(first_store.entity_id())
+        );
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 4)..language::Point::new(0, 7),
+            "Two.",
+            &mut cx,
+        )
+        .await;
+        first_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let second_store = visible_comment_store(&panel, &mut cx);
+        assert_ne!(first_store.entity_id(), second_store.entity_id());
+        comment_in_editor(
+            &workspace,
+            language::Point::new(1, 0)..language::Point::new(1, 5),
+            "Three.",
+            &mut cx,
+        )
+        .await;
+        first_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        second_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            active_comment_store(&mut cx).is_none(),
+            "the setting turns comments off"
+        );
+        second_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+    }
+
+    #[gpui::test]
+    async fn test_agent_comments_are_dropped_with_their_session(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let thread_store = visible_comment_store(&panel, &mut cx);
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 4)..language::Point::new(0, 7),
+            "Two.",
+            &mut cx,
+        )
+        .await;
+        let thread_id = active_thread_id(&panel, &cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.remove_thread_without_activating_draft(thread_id, window, cx)
+        });
+        cx.run_until_parked();
+        thread_store.read_with(&cx, |store, _| {
+            assert!(store.is_empty(), "removing a thread drops its comments")
+        });
+        assert!(active_comment_store(&mut cx).is_none());
+
+        let terminal_id = TerminalId::new();
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    Some(PathBuf::from("/project")),
+                    Some("Terminal".into()),
+                    None,
+                    None,
+                    true,
+                    true,
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+            .expect("display-only terminal should be inserted");
+        cx.run_until_parked();
+        let terminal_store = visible_comment_store(&panel, &mut cx).downgrade();
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 4)..language::Point::new(0, 7),
+            "Two.",
+            &mut cx,
+        )
+        .await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal_without_activating_draft(terminal_id, window, cx)
+        });
+        cx.run_until_parked();
+        // The last rendered frame still holds the session's views.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            terminal_store.upgrade().is_none(),
+            "closing a terminal drops its comments"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_insert_agent_comments_into_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let store = visible_comment_store(&panel, &mut cx);
+        comment_in_editor(
+            &workspace,
+            language::Point::new(1, 0)..language::Point::new(1, 5),
+            "Three.",
+            &mut cx,
+        )
+        .await;
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 0)..language::Point::new(0, 3),
+            "One.",
+            &mut cx,
+        )
+        .await;
+
+        let button_shown = panel.update(&mut cx, |panel, cx| {
+            panel.render_agent_comments_button(cx).is_some()
+        });
+        assert!(button_shown);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_agent_comments(window, cx)
+        });
+        cx.run_until_parked();
+
+        let text = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be visible")
+                .read(cx)
+                .message_editor
+                .read(cx)
+                .editor()
+                .read(cx)
+                .text(cx)
+        });
+        assert_eq!(text, "`file.txt:2`\nThree.\n\n`file.txt:1`\nOne.");
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
+        let button_shown = panel.update(&mut cx, |panel, cx| {
+            panel.render_agent_comments_button(cx).is_some()
+        });
+        assert!(!button_shown, "the count returns to 0");
+    }
+
+    #[gpui::test]
+    async fn test_insert_agent_comments_pastes_into_terminal_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let terminal_id = TerminalId::new();
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    Some(PathBuf::from("/project")),
+                    Some("Terminal".into()),
+                    None,
+                    None,
+                    true,
+                    true,
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+            .expect("display-only terminal should be inserted");
+        cx.run_until_parked();
+        let store = visible_comment_store(&panel, &mut cx);
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 4)..language::Point::new(0, 7),
+            "Two.",
+            &mut cx,
+        )
+        .await;
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        terminal.update(&mut cx, |terminal, _| {
+            terminal.take_input_log();
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_agent_comments(window, cx)
+        });
+        cx.run_until_parked();
+
+        let pasted: String = terminal
+            .update(&mut cx, |terminal, _| terminal.take_input_log())
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
+            .collect();
+        assert_eq!(pasted, "`file.txt:1`\rTwo.");
+        assert!(!pasted.ends_with('\r'));
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {

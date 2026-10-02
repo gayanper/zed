@@ -32,13 +32,13 @@ use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton, MouseDownEvent,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
-    StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
-    TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, WrappedLineLayout,
-    actions, canvas, img, point, quad, relative, size,
+    AnyElement, App, AvailableSpace, BorderStyle, Bounds, ClipboardItem, CursorStyle,
+    DispatchPhase, Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
+    Hitbox, Hsla, Image, ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton,
+    MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle,
+    Stateful, StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task,
+    TextAlign, TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection,
+    WrappedLineLayout, actions, canvas, img, point, quad, relative, size,
 };
 use language::{
     Bias, CharClassifier, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights, Rope,
@@ -69,6 +69,10 @@ pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> +
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
 type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
+/// Receives the selected markdown source and the window position of the
+/// button that triggered it.
+type SelectionActionCallback =
+    Rc<dyn Fn(Range<usize>, SharedString, Point<Pixels>, &mut Window, &mut App)>;
 /// Invoked when a mermaid diagram's zoom level changes (via scroll gesture or
 /// the reset button), so a scroll container can keep the diagram anchored.
 pub type MermaidZoomCallback = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -510,6 +514,7 @@ pub struct Markdown {
     context_menu_selected_markdown: Option<SharedString>,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
+    range_highlights: Rc<[(Range<usize>, Hsla)]>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -705,6 +710,7 @@ impl Markdown {
             context_menu_selected_markdown: None,
             search_highlights: Rc::default(),
             active_search_highlight: None,
+            range_highlights: Rc::default(),
         };
         this.parse(cx);
         this
@@ -1078,6 +1084,11 @@ impl Markdown {
         output.into()
     }
 
+    /// The cursor's source offset when nothing is selected.
+    pub fn cursor_offset(&self) -> Option<usize> {
+        (self.selection.start == self.selection.end).then_some(self.selection.start)
+    }
+
     pub fn has_selection(&self) -> bool {
         self.selection.end > self.selection.start
     }
@@ -1087,6 +1098,45 @@ impl Markdown {
             return None;
         }
         self.source.get(self.selection.start..self.selection.end)
+    }
+
+    /// The range and source a selection action applies to, if its button
+    /// should show: a finished selection, or with `in_range_highlights`, a
+    /// cursor inside a range highlight.
+    fn selection_action_target(
+        &self,
+        in_range_highlights: bool,
+    ) -> Option<(Range<usize>, SharedString)> {
+        if self.selection.pending {
+            return None;
+        }
+        let selected_range = self.selection.start..self.selection.end;
+        if let Some(source) = self.selected_source() {
+            return Some((selected_range, SharedString::from(source.to_string())));
+        }
+        let cursor = self.selection.start;
+        let in_range_highlight = in_range_highlights
+            && selected_range.is_empty()
+            && self
+                .range_highlights
+                .iter()
+                .any(|(range, _)| range.start <= cursor && cursor <= range.end);
+        in_range_highlight.then(|| (selected_range, SharedString::default()))
+    }
+
+    /// Highlights source ranges with a background color. Unlike search
+    /// highlights these survive `reset`, since the owner maps them onto the
+    /// new source itself.
+    pub fn set_range_highlights(
+        &mut self,
+        highlights: Vec<(Range<usize>, Hsla)>,
+        cx: &mut Context<Self>,
+    ) {
+        if highlights.is_empty() && self.range_highlights.is_empty() {
+            return;
+        }
+        self.range_highlights = highlights.into();
+        cx.notify();
     }
 
     pub fn set_search_highlights(
@@ -1728,6 +1778,8 @@ pub struct MarkdownElement {
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
+    on_selection_action: Option<SelectionActionCallback>,
+    selection_action_in_range_highlights: bool,
     image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
@@ -1755,6 +1807,8 @@ impl MarkdownElement {
             on_source_click: None,
             on_checkbox_toggle: None,
             on_mermaid_zoom: None,
+            on_selection_action: None,
+            selection_action_in_range_highlights: false,
             image_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
@@ -1832,6 +1886,68 @@ impl MarkdownElement {
     ) -> Self {
         self.on_source_click = Some(Box::new(handler));
         self
+    }
+
+    /// Shows a button at the end of a finished selection that runs `handler`
+    /// with the selected markdown source.
+    pub fn on_selection_action(
+        mut self,
+        handler: impl Fn(Range<usize>, SharedString, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_selection_action = Some(Rc::new(handler));
+        self
+    }
+
+    /// Also shows the selection action button when nothing is selected and
+    /// the cursor is inside a range highlight. The handler then receives an
+    /// empty range at the cursor.
+    pub fn selection_action_in_range_highlights(mut self) -> Self {
+        self.selection_action_in_range_highlights = true;
+        self
+    }
+
+    fn layout_selection_action_button(
+        &self,
+        rendered_text: &RenderedText,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let on_selection_action = self.on_selection_action.clone()?;
+        let markdown = self.markdown.read(cx);
+        // Captured now because clicking outside the text clears the selection
+        // before the button's handler runs.
+        let (selected_range, selected_source) =
+            markdown.selection_action_target(self.selection_action_in_range_highlights)?;
+        let (position, line_height) =
+            rendered_text.position_for_source_index(markdown.selection.end)?;
+
+        let icon_size = IconSize::Small;
+        let origin = point(
+            position.x + px(4.),
+            position.y + (line_height - icon_size.square(window, cx)) / 2.,
+        );
+        let mut button = div()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                on_selection_action(
+                    selected_range.clone(),
+                    selected_source.clone(),
+                    origin,
+                    window,
+                    cx,
+                );
+            })
+            .child(
+                IconButton::new("markdown-selection-action", IconName::Chat)
+                    .icon_size(icon_size)
+                    .shape(ui::IconButtonShape::Square)
+                    .style(ButtonStyle::Filled)
+                    .tooltip(Tooltip::text("Comment for Agent")),
+            )
+            .into_any_element();
+        button.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
+        Some(button)
     }
 
     pub fn on_checkbox_toggle(
@@ -2590,6 +2706,7 @@ impl Element for MarkdownElement {
             let colors = cx.theme().colors();
             let selection = &markdown.selection;
             MarkdownHighlights {
+                range_highlights: markdown.range_highlights.clone(),
                 search_highlights: markdown.search_highlights.clone(),
                 active_search_highlight: markdown.active_search_highlight,
                 search_match_color: colors.search_match_background,
@@ -3340,6 +3457,8 @@ impl Element for MarkdownElement {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         rendered_markdown.element.prepaint(window, cx);
+        rendered_markdown.selection_action_button =
+            self.layout_selection_action_button(&rendered_markdown.text, window, cx);
         self.autoscroll(&rendered_markdown.text, window, cx);
         hitbox
     }
@@ -3395,6 +3514,9 @@ impl Element for MarkdownElement {
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+        if let Some(button) = rendered_markdown.selection_action_button.as_mut() {
+            button.paint(window, cx);
+        }
     }
 }
 
@@ -3731,6 +3853,7 @@ struct MarkdownElementBuilder {
 }
 
 struct MarkdownHighlights {
+    range_highlights: Rc<[(Range<usize>, Hsla)]>,
     /// Search highlights, sorted by range start.
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
@@ -3749,6 +3872,13 @@ impl MarkdownHighlights {
         source_range: Range<usize>,
     ) -> SmallVec<[(Range<usize>, Hsla); 1]> {
         let mut highlights = SmallVec::new();
+
+        for (range, color) in self.range_highlights.iter() {
+            let clamped = range.start.max(source_range.start)..range.end.min(source_range.end);
+            if clamped.start < clamped.end {
+                highlights.push((clamped, *color));
+            }
+        }
 
         self.next_search_highlight_ix += self.search_highlights[self.next_search_highlight_ix..]
             .iter()
@@ -4280,6 +4410,7 @@ impl MarkdownElementBuilder {
                 image_links: self.rendered_image_links.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
             },
+            selection_action_button: None,
         }
     }
 }
@@ -4734,6 +4865,7 @@ fn source_index_for_rendered(mappings: &[SourceMapping], rendered_index: usize) 
 pub struct RenderedMarkdown {
     element: AnyElement,
     text: RenderedText,
+    selection_action_button: Option<AnyElement>,
 }
 
 #[derive(Clone)]
@@ -5360,6 +5492,52 @@ mod tests {
                 second_markdown: second_markdown.clone(),
             })
             .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn test_range_highlights_survive_reset(cx: &mut TestAppContext) {
+        let markdown = cx.new(|cx| Markdown::new("one two".into(), None, None, cx));
+        let color = gpui::red();
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_range_highlights(vec![(4..7, color)], cx);
+            markdown.reset("one two three".into(), cx);
+        });
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| {
+            assert_eq!(markdown.range_highlights.as_ref(), [(4..7, color)]);
+        });
+    }
+
+    #[gpui::test]
+    fn test_selection_action_target(cx: &mut TestAppContext) {
+        let markdown = cx.new(|cx| Markdown::new("one two three".into(), None, None, cx));
+        cx.run_until_parked();
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_range_highlights(vec![(4..7, gpui::red())], cx);
+
+            markdown.selection.start = 0;
+            markdown.selection.end = 3;
+            assert_eq!(
+                markdown.selection_action_target(false),
+                Some((0..3, SharedString::from("one")))
+            );
+
+            markdown.selection.pending = true;
+            assert_eq!(markdown.selection_action_target(false), None);
+            markdown.selection.pending = false;
+
+            markdown.selection.start = 5;
+            markdown.selection.end = 5;
+            assert_eq!(markdown.selection_action_target(false), None);
+            assert_eq!(
+                markdown.selection_action_target(true),
+                Some((5..5, SharedString::default()))
+            );
+
+            markdown.selection.start = 9;
+            markdown.selection.end = 9;
+            assert_eq!(markdown.selection_action_target(true), None);
         });
     }
 
