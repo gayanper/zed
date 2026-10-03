@@ -40,6 +40,8 @@ actions!(
         FocusPrevious,
         /// Inserts the visible agent session's pending comments into its prompt.
         InsertPendingComments,
+        /// Removes the visible agent session's pending comments without inserting them.
+        ClearPendingComments,
     ]
 );
 
