@@ -1924,11 +1924,10 @@ impl Render for MarkdownPreviewView {
             .unwrap_or_else(|| cx.theme().colors().editor_background);
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         let hovered_url = self.hovered_url.clone();
-        div()
+        let preview = div()
             .image_cache(self.image_cache.clone())
             .id("MarkdownPreview")
             .key_context("MarkdownPreview")
-            .track_focus(&self.focus_handle(cx))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(Self::toggle_agent_comment_on_click),
@@ -1950,12 +1949,9 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
-            .w_full()
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .relative()
             .bg(bg_color)
-            .children(self.agent_comment.as_ref().map(|popover| popover.render()))
             .child(
                 WithRemSize::new(preview_font_size).size_full().child(
                     div()
@@ -2049,7 +2045,19 @@ impl Render for MarkdownPreviewView {
                         .overflow_hidden()
                         .child(LinkPreview::new(hovered_url.as_ref(), cx)),
                 )
-            })
+            });
+        // The comment popover sits outside the `MarkdownPreview` key context so
+        // the preview's bindings (e.g. vim `g g`) don't consume keys typed into
+        // it, while focus tracking stays on the wrapper so the preview still
+        // counts as focused.
+        div()
+            .track_focus(&self.focus_handle(cx))
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .child(preview)
+            .children(self.agent_comment.as_ref().map(|popover| popover.render()))
     }
 }
 
@@ -4595,6 +4603,80 @@ mod tests {
             preview.toggle_agent_comment_on_click(&event, window, cx);
             assert!(preview.agent_comment.is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn test_preview_bindings_do_not_consume_comment_input(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({"docs": {"README.md": "# Title\n\nSome text here.\n"}}),
+            false,
+        )
+        .await;
+        cx.update(|cx| {
+            set_auto_preview_enabled(cx, false);
+            agent_comments::init(cx);
+            // Mirrors the vim keymap's `MarkdownPreview` bindings.
+            cx.bind_keys([
+                gpui::KeyBinding::new("g g", crate::ScrollToTop, Some("MarkdownPreview")),
+                gpui::KeyBinding::new("shift-g", crate::ScrollToBottom, Some("MarkdownPreview")),
+            ]);
+        });
+        let item =
+            open_project_file(cx, &project, &multi_workspace, "docs/README.md", None, true).await;
+        let editor = cx
+            .update(|cx| item.act_as::<Editor>(cx))
+            .expect("file should open in an editor");
+        let store = cx.new(|_| agent_comments::AgentCommentStore::default());
+        cx.update(|cx| {
+            agent_comments::ActiveCommentStore::global(cx).update(cx, |active, cx| {
+                active.set(Some(&store), "Thread".into(), cx)
+            })
+        });
+        let preview = multi_workspace
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        preview.update_in(cx, |preview, window, cx| {
+            preview.open_agent_comment(9..13, "Some".into(), point(px(0.), px(0.)), window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("g g shift-g x");
+        cx.run_until_parked();
+        preview.update_in(cx, |preview, window, cx| {
+            assert!(
+                preview.focus_handle.contains_focused(window, cx),
+                "the preview stays focused while its comment input is"
+            );
+        });
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+
+        let payload = cx.update(|_, cx| {
+            agent_comments::format_comments(&store.read(cx).pending_comments(
+                |buffer, cx| {
+                    let file = buffer.file()?;
+                    Some(file.path().display(file.path_style(cx)).into_owned().into())
+                },
+                cx,
+            ))
+        });
+        assert_eq!(payload, "`docs/README.md:3`\nggGx");
     }
 
     fn register_markdown_language(project: &Entity<Project>, cx: &mut TestAppContext) {
