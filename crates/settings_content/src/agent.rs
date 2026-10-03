@@ -57,6 +57,11 @@ pub struct ThreadsSidebarSettingsContent {
     /// Default: 300
     #[schemars(range(min = 200, max = 800))]
     pub default_width: Option<crate::PixelSetting>,
+    /// Whether to filter the threads sidebar to only show threads belonging
+    /// to the current worktree.
+    ///
+    /// Default: false
+    pub filter_by_current_worktree: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

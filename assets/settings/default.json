@@ -1176,6 +1176,9 @@
       "default_width": 300,
       // Automatically open the Threads Sidebar when opening a folder in an existing window.
       "auto_open": true,
+      // Whether to filter the Threads Sidebar to only show threads belonging to
+      // the current worktree.
+      "filter_by_current_worktree": false,
     },
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.

@@ -1015,6 +1015,7 @@ mod tests {
                 auto_open: true,
                 default_width: px(300.),
                 position: settings::SidebarDockPosition::Left,
+                filter_by_current_worktree: false,
             },
             thinking_display: Default::default(),
         };

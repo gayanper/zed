@@ -27,6 +27,7 @@ use editor::Editor;
 use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
+use fs::Fs;
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
     FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
@@ -235,6 +236,44 @@ impl ThreadEntryWorkspace {
                 project_group_key, ..
             } => project_group_key.host().is_some(),
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ThreadScope {
+    #[default]
+    All,
+    CurrentWorktree,
+}
+
+impl ThreadScope {
+    fn matches_paths(self, folder_paths: &PathList, active_paths: Option<&PathList>) -> bool {
+        if self == ThreadScope::All {
+            return true;
+        }
+        let Some(active) = active_paths else {
+            return true; // no active workspace -> don't hide everything
+        };
+        if active.is_empty() {
+            return true;
+        }
+
+        folder_paths
+            .paths()
+            .iter()
+            .any(|p| active.paths().contains(p))
+    }
+
+    fn matches_thread(self, metadata: &ThreadMetadata, active_paths: Option<&PathList>) -> bool {
+        self.matches_paths(metadata.folder_paths(), active_paths)
+    }
+
+    fn matches_terminal(
+        self,
+        metadata: &TerminalThreadMetadata,
+        active_paths: Option<&PathList>,
+    ) -> bool {
+        self.matches_paths(metadata.folder_paths(), active_paths)
     }
 }
 
@@ -774,6 +813,7 @@ pub struct Sidebar {
     width_set_by_user: bool,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
+    thread_scope: ThreadScope,
     rename_editor: Entity<Editor>,
     list_state: ListState,
     contents: SidebarContents,
@@ -849,6 +889,16 @@ impl Sidebar {
                 previous_default_width = width;
                 this.set_width(None, cx);
                 this.serialize(cx);
+            }
+
+            let thread_scope = if AgentSettings::get_global(cx).threads_sidebar.filter_by_current_worktree {
+                ThreadScope::CurrentWorktree
+            } else {
+                ThreadScope::All
+            };
+            if this.thread_scope != thread_scope {
+                this.thread_scope = thread_scope;
+                this.schedule_update_entries(false, cx);
             }
         })
         .detach();
@@ -942,6 +992,11 @@ impl Sidebar {
             width_set_by_user: false,
             focus_handle,
             filter_editor,
+            thread_scope: if AgentSettings::get_global(cx).threads_sidebar.filter_by_current_worktree {
+                ThreadScope::CurrentWorktree
+            } else {
+                ThreadScope::All
+            },
             rename_editor,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             contents: SidebarContents::default(),
@@ -1397,6 +1452,14 @@ impl Sidebar {
         let mw = multi_workspace.read(cx);
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
+        let active_paths = (self.thread_scope == ThreadScope::CurrentWorktree)
+            .then(|| {
+                active_workspace
+                    .as_ref()
+                    .map(|ws| workspace_path_list(ws, cx))
+            })
+            .flatten();
+        let scope = self.thread_scope;
 
         let agent_server_store = workspaces
             .first()
@@ -1870,6 +1933,9 @@ impl Sidebar {
 
                 let mut matched_threads: Vec<Arc<ThreadEntry>> = Vec::new();
                 for mut thread in threads {
+                    if !scope.matches_thread(&thread.metadata, active_paths.as_ref()) {
+                        continue;
+                    }
                     let mut worktree_matched = false;
                     {
                         let thread = Arc::make_mut(&mut thread);
@@ -1897,6 +1963,9 @@ impl Sidebar {
 
                 let mut matched_terminals: Vec<TerminalEntry> = Vec::new();
                 for mut terminal in terminals {
+                    if !scope.matches_terminal(&terminal.metadata, active_paths.as_ref()) {
+                        continue;
+                    }
                     let mut terminal_matched = false;
                     let terminal_title = terminal.metadata.display_title();
                     if let Some(positions) = fuzzy_match_positions(&query, terminal_title.as_ref())
@@ -1952,6 +2021,11 @@ impl Sidebar {
                     &mut current_thread_ids,
                 );
             } else {
+                // Display-only scope filter, same contract as the query filter above:
+                // hidden rows are dropped here and behave exactly like non-matches.
+                threads.retain(|t| scope.matches_thread(&t.metadata, active_paths.as_ref()));
+                terminals.retain(|t| scope.matches_terminal(&t.metadata, active_paths.as_ref()));
+
                 let has_terminal_notifications = terminals
                     .iter()
                     .any(|t| notified_terminals.contains(&t.metadata.terminal_id));
@@ -1977,6 +2051,15 @@ impl Sidebar {
                         .iter()
                         .any(|t| notified_threads.contains(&t.metadata.thread_id))
                 };
+
+                if threads.is_empty()
+                    && terminals.is_empty()
+                    && scope == ThreadScope::CurrentWorktree
+                    && !is_active
+                {
+                    // Don't emit an empty header for out-of-scope groups.
+                    continue;
+                }
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
@@ -3414,6 +3497,23 @@ impl Sidebar {
 
     fn has_filter_query(&self, cx: &App) -> bool {
         !self.filter_editor.read(cx).text(cx).is_empty()
+    }
+
+    fn toggle_thread_scope(&mut self, cx: &mut Context<Self>) {
+        self.thread_scope = match self.thread_scope {
+            ThreadScope::All => ThreadScope::CurrentWorktree,
+            ThreadScope::CurrentWorktree => ThreadScope::All,
+        };
+        let filtered = self.thread_scope == ThreadScope::CurrentWorktree;
+        settings::update_settings_file(<dyn Fs>::global(cx), cx, move |settings, _| {
+            settings
+                .agent
+                .get_or_insert_default()
+                .threads_sidebar
+                .get_or_insert_default()
+                .filter_by_current_worktree = Some(filtered);
+        });
+        self.schedule_update_entries(false, cx);
     }
 
     fn start_renaming_entry(
@@ -7535,6 +7635,17 @@ impl Sidebar {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_archive(&ToggleThreadHistory, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("thread-scope", IconName::Folder)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.thread_scope == ThreadScope::CurrentWorktree)
+                    .tooltip(Tooltip::text(
+                        "Switch between current worktree threads and all threads",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_thread_scope(cx);
                     })),
             )
             .child(div().flex_1())
