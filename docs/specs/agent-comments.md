@@ -513,6 +513,7 @@ Otherwise it isn't rendered at all, so the toolbar layout stays the same as upst
 
 - **No prompt prefix.** The `agent-reviews` branch puts a configurable prefix (`review_comments_prompt_prefix`, default "Please address these review comments:") before diff review comments. Agent comments insert only the comments, because the user writes the instruction in the prompt themselves. A setting can be added later if wanted.
 - **No confirmation** before inserting or clearing.
+- **Clearing.** A close icon button next to the count, and the `agent_comments::ClearPendingComments` action, remove the visible session's pending comments without inserting them. This recovers from comments collected against the wrong thread or agent.
 - **Out of scope:** a list of pending comments on the toolbar. Individual comments are edited or removed from the text they're attached to.
 
 ### Production gaps found in the proof of concept

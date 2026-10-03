@@ -14,7 +14,8 @@ use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_comments::{
-    ActiveCommentStore, AgentCommentStore, AgentCommentStoreEvent, InsertPendingComments,
+    ActiveCommentStore, AgentCommentStore, AgentCommentStoreEvent, ClearPendingComments,
+    InsertPendingComments,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -6342,23 +6343,42 @@ impl AgentPanel {
             format!("Insert {count} pending comments into prompt")
         };
         let focus_handle = self.focus_handle.clone();
+        let insert_button = Button::new("agent-comments-insert", count.to_string())
+            .start_icon(Icon::new(IconName::Chat).size(IconSize::Small))
+            .label_size(LabelSize::Small)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(tooltip.clone(), &InsertPendingComments, &focus_handle, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.insert_agent_comments(window, cx);
+            }));
+        let clear_focus_handle = self.focus_handle.clone();
+        let clear_button = IconButton::new("agent-comments-clear", IconName::Close)
+            .icon_size(IconSize::Small)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Clear pending comments",
+                    &ClearPendingComments,
+                    &clear_focus_handle,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.clear_visible_agent_comments(cx);
+            }));
         Some(
-            Button::new("agent-comments-insert", count.to_string())
-                .start_icon(Icon::new(IconName::Chat).size(IconSize::Small))
-                .label_size(LabelSize::Small)
-                .tooltip(move |_window, cx| {
-                    Tooltip::for_action_in(
-                        tooltip.clone(),
-                        &InsertPendingComments,
-                        &focus_handle,
-                        cx,
-                    )
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.insert_agent_comments(window, cx);
-                }))
+            h_flex()
+                .child(insert_button)
+                .child(clear_button)
                 .into_any_element(),
         )
+    }
+
+    fn clear_visible_agent_comments(&mut self, cx: &mut Context<Self>) {
+        let Some((store, _)) = self.visible_comment_store(cx) else {
+            return;
+        };
+        store.update(cx, |store, cx| store.clear(cx));
     }
 
     /// Inserts the visible session's pending agent comments into its prompt,
@@ -6742,6 +6762,9 @@ impl Render for AgentPanel {
             }))
             .on_action(cx.listener(|this, _: &InsertPendingComments, window, cx| {
                 this.insert_agent_comments(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearPendingComments, _window, cx| {
+                this.clear_visible_agent_comments(cx);
             }))
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
@@ -9960,6 +9983,42 @@ mod tests {
         });
         assert_eq!(text, "`file.txt:2`\nThree.\n\n`file.txt:1`\nOne.");
         store.read_with(&cx, |store, _| assert!(store.is_empty()));
+        let button_shown = panel.update(&mut cx, |panel, cx| {
+            panel.render_agent_comments_button(cx).is_some()
+        });
+        assert!(!button_shown, "the count returns to 0");
+    }
+
+    #[gpui::test]
+    async fn test_clear_agent_comments(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let store = visible_comment_store(&panel, &mut cx);
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 0)..language::Point::new(0, 3),
+            "Wrong agent.",
+            &mut cx,
+        )
+        .await;
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+
+        panel.update(&mut cx, |panel, cx| panel.clear_visible_agent_comments(cx));
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
+        let text = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread should be visible")
+                .read(cx)
+                .message_editor
+                .read(cx)
+                .editor()
+                .read(cx)
+                .text(cx)
+        });
+        assert_eq!(text, "", "clearing doesn't insert the comments");
         let button_shown = panel.update(&mut cx, |panel, cx| {
             panel.render_agent_comments_button(cx).is_some()
         });
