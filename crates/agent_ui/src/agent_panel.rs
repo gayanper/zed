@@ -73,6 +73,7 @@ use collections::HashMap;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
+use settings::TerminalInitCommand;
 
 use fs::Fs;
 use futures::FutureExt as _;
@@ -950,6 +951,7 @@ struct AgentTerminal {
     last_known_terminal_title: String,
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
+    init_command: Option<String>,
     created_at: DateTime<Utc>,
     has_notification: bool,
     comment_store: Entity<AgentCommentStore>,
@@ -1970,6 +1972,23 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_terminal_with_init_command(
+            workspace,
+            Self::default_terminal_init_command(cx),
+            source,
+            window,
+            cx,
+        );
+    }
+
+    fn new_terminal_with_init_command(
+        &mut self,
+        workspace: Option<&Workspace>,
+        init_command: Option<String>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.supports_terminal(cx) {
             return;
         }
@@ -1983,7 +2002,7 @@ impl AgentPanel {
             None,
             true,
             true,
-            true,
+            init_command,
             source,
             window,
             cx,
@@ -2037,7 +2056,7 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: Option<String>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2048,7 +2067,6 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2084,6 +2102,7 @@ impl AgentPanel {
                     terminal_id,
                     terminal_view,
                     terminal_working_directory,
+                    init_command.clone(),
                     custom_title,
                     initial_title,
                     created_at,
@@ -2121,11 +2140,17 @@ impl AgentPanel {
         })
     }
 
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
-        run_init_command
-            .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
-            .flatten()
-            .filter(|command| !command.trim().is_empty())
+    fn default_terminal_init_command(cx: &App) -> Option<String> {
+        match AgentSettings::get_global(cx)
+            .terminal_init_command
+            .as_ref()?
+        {
+            TerminalInitCommand::Command(command) => Some(command.clone()),
+            TerminalInitCommand::Profiles(profiles) => {
+                profiles.first().map(|profile| profile.command.clone())
+            }
+        }
+        .filter(|command| !command.trim().is_empty())
     }
 
     fn write_terminal_init_command(
@@ -2189,6 +2214,7 @@ impl AgentPanel {
         terminal_id: TerminalId,
         terminal_view: Entity<TerminalView>,
         working_directory: Option<PathBuf>,
+        init_command: Option<String>,
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
@@ -2249,6 +2275,7 @@ impl AgentPanel {
             last_known_terminal_title,
             last_observed_program: None,
             working_directory,
+            init_command,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
             comment_store: cx.new(|_| AgentCommentStore::default()),
@@ -2426,6 +2453,7 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            init_command: terminal.init_command.clone(),
         })
     }
 
@@ -2457,7 +2485,9 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            metadata
+                .init_command
+                .or_else(|| Self::default_terminal_init_command(cx)),
             source,
             window,
             cx,
@@ -5253,7 +5283,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            Self::default_terminal_init_command(cx),
             source,
             window,
             cx,
@@ -5277,7 +5307,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            Self::default_terminal_init_command(cx),
             source,
             window,
             cx,
@@ -5982,36 +6012,52 @@ impl AgentPanel {
                                 }),
                         )
                         .when(supports_terminal, |menu| {
-                            menu.item(
-                                ContextMenuEntry::new("Terminal")
-                                    .when(showing_terminal, |this| this.action(Box::new(NewThread)))
-                                    .when(!showing_terminal, |this| {
-                                        this.action(Box::new(NewTerminalThread))
+                            let terminal_profiles = match &AgentSettings::get_global(cx)
+                                .terminal_init_command
+                            {
+                                Some(TerminalInitCommand::Profiles(profiles)) => profiles
+                                    .iter()
+                                    .filter(|profile| {
+                                        !profile.name.trim().is_empty()
+                                            && !profile.command.trim().is_empty()
                                     })
-                                    .icon(IconName::Terminal)
-                                    .icon_color(Color::Muted)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_terminal(
-                                                                Some(workspace),
-                                                                AgentThreadSource::AgentPanel,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                });
+                                    .map(|profile| {
+                                        (SharedString::from(profile.name.clone()), Some(profile.command.clone()))
+                                    })
+                                    .collect_vec(),
+                                _ => vec![(SharedString::from("Terminal"), Self::default_terminal_init_command(cx))],
+                            };
+                            terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
+                                menu.item(
+                                    ContextMenuEntry::new(name)
+                                        .when(showing_terminal, |this| this.action(Box::new(NewThread)))
+                                        .when(!showing_terminal, |this| {
+                                            this.action(Box::new(NewTerminalThread))
+                                        })
+                                        .icon(IconName::Terminal)
+                                        .icon_color(Color::Muted)
+                                        .handler({
+                                            let workspace = workspace.clone();
+                                            move |window, cx| {
+                                                if let Some(workspace) = workspace.upgrade() {
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.new_terminal_with_init_command(
+                                                                    Some(workspace),
+                                                                    init_command.clone(),
+                                                                    AgentThreadSource::AgentPanel,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    });
+                                                }
                                             }
-                                        }
-                                    }),
-                            )
+                                        }),
+                                )
+                            })
                         })
                         .map(|mut menu| {
                             let agent_server_store = agent_server_store.read(cx);
@@ -6935,7 +6981,7 @@ impl AgentPanel {
             None,
             focus,
             focus,
-            true,
+            Self::default_terminal_init_command(cx),
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -6972,7 +7018,9 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            metadata
+                .init_command
+                .or_else(|| Self::default_terminal_init_command(cx)),
             source,
             window,
             cx,
@@ -7004,12 +7052,11 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: Option<String>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
         let terminal = self.build_display_only_terminal(cx);
         let terminal_for_init_command = terminal.clone();
         let terminal_view = cx.new(|cx| {
@@ -7028,6 +7075,7 @@ impl AgentPanel {
             terminal_id,
             terminal_view,
             working_directory,
+            init_command.clone(),
             custom_title,
             initial_title,
             created_at,
@@ -7796,6 +7844,7 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            init_command: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7922,7 +7971,9 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
-            settings.terminal_init_command = Some(" claude --resume ".to_string());
+            settings.terminal_init_command = Some(TerminalInitCommand::Command(
+                " claude --resume ".to_string(),
+            ));
             AgentSettings::override_global(settings, cx);
         });
 
@@ -7936,6 +7987,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            init_command: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7992,6 +8044,57 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_restored_terminal_uses_persisted_init_command(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command =
+                Some(TerminalInitCommand::Command("current-agent".to_string()));
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let metadata = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "Restored Terminal".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/project",
+            )])),
+            remote_connection: None,
+            working_directory: None,
+            init_command: Some("selected-agent --resume".to_string()),
+        };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("test terminal should be restored");
+        cx.run_until_parked();
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"selected-agent --resume\r".to_vec()]);
+    }
+
     /// Exercises the real `spawn_terminal` path with a genuine shell PTY (not the
     /// display-only test terminal, where `write_to_pty` is a no-op) to verify the
     /// init command is actually delivered to the shell and executed.
@@ -8004,7 +8107,9 @@ mod tests {
             let mut settings = AgentSettings::get_global(cx).clone();
             // `init_ran_42` is the command's output, not its echoed text, so finding
             // it proves the shell executed the command rather than just echoing it.
-            settings.terminal_init_command = Some("printf 'init_ran_%s\\n' 42".to_string());
+            settings.terminal_init_command = Some(TerminalInitCommand::Command(
+                "printf 'init_ran_%s\\n' 42".to_string(),
+            ));
             AgentSettings::override_global(settings, cx);
 
             // Force a known POSIX shell so the test doesn't depend on the developer's login shell.
@@ -8025,7 +8130,7 @@ mod tests {
                 None,
                 true,
                 true,
-                true,
+                Some("printf 'init_ran_%s\\n' 42".to_string()),
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -8109,6 +8214,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            init_command: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9526,7 +9632,7 @@ mod tests {
                     None,
                     true,
                     true,
-                    false,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -9782,7 +9888,7 @@ mod tests {
                     None,
                     true,
                     true,
-                    false,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -9874,7 +9980,7 @@ mod tests {
                     None,
                     true,
                     true,
-                    false,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -10500,6 +10606,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            init_command: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10551,6 +10658,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            init_command: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

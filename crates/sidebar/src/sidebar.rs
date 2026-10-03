@@ -891,7 +891,10 @@ impl Sidebar {
                 this.serialize(cx);
             }
 
-            let thread_scope = if AgentSettings::get_global(cx).threads_sidebar.filter_by_current_worktree {
+            let thread_scope = if AgentSettings::get_global(cx)
+                .threads_sidebar
+                .filter_by_current_worktree
+            {
                 ThreadScope::CurrentWorktree
             } else {
                 ThreadScope::All
@@ -992,7 +995,10 @@ impl Sidebar {
             width_set_by_user: false,
             focus_handle,
             filter_editor,
-            thread_scope: if AgentSettings::get_global(cx).threads_sidebar.filter_by_current_worktree {
+            thread_scope: if AgentSettings::get_global(cx)
+                .threads_sidebar
+                .filter_by_current_worktree
+            {
                 ThreadScope::CurrentWorktree
             } else {
                 ThreadScope::All
