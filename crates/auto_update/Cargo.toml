@@ -8,6 +8,9 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+disable-auto-update = []
+
 [lib]
 path = "src/auto_update.rs"
 doctest = false
