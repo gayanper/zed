@@ -11,7 +11,9 @@ use paths::remote_servers_dir;
 use release_channel::{AppCommitSha, ReleaseChannel};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use settings::{RegisterSetting, Settings, SettingsStore};
+#[cfg(any(test, not(feature = "disable-auto-update")))]
+use settings::SettingsStore;
+use settings::{RegisterSetting, Settings};
 use smol::fs::File;
 use smol::{
     fs,
@@ -247,6 +249,7 @@ async fn unmount_disk_image(mount_path: &Path) {
     }
 }
 
+#[cfg_attr(feature = "disable-auto-update", allow(dead_code))]
 #[derive(Clone, Copy, Debug, RegisterSetting)]
 struct AutoUpdateSetting(bool);
 
@@ -278,28 +281,31 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
-
-        if option_env!("ZED_UPDATE_EXPLANATION").is_none()
-            && env::var("ZED_UPDATE_EXPLANATION").is_err()
-            && poll_for_updates
+        #[cfg(not(feature = "disable-auto-update"))]
         {
-            let mut update_subscription = AutoUpdateSetting::get_global(cx)
-                .0
-                .then(|| updater.start_polling(cx));
+            let poll_for_updates = ReleaseChannel::try_global(cx)
+                .map(|channel| channel.poll_for_updates())
+                .unwrap_or(false);
 
-            cx.observe_global::<SettingsStore>(move |updater: &mut AutoUpdater, cx| {
-                if AutoUpdateSetting::get_global(cx).0 {
-                    if update_subscription.is_none() {
-                        update_subscription = Some(updater.start_polling(cx))
+            if option_env!("ZED_UPDATE_EXPLANATION").is_none()
+                && env::var("ZED_UPDATE_EXPLANATION").is_err()
+                && poll_for_updates
+            {
+                let mut update_subscription = AutoUpdateSetting::get_global(cx)
+                    .0
+                    .then(|| updater.start_polling(cx));
+
+                cx.observe_global::<SettingsStore>(move |updater: &mut AutoUpdater, cx| {
+                    if AutoUpdateSetting::get_global(cx).0 {
+                        if update_subscription.is_none() {
+                            update_subscription = Some(updater.start_polling(cx))
+                        }
+                    } else {
+                        update_subscription.take();
                     }
-                } else {
-                    update_subscription.take();
-                }
-            })
-            .detach();
+                })
+                .detach();
+            }
         }
 
         updater
@@ -308,37 +314,45 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
 }
 
 pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
-    if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
-        .map(ToOwned::to_owned)
-        .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
+    #[cfg(feature = "disable-auto-update")]
     {
-        drop(window.prompt(
-            gpui::PromptLevel::Info,
-            "Zed was installed via a package manager.",
-            Some(&message),
-            &["OK"],
-            cx,
-        ));
-        return;
+        let _ = (window, cx);
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
+    #[cfg(not(feature = "disable-auto-update"))]
     {
-        return;
-    }
+        if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
+            .map(ToOwned::to_owned)
+            .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
+        {
+            drop(window.prompt(
+                gpui::PromptLevel::Info,
+                "Zed was installed via a package manager.",
+                Some(&message),
+                &["OK"],
+                cx,
+            ));
+            return;
+        }
 
-    if let Some(updater) = AutoUpdater::get(cx) {
-        updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
-    } else {
-        drop(window.prompt(
-            gpui::PromptLevel::Info,
-            "Could not check for updates",
-            Some("Auto-updates disabled for non-bundled app."),
-            &["OK"],
-            cx,
-        ));
+        if !ReleaseChannel::try_global(cx)
+            .map(|channel| channel.poll_for_updates())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if let Some(updater) = AutoUpdater::get(cx) {
+            updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
+        } else {
+            drop(window.prompt(
+                gpui::PromptLevel::Info,
+                "Could not check for updates",
+                Some("Auto-updates disabled for non-bundled app."),
+                &["OK"],
+                cx,
+            ));
+        }
     }
 }
 
@@ -1360,17 +1374,14 @@ pub async fn finalize_auto_update_on_quit() {
 mod tests {
     use client::Client;
     use clock::FakeSystemClock;
+    #[cfg(not(feature = "disable-auto-update"))]
     use futures::channel::oneshot;
     use gpui::TestAppContext;
     use http_client::{FakeHttpClient, Response};
     use settings::default_settings;
-    use std::{
-        rc::Rc,
-        sync::{
-            Arc,
-            atomic::{self, AtomicBool},
-        },
-    };
+    #[cfg(not(feature = "disable-auto-update"))]
+    use std::sync::atomic::{self, AtomicBool};
+    use std::{rc::Rc, sync::Arc};
     use tempfile::tempdir;
 
     #[ctor::ctor(unsafe)]
@@ -1398,6 +1409,29 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "disable-auto-update")]
+    #[gpui::test]
+    fn test_auto_update_is_disabled_without_changing_the_setting(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            release_channel::init_test(Version::new(0, 100, 0), ReleaseChannel::Stable, cx);
+
+            let client = Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::create(|_| async {
+                    Ok(Response::builder().status(200).body("".into()).unwrap())
+                }),
+                cx,
+            );
+            crate::init(client, cx);
+
+            assert!(AutoUpdateSetting::get_global(cx).0);
+            let auto_updater = AutoUpdater::get(cx).expect("auto updater should exist");
+            assert!(auto_updater.read(cx).pending_poll.is_none());
+        });
+    }
+
+    #[cfg(not(feature = "disable-auto-update"))]
     #[gpui::test]
     async fn test_auto_update_downloads(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
