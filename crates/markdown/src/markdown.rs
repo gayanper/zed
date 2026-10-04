@@ -51,6 +51,7 @@ use parser::{
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;
+use ui::utils::WithRemSize;
 use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 
@@ -1921,12 +1922,16 @@ impl MarkdownElement {
         let (position, line_height) =
             rendered_text.position_for_source_index(markdown.selection.end)?;
 
+        // The preview scales rems with its own font size; keep the button at UI size.
+        let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
         let icon_size = IconSize::Small;
+        let button_size =
+            window.with_rem_size(Some(ui_font_size), |window| icon_size.square(window, cx));
         let origin = point(
             position.x + px(4.),
-            position.y + (line_height - icon_size.square(window, cx)) / 2.,
+            position.y + (line_height - button_size) / 2.,
         );
-        let mut button = div()
+        let button = div()
             .occlude()
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
@@ -1944,7 +1949,9 @@ impl MarkdownElement {
                     .shape(ui::IconButtonShape::Square)
                     .style(ButtonStyle::Filled)
                     .tooltip(Tooltip::text("Comment for Agent")),
-            )
+            );
+        let mut button = WithRemSize::new(ui_font_size)
+            .child(button)
             .into_any_element();
         button.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
         Some(button)
