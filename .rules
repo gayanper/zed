@@ -188,3 +188,12 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+## Feature Development
+1. Make sure `myzed` branch is clean
+  - If Not On `myzed`: stop and tell user
+  - If Not Clean: stop and tell user
+  - Otherwise: continue to next step
+2. Create a new feature branch based from `myzed` branch. Choose a new based on the feature request.
+3. Switch to the new feature branch.
+4. Never create worktree unless user asks to.
