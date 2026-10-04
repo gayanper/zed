@@ -6381,6 +6381,16 @@ impl AgentPanel {
         store.update(cx, |store, cx| store.clear(cx));
     }
 
+    fn comments_prompt_text(comments: &[agent_comments::CommentPayload], cx: &App) -> String {
+        let text = agent_comments::format_comments(comments);
+        let preamble = AgentSettings::get_global(cx).comments_preamble.trim();
+        if text.is_empty() || preamble.is_empty() {
+            text
+        } else {
+            format!("{preamble}\n\n{text}")
+        }
+    }
+
     /// Inserts the visible session's pending agent comments into its prompt,
     /// without submitting it, and removes them from the session.
     fn insert_agent_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6407,7 +6417,7 @@ impl AgentPanel {
                         cx,
                     )
                 });
-                let text = agent_comments::format_comments(&comments);
+                let text = Self::comments_prompt_text(&comments, cx);
                 if text.is_empty() {
                     return;
                 }
@@ -6447,7 +6457,7 @@ impl AgentPanel {
                         cx,
                     )
                 });
-                let text = agent_comments::format_comments(&comments);
+                let text = Self::comments_prompt_text(&comments, cx);
                 if text.is_empty() {
                     return;
                 }
@@ -9981,7 +9991,10 @@ mod tests {
                 .read(cx)
                 .text(cx)
         });
-        assert_eq!(text, "`file.txt:2`\nThree.\n\n`file.txt:1`\nOne.");
+        assert_eq!(
+            text,
+            "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear.\n\n`file.txt:2`\nThree.\n\n`file.txt:1`\nOne."
+        );
         store.read_with(&cx, |store, _| assert!(store.is_empty()));
         let button_shown = panel.update(&mut cx, |panel, cx| {
             panel.render_agent_comments_button(cx).is_some()
@@ -10080,7 +10093,10 @@ mod tests {
             .into_iter()
             .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
             .collect();
-        assert_eq!(pasted, "`file.txt:1`\rTwo.");
+        assert_eq!(
+            pasted,
+            "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear.\r\r`file.txt:1`\rTwo."
+        );
         assert!(!pasted.ends_with('\r'));
         store.read_with(&cx, |store, _| assert!(store.is_empty()));
     }

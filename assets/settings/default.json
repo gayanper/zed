@@ -1286,6 +1286,9 @@
     "enable_feedback": true,
     // Whether to allow commenting on editor and markdown preview text for the agent.
     "enable_comments": false,
+    // Text inserted before agent comments when they are added to a prompt.
+    // Set to "" to disable.
+    "comments_preamble": "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear.",
     "default_profile": "write",
     "profiles": {
       "write": {

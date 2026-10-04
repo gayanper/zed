@@ -373,6 +373,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub enable_comments: Option<bool>,
+    /// Text inserted before agent comments when they are added to a prompt.
+    /// Leading and trailing whitespace is trimmed; an empty string disables the preamble.
+    ///
+    /// Default: "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear."
+    pub comments_preamble: Option<String>,
     /// Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     ///
     /// Default: true

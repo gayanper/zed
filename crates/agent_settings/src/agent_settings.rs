@@ -240,6 +240,7 @@ pub struct AgentSettings {
     pub auto_compact: AutoCompactSettings,
     pub enable_feedback: bool,
     pub enable_comments: bool,
+    pub comments_preamble: String,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<TerminalInitCommand>,
@@ -837,6 +838,7 @@ impl Settings for AgentSettings {
             },
             enable_feedback: agent.enable_feedback.unwrap(),
             enable_comments: agent.enable_comments.unwrap(),
+            comments_preamble: agent.comments_preamble.unwrap(),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             terminal_init_command: agent
