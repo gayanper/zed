@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use agent_settings::AgentSettings;
 use collections::{HashMap, HashSet};
 use editor::{
     CODE_ACTIONS_DEBOUNCE_TIMEOUT, Editor, EditorEvent, ToPoint as _,
@@ -17,13 +18,14 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{
-    Anchor, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
-    Pixels, Point, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
+    Anchor, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    Global, Pixels, Point, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use language::{
     Buffer, BufferEvent, BufferId, BufferSnapshot, Point as BufferPoint, ToOffset as _,
 };
 use multi_buffer::MultiBufferRow;
+use settings::{Settings as _, SettingsStore};
 use ui::{KeyBinding, prelude::*};
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -38,9 +40,9 @@ actions!(
         FocusNext,
         /// Moves focus to the previous control in the agent comment input.
         FocusPrevious,
-        /// Inserts the visible agent session's pending comments into its prompt.
+        /// Inserts the workspace's pending agent comments into the visible session's prompt.
         InsertPendingComments,
-        /// Removes the visible agent session's pending comments without inserting them.
+        /// Removes the workspace's pending agent comments without inserting them.
         ClearPendingComments,
     ]
 );
@@ -84,7 +86,7 @@ pub struct AgentCommentId(usize);
 
 impl AgentCommentId {
     /// Ids are unique across every store, so an open input can tell whether
-    /// its comment still exists after the visible thread changes.
+    /// its comment still exists.
     fn next() -> Self {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -110,7 +112,8 @@ pub enum AgentCommentStoreEvent {
     Changed,
 }
 
-/// The comments an agent session has collected, in the order they were added.
+/// The comments a workspace has collected for the agent, in the order they
+/// were added.
 #[derive(Default)]
 pub struct AgentCommentStore {
     comments: Vec<AgentComment>,
@@ -319,59 +322,84 @@ fn comment_payload(
     })
 }
 
-/// The comment store of the agent session that is visible in the agent panel,
-/// which is where comments are added and whose comments views show. It
-/// notifies its observers when the session changes or its comments change.
+/// One comment store per workspace, so comments reach the agent panel of the
+/// workspace they were written in, whether or not that panel is open.
 #[derive(Default)]
-pub struct ActiveCommentStore {
-    store: Option<WeakEntity<AgentCommentStore>>,
-    thread_title: SharedString,
-    _store_subscription: Option<Subscription>,
+pub struct AgentCommentStores {
+    stores: HashMap<EntityId, (Entity<AgentCommentStore>, Vec<Subscription>)>,
 }
 
-struct GlobalActiveCommentStore(Entity<ActiveCommentStore>);
+struct GlobalAgentCommentStores(Entity<AgentCommentStores>);
 
-impl Global for GlobalActiveCommentStore {}
+impl Global for GlobalAgentCommentStores {}
 
-impl ActiveCommentStore {
+impl AgentCommentStores {
+    /// Notifies when any workspace's comments change, or comments are turned
+    /// on or off.
     pub fn global(cx: &mut App) -> Entity<Self> {
-        if let Some(global) = cx.try_global::<GlobalActiveCommentStore>() {
+        if let Some(global) = cx.try_global::<GlobalAgentCommentStores>() {
             return global.0.clone();
         }
-        let active_store = cx.new(|_| Self::default());
-        cx.set_global(GlobalActiveCommentStore(active_store.clone()));
-        active_store
+        let stores = cx.new(|cx| {
+            let mut enabled = comments_enabled(cx);
+            cx.observe_global::<SettingsStore>(move |_, cx| {
+                let now_enabled = comments_enabled(cx);
+                if now_enabled != enabled {
+                    enabled = now_enabled;
+                    cx.notify();
+                }
+            })
+            .detach();
+            Self::default()
+        });
+        cx.set_global(GlobalAgentCommentStores(stores.clone()));
+        stores
     }
 
-    /// Makes `store` the one comments go to. `None` turns commenting off.
-    pub fn set(
+    fn store_for(
         &mut self,
-        store: Option<&Entity<AgentCommentStore>>,
-        thread_title: SharedString,
+        workspace: &Entity<Workspace>,
         cx: &mut Context<Self>,
-    ) {
-        self.thread_title = thread_title;
-        let current = self.store();
-        if current.as_ref().map(Entity::entity_id) == store.map(Entity::entity_id) {
-            return;
+    ) -> Entity<AgentCommentStore> {
+        let workspace_id = workspace.entity_id();
+        if let Some((store, _)) = self.stores.get(&workspace_id) {
+            return store.clone();
         }
-        self.store = store.map(Entity::downgrade);
-        self._store_subscription = store
-            .map(|store| cx.subscribe(store, |_, _, _: &AgentCommentStoreEvent, cx| cx.notify()));
-        cx.notify();
-    }
-
-    pub fn store(&self) -> Option<Entity<AgentCommentStore>> {
-        self.store.as_ref()?.upgrade()
-    }
-
-    pub fn thread_title(&self) -> SharedString {
-        self.thread_title.clone()
+        let store = cx.new(|_| AgentCommentStore::default());
+        let subscriptions = vec![
+            cx.subscribe(&store, |_, _, _: &AgentCommentStoreEvent, cx| cx.notify()),
+            cx.observe_release(workspace, move |this, _, _| {
+                this.stores.remove(&workspace_id);
+            }),
+        ];
+        self.stores
+            .insert(workspace_id, (store.clone(), subscriptions));
+        store
     }
 }
 
-pub fn active_comment_store(cx: &mut App) -> Option<Entity<AgentCommentStore>> {
-    ActiveCommentStore::global(cx).read(cx).store()
+pub fn comments_enabled(cx: &App) -> bool {
+    let settings = AgentSettings::get_global(cx);
+    settings.enabled(cx) && settings.enable_comments
+}
+
+/// The workspace's comment store, even while comments are turned off.
+pub fn workspace_comment_store(
+    workspace: &Entity<Workspace>,
+    cx: &mut App,
+) -> Entity<AgentCommentStore> {
+    AgentCommentStores::global(cx).update(cx, |stores, cx| stores.store_for(workspace, cx))
+}
+
+/// The store new comments go to, or `None` while comments are turned off.
+pub fn comment_store(
+    workspace: Option<&Entity<Workspace>>,
+    cx: &mut App,
+) -> Option<Entity<AgentCommentStore>> {
+    if !comments_enabled(cx) {
+        return None;
+    }
+    Some(workspace_comment_store(workspace?, cx))
 }
 
 /// Anchors a commented range so that text typed at either edge doesn't join it.
@@ -459,7 +487,7 @@ pub fn format_comments(comments: &[CommentPayload]) -> String {
 
 struct CommentAddedToast;
 
-/// Adds a new comment to the visible agent session's store.
+/// Adds a new comment to the workspace's store.
 fn add_comment(
     buffer: Entity<Buffer>,
     range: Range<language::Anchor>,
@@ -467,25 +495,23 @@ fn add_comment(
     workspace: &WeakEntity<Workspace>,
     cx: &mut App,
 ) {
-    let active_store = ActiveCommentStore::global(cx);
-    let Some(store) = active_store.read(cx).store() else {
+    let Some(workspace) = workspace.upgrade() else {
         return;
     };
-    let thread_title = active_store.read(cx).thread_title();
-    store.update(cx, |store, cx| store.add(buffer, range, body, cx));
-    let message = if thread_title.is_empty() {
-        "Comment added to agent thread".to_string()
-    } else {
-        format!("Comment added to {thread_title}")
+    let Some(store) = comment_store(Some(&workspace), cx) else {
+        return;
     };
-    workspace
-        .update(cx, |workspace, cx| {
-            workspace.show_toast(
-                Toast::new(NotificationId::unique::<CommentAddedToast>(), message).autohide(),
-                cx,
-            );
-        })
-        .log_err();
+    store.update(cx, |store, cx| store.add(buffer, range, body, cx));
+    workspace.update(cx, |workspace, cx| {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::unique::<CommentAddedToast>(),
+                "Comment added for the agent",
+            )
+            .autohide(),
+            cx,
+        );
+    });
 }
 
 fn apply_edit_event(
@@ -514,7 +540,7 @@ struct AgentCommentGutter;
 fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Editor>) {
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let buffer_ids = snapshot.all_buffer_ids().collect::<HashSet<_>>();
-    let ranges = match active_comment_store(cx) {
+    let ranges = match comment_store(editor.workspace().as_ref(), cx) {
         Some(store) => store
             .read(cx)
             .comments()
@@ -542,14 +568,13 @@ fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Edito
     );
 }
 
-/// Comments go to the visible agent session, so without one there is nowhere
-/// to send them and the icons are hidden.
+/// While comments are turned off, the icons are hidden.
 fn refresh_editor_comment_buttons(
     editor: &mut Editor,
     show_selection_button: bool,
     cx: &mut Context<Editor>,
 ) {
-    let has_active_store = active_comment_store(cx).is_some();
+    let has_active_store = comment_store(editor.workspace().as_ref(), cx).is_some();
     editor.set_show_selection_comment_button(show_selection_button && has_active_store, cx);
     let in_comment = has_active_store && comment_at_cursor(editor, cx).is_some();
     editor.set_show_cursor_comment_button(in_comment, cx);
@@ -560,7 +585,7 @@ fn comment_at_cursor(
     editor: &Editor,
     cx: &mut App,
 ) -> Option<(Entity<AgentCommentStore>, BufferSnapshot, AgentComment)> {
-    let store = active_comment_store(cx)?;
+    let store = comment_store(editor.workspace().as_ref(), cx)?;
     let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
     let (snapshot, range) = multi_buffer_snapshot
         .anchor_range_to_buffer_anchor_range(editor.selections.newest_anchor().range())?;
@@ -581,11 +606,11 @@ pub fn init(cx: &mut App) {
         let open_input = OpenInputSlot::default();
         refresh_editor_comment_buttons(editor, true, cx);
         refresh_editor_comment_highlights(editor, cx);
-        let active_store = ActiveCommentStore::global(cx);
-        cx.observe(&active_store, {
+        let comment_stores = AgentCommentStores::global(cx);
+        cx.observe(&comment_stores, {
             let open_input = open_input.clone();
             move |editor, _, cx| {
-                close_input_if_comment_gone(&open_input, cx);
+                close_input_if_comment_gone(&open_input, editor.workspace().as_ref(), cx);
                 refresh_editor_comment_buttons(editor, true, cx);
                 refresh_editor_comment_highlights(editor, cx)
             }
@@ -637,10 +662,14 @@ struct OpenInput {
 
 type OpenInputSlot = Rc<RefCell<Option<OpenInput>>>;
 
-/// Whether an input has nothing left to submit to: no session is visible,
-/// or the comment it edits is gone from the visible session.
-fn is_input_stale(comment_id: Option<AgentCommentId>, cx: &mut App) -> bool {
-    let Some(store) = active_comment_store(cx) else {
+/// Whether an input has nothing left to submit to: comments are turned off,
+/// or the comment it edits is gone.
+fn is_input_stale(
+    comment_id: Option<AgentCommentId>,
+    workspace: Option<&Entity<Workspace>>,
+    cx: &mut App,
+) -> bool {
+    let Some(store) = comment_store(workspace, cx) else {
         return true;
     };
     comment_id.is_some_and(|comment_id| !store.read(cx).contains(comment_id))
@@ -648,13 +677,17 @@ fn is_input_stale(comment_id: Option<AgentCommentId>, cx: &mut App) -> bool {
 
 /// Closes an input with nothing left to submit to, so its text isn't
 /// silently dropped on submit.
-fn close_input_if_comment_gone(open_input: &OpenInputSlot, cx: &mut App) {
+fn close_input_if_comment_gone(
+    open_input: &OpenInputSlot,
+    workspace: Option<&Entity<Workspace>>,
+    cx: &mut App,
+) {
     let input = {
         let open_input = open_input.borrow();
         let Some(OpenInput { input, comment_id }) = open_input.as_ref() else {
             return;
         };
-        if !is_input_stale(*comment_id, cx) {
+        if !is_input_stale(*comment_id, workspace, cx) {
             return;
         }
         input.clone()
@@ -676,7 +709,7 @@ fn toggle_editor_comment(
             .update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
         return;
     }
-    if active_comment_store(cx).is_none() {
+    if comment_store(editor.workspace().as_ref(), cx).is_none() {
         return;
     }
     let display_snapshot = editor.display_snapshot(cx);
@@ -1078,11 +1111,12 @@ impl CommentPopover {
         buffer: &BufferSnapshot,
         range: Range<usize>,
         position: Point<Pixels>,
+        workspace: Option<&Entity<Workspace>>,
         window: &mut Window,
         cx: &mut Context<V>,
         on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
     ) -> Option<Self> {
-        let store = active_comment_store(cx)?;
+        let store = comment_store(workspace, cx)?;
         let comment = store
             .read(cx)
             .comments_at(buffer, range, cx)
@@ -1126,10 +1160,10 @@ impl CommentPopover {
         }
     }
 
-    /// Whether the popover edits a comment that is no longer in the visible
-    /// session, so the view should close it.
-    pub fn is_stale(&self, cx: &mut App) -> bool {
-        is_input_stale(self.comment_id, cx)
+    /// Whether comments were turned off or the edited comment is gone, so
+    /// the view should close the popover.
+    pub fn is_stale(&self, workspace: Option<&Entity<Workspace>>, cx: &mut App) -> bool {
+        is_input_stale(self.comment_id, workspace, cx)
     }
 
     pub fn render(&self) -> impl IntoElement {
@@ -1452,57 +1486,11 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn test_active_store_notifies_on_changes(cx: &mut TestAppContext) {
-        let buffer = cx.new(|cx| Buffer::local("one two", cx));
-        let first = cx.new(|_| AgentCommentStore::default());
-        let second = cx.new(|_| AgentCommentStore::default());
-        let active_store = cx.update(ActiveCommentStore::global);
-        let notifications = Rc::new(RefCell::new(0));
-        cx.update(|cx| {
-            let notifications = notifications.clone();
-            cx.observe(&active_store, move |_, _| *notifications.borrow_mut() += 1)
-                .detach();
-        });
-
-        active_store.update(cx, |active, cx| {
-            active.set(Some(&first), "First".into(), cx)
-        });
-        assert_eq!(*notifications.borrow(), 1);
-        active_store.update(cx, |active, cx| {
-            active.set(Some(&first), "Renamed".into(), cx)
-        });
-        assert_eq!(*notifications.borrow(), 1, "same store doesn't notify");
-        assert_eq!(
-            active_store.read_with(cx, |active, _| active.thread_title()),
-            "Renamed"
-        );
-
-        add(&first, &buffer, 0..3, "One.", cx);
-        assert_eq!(*notifications.borrow(), 2);
-        add(&second, &buffer, 4..7, "Two.", cx);
-        assert_eq!(*notifications.borrow(), 2, "other stores are ignored");
-
-        active_store.update(cx, |active, cx| {
-            active.set(Some(&second), "Second".into(), cx)
-        });
-        assert_eq!(*notifications.borrow(), 3);
-        add(&first, &buffer, 4..7, "Ignored.", cx);
-        assert_eq!(*notifications.borrow(), 3);
-
-        drop(second);
-        cx.run_until_parked();
-        assert!(
-            cx.update(active_comment_store).is_none(),
-            "the slot is weak"
-        );
-    }
-
     mod editor_tests {
         use super::*;
         use editor::SelectionEffects;
         use fs::FakeFs;
-        use gpui::VisualTestContext;
+        use gpui::{UpdateGlobal as _, VisualTestContext};
         use project::Project;
         use serde_json::json;
         use std::path::PathBuf;
@@ -1543,14 +1531,27 @@ mod tests {
             (editor, cx)
         }
 
-        fn activate_store(cx: &mut VisualTestContext) -> Entity<AgentCommentStore> {
-            let store = cx.new(|_| AgentCommentStore::default());
-            let active_store = cx.update(|_, cx| ActiveCommentStore::global(cx));
-            active_store.update(cx, |active, cx| {
-                active.set(Some(&store), "Thread".into(), cx)
+        fn set_comments_enabled(enabled: bool, cx: &mut VisualTestContext) {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        content.agent.get_or_insert_default().enable_comments = Some(enabled);
+                    });
+                });
             });
             cx.run_until_parked();
-            store
+        }
+
+        /// Turns comments on and returns the store of the editor's workspace.
+        fn enable_comments(
+            editor: &Entity<Editor>,
+            cx: &mut VisualTestContext,
+        ) -> Entity<AgentCommentStore> {
+            set_comments_enabled(true, cx);
+            let workspace = editor
+                .read_with(cx, |editor, _| editor.workspace())
+                .expect("editor should be in a workspace");
+            cx.update(|_, cx| workspace_comment_store(&workspace, cx))
         }
 
         fn select(editor: &Entity<Editor>, range: Range<usize>, cx: &mut VisualTestContext) {
@@ -1596,15 +1597,15 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_buttons_follow_selection_and_active_store(cx: &mut TestAppContext) {
+        async fn test_buttons_follow_selection_and_setting(cx: &mut TestAppContext) {
             let (editor, cx) = open_editor("one two three\n", cx).await;
 
             select(&editor, 4..7, cx);
             cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
             cx.run_until_parked();
-            assert_eq!(buttons(&editor, cx), (false, false), "no active session");
+            assert_eq!(buttons(&editor, cx), (false, false), "comments are off");
 
-            let store = activate_store(cx);
+            let store = enable_comments(&editor, cx);
             assert_eq!(buttons(&editor, cx), (true, false));
 
             select(&editor, 0..3, cx);
@@ -1632,10 +1633,7 @@ mod tests {
             cx.run_until_parked();
             assert!(!buttons(&editor, cx).1, "cursor outside a comment");
 
-            let active_store = cx.update(|_, cx| ActiveCommentStore::global(cx));
-            active_store.update(cx, |active, cx| {
-                active.set(None, SharedString::default(), cx)
-            });
+            set_comments_enabled(false, cx);
             select(&editor, 5..5, cx);
             cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
             cx.run_until_parked();
@@ -1649,9 +1647,9 @@ mod tests {
             select(&editor, 4..7, cx);
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
-            assert!(editor_focused(&editor, cx), "no active session");
+            assert!(editor_focused(&editor, cx), "comments are off");
 
-            let store = activate_store(cx);
+            let store = enable_comments(&editor, cx);
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
             assert!(!editor_focused(&editor, cx), "the input takes focus");
@@ -1762,7 +1760,7 @@ mod tests {
         #[gpui::test]
         async fn test_input_closes_when_its_comment_is_deleted(cx: &mut TestAppContext) {
             let (editor, cx) = open_editor("one two three\n", cx).await;
-            let store = activate_store(cx);
+            let store = enable_comments(&editor, cx);
             editor.update(cx, |editor, cx| {
                 let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
                 let snapshot = buffer.read(cx).snapshot();
@@ -1786,18 +1784,76 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_new_input_closes_without_active_store(cx: &mut TestAppContext) {
+        async fn test_new_input_closes_when_comments_are_disabled(cx: &mut TestAppContext) {
             let (editor, cx) = open_editor("one two three\n", cx).await;
-            let _store = activate_store(cx);
+            let _store = enable_comments(&editor, cx);
             select(&editor, 4..7, cx);
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
             assert!(!editor_focused(&editor, cx));
 
-            let active_store = cx.update(|_, cx| ActiveCommentStore::global(cx));
-            active_store.update(cx, |active, cx| active.set(None, "".into(), cx));
-            cx.run_until_parked();
+            set_comments_enabled(false, cx);
             assert!(editor_focused(&editor, cx), "the input closed");
+        }
+
+        #[gpui::test]
+        async fn test_comments_go_to_the_editor_workspace(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+            let store = enable_comments(&editor, cx);
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/other"), json!({"lib.rs": "four five\n"}))
+                .await;
+            let other_project = Project::test(fs, [path!("/other").as_ref()], cx).await;
+            let other_workspace =
+                cx.update(|window, cx| cx.new(|cx| Workspace::test_new(other_project, window, cx)));
+            let other_store = cx.update(|_, cx| workspace_comment_store(&other_workspace, cx));
+            assert_ne!(store.entity_id(), other_store.entity_id());
+            let workspace = editor
+                .read_with(cx, |editor, _| editor.workspace())
+                .expect("editor should be in a workspace");
+            assert_eq!(
+                cx.update(|_, cx| workspace_comment_store(&workspace, cx))
+                    .entity_id(),
+                store.entity_id(),
+                "a workspace keeps its store"
+            );
+
+            select(&editor, 4..7, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input("Two.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx), ["Two."]);
+            assert!(bodies(&other_store, cx).is_empty());
+
+            let stores = cx.update(|_, cx| AgentCommentStores::global(cx));
+            let notifications = Rc::new(RefCell::new(0));
+            cx.update(|_, cx| {
+                let notifications = notifications.clone();
+                cx.observe(&stores, move |_, _| *notifications.borrow_mut() += 1)
+                    .detach();
+            });
+            let buffer = cx.new(|cx| Buffer::local("four", cx));
+            other_store.update(cx, |store, cx| {
+                let range = comment_anchor_range(&buffer.read(cx).snapshot(), 0..4);
+                store.add(buffer, range, "Four.".to_string(), cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(*notifications.borrow(), 1, "any store's changes notify");
+
+            let weak_other_store = other_store.downgrade();
+            drop(other_store);
+            drop(other_workspace);
+            cx.run_until_parked();
+            // The store is dropped while the workspace's release is handled,
+            // so it's released on the next effect flush.
+            cx.update(|_, _| {});
+            assert!(
+                weak_other_store.upgrade().is_none(),
+                "the store goes with its workspace"
+            );
         }
     }
 }

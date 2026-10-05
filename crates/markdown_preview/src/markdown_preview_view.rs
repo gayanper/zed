@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_comments::{ActiveCommentStore, CommentPopover, CommentSource};
+use agent_comments::{AgentCommentStore, AgentCommentStores, CommentPopover, CommentSource};
 use anyhow::{Context as _, Result};
 use editor::items::open_resolved_target;
 use editor::scroll::Autoscroll;
@@ -396,7 +396,7 @@ impl MarkdownPreviewView {
                     cx,
                 )
             });
-            let active_comment_store = ActiveCommentStore::global(cx);
+            let agent_comment_stores = AgentCommentStores::global(cx);
             let mut this = Self {
                 active_editor: None,
                 focus_handle: cx.focus_handle(),
@@ -423,12 +423,13 @@ impl MarkdownPreviewView {
                 markdown_parse_pending: false,
                 agent_comment: None,
                 _active_comment_store_subscription: cx.observe(
-                    &active_comment_store,
+                    &agent_comment_stores,
                     |this, _, cx| {
+                        let workspace = this.workspace.upgrade();
                         if this
                             .agent_comment
                             .as_ref()
-                            .is_some_and(|popover| popover.is_stale(cx))
+                            .is_some_and(|popover| popover.is_stale(workspace.as_ref(), cx))
                         {
                             this.agent_comment = None;
                         }
@@ -1158,7 +1159,7 @@ impl MarkdownPreviewView {
                 }
             });
 
-        if self.agent_comment.is_none() && agent_comments::active_comment_store(cx).is_some() {
+        if self.agent_comment.is_none() && self.agent_comment_store(cx).is_some() {
             let view_handle = cx.entity().downgrade();
             markdown_element = markdown_element
                 .selection_action_in_range_highlights()
@@ -1803,8 +1804,12 @@ impl MarkdownPreviewView {
             .as_singleton()
     }
 
+    fn agent_comment_store(&self, cx: &mut App) -> Option<Entity<AgentCommentStore>> {
+        agent_comments::comment_store(self.workspace.upgrade().as_ref(), cx)
+    }
+
     fn refresh_agent_comment_highlights(&mut self, cx: &mut Context<Self>) {
-        let store = agent_comments::active_comment_store(cx);
+        let store = self.agent_comment_store(cx);
         let highlights = match (self.active_buffer(cx), store) {
             (Some(buffer), Some(store)) => {
                 let color = cx.theme().status().info_background;
@@ -1836,6 +1841,7 @@ impl MarkdownPreviewView {
             &buffer.read(cx).snapshot(),
             range,
             position,
+            self.workspace.upgrade().as_ref(),
             window,
             cx,
             |view, window, cx| {
@@ -1862,7 +1868,7 @@ impl MarkdownPreviewView {
             cx.notify();
             return;
         }
-        if agent_comments::active_comment_store(cx).is_none() || self.hovered_url.is_some() {
+        if self.agent_comment_store(cx).is_none() || self.hovered_url.is_some() {
             return;
         }
         if let Some(offset) = self.markdown.read(cx).cursor_offset() {
@@ -4526,11 +4532,13 @@ mod tests {
         let editor = cx
             .update(|cx| item.act_as::<Editor>(cx))
             .expect("file should open in an editor");
-        let store = cx.new(|_| agent_comments::AgentCommentStore::default());
-        cx.update(|cx| {
-            agent_comments::ActiveCommentStore::global(cx).update(cx, |active, cx| {
-                active.set(Some(&store), "Thread".into(), cx)
-            })
+        let store = cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(true);
+                });
+            });
+            agent_comments::workspace_comment_store(&workspace, cx)
         });
         let preview = multi_workspace
             .update(cx, |_, window, cx| {
@@ -4627,11 +4635,13 @@ mod tests {
         let editor = cx
             .update(|cx| item.act_as::<Editor>(cx))
             .expect("file should open in an editor");
-        let store = cx.new(|_| agent_comments::AgentCommentStore::default());
-        cx.update(|cx| {
-            agent_comments::ActiveCommentStore::global(cx).update(cx, |active, cx| {
-                active.set(Some(&store), "Thread".into(), cx)
-            })
+        let store = cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(true);
+                });
+            });
+            agent_comments::workspace_comment_store(&workspace, cx)
         });
         let preview = multi_workspace
             .update(cx, |_, window, cx| {

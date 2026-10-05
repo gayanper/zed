@@ -14,8 +14,7 @@ use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_comments::{
-    ActiveCommentStore, AgentCommentStore, AgentCommentStoreEvent, ClearPendingComments,
-    InsertPendingComments,
+    AgentCommentStore, AgentCommentStoreEvent, ClearPendingComments, InsertPendingComments,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -955,7 +954,6 @@ struct AgentTerminal {
     init_command: Option<String>,
     created_at: DateTime<Utc>,
     has_notification: bool,
-    comment_store: Entity<AgentCommentStore>,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
@@ -1143,7 +1141,8 @@ pub struct AgentPanel {
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
     _settings_subscription: Subscription,
-    _visible_comment_store_subscription: Option<Subscription>,
+    agent_comment_store: Entity<AgentCommentStore>,
+    _agent_comment_store_subscription: Subscription,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
 
@@ -1461,6 +1460,16 @@ impl AgentPanel {
         let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
         let workspace = workspace.weak_handle();
+        let agent_comment_store = match workspace.upgrade() {
+            Some(workspace) => agent_comments::workspace_comment_store(&workspace, cx),
+            // Unreachable while the panel is built from a live workspace; a
+            // detached store only means comments stay hidden from this panel.
+            None => cx.new(|_| AgentCommentStore::default()),
+        };
+        let _agent_comment_store_subscription = cx.subscribe(
+            &agent_comment_store,
+            |_, _, _: &AgentCommentStoreEvent, cx| cx.notify(),
+        );
 
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
@@ -1514,8 +1523,7 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if let Some(conversation_view) = this.remove_retained_thread(thread_id) {
-                    Self::clear_agent_comments(&conversation_view, cx);
+                if this.remove_retained_thread(thread_id).is_some() {
                     cx.notify();
                 }
             },
@@ -1523,7 +1531,6 @@ impl AgentPanel {
 
         let _settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
             this.cleanup_retained_threads(cx);
-            this.sync_active_comment_store(cx);
             cx.notify();
         });
 
@@ -1569,7 +1576,8 @@ impl AgentPanel {
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
             _settings_subscription,
-            _visible_comment_store_subscription: None,
+            agent_comment_store,
+            _agent_comment_store_subscription,
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
@@ -2279,7 +2287,6 @@ impl AgentPanel {
             init_command,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
-            comment_store: cx.new(|_| AgentCommentStore::default()),
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -3348,14 +3355,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let removed_view = self.remove_retained_thread(&id).or_else(|| {
-            self.active_conversation_view()
-                .filter(|conversation_view| conversation_view.read(cx).thread_id == id)
-                .cloned()
-        });
-        if let Some(conversation_view) = removed_view {
-            Self::clear_agent_comments(&conversation_view, cx);
-        }
+        self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
@@ -4316,10 +4316,7 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                // Pending agent comments live only in the view, so keep it.
-                thread.connection().supports_load_session()
-                    && thread.is_idle_for_retention()
-                    && view.read(cx).agent_comment_store().read(cx).is_empty()
+                thread.connection().supports_load_session() && thread.is_idle_for_retention()
             })
             .collect::<Vec<_>>();
 
@@ -4390,7 +4387,6 @@ impl AgentPanel {
                     this._thread_view_subscription =
                         Self::subscribe_to_active_thread_view(&server_view, window, cx);
                     this.observe_active_draft_for_empty_editor(&server_view, cx);
-                    this.sync_active_comment_store(cx);
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
                     cx.notify();
@@ -4422,57 +4418,21 @@ impl AgentPanel {
                 None
             }
         };
-        self.sync_active_comment_store(cx);
         self.serialize(cx);
     }
 
-    /// Comments belong to their session, so they go when it is closed or
-    /// archived, even while something else still holds its view.
-    fn clear_agent_comments(conversation_view: &Entity<ConversationView>, cx: &mut App) {
-        let store = conversation_view.read(cx).agent_comment_store().clone();
-        store.update(cx, |store, cx| store.clear(cx));
-    }
-
-    fn comments_enabled(cx: &App) -> bool {
-        let settings = AgentSettings::get_global(cx);
-        settings.enabled(cx) && settings.enable_comments
-    }
-
-    /// The visible session's comment store and title.
-    fn visible_comment_store(&self, cx: &App) -> Option<(Entity<AgentCommentStore>, SharedString)> {
-        if !Self::comments_enabled(cx) {
+    /// The workspace's comment store, while comments are on and a session
+    /// is visible to insert them into.
+    fn visible_comment_store(&self, cx: &App) -> Option<Entity<AgentCommentStore>> {
+        if !agent_comments::comments_enabled(cx) {
             return None;
         }
-        match &self.base_view {
-            BaseView::AgentThread { conversation_view } => {
-                let conversation_view = conversation_view.read(cx);
-                Some((
-                    conversation_view.agent_comment_store().clone(),
-                    conversation_view.title(cx),
-                ))
-            }
-            BaseView::Terminal { terminal_id } => self
-                .terminals
-                .get(terminal_id)
-                .map(|terminal| (terminal.comment_store.clone(), terminal.title(cx))),
-            BaseView::Uninitialized => None,
-        }
-    }
-
-    /// Sends new agent comments to the visible session, and shows only its
-    /// comments in editors.
-    fn sync_active_comment_store(&mut self, cx: &mut Context<Self>) {
-        let visible = self.visible_comment_store(cx);
-        self._visible_comment_store_subscription = visible.as_ref().map(|(store, _)| {
-            cx.subscribe(store, |_, _, _: &AgentCommentStoreEvent, cx| cx.notify())
-        });
-        let (store, title) = match visible {
-            Some((store, title)) => (Some(store), title),
-            None => (None, SharedString::default()),
+        let session_visible = match &self.base_view {
+            BaseView::AgentThread { .. } => true,
+            BaseView::Terminal { terminal_id } => self.terminals.contains_key(terminal_id),
+            BaseView::Uninitialized => false,
         };
-        ActiveCommentStore::global(cx).update(cx, |active_store, cx| {
-            active_store.set(store.as_ref(), title, cx)
-        });
+        session_visible.then(|| self.agent_comment_store.clone())
     }
 
     fn visible_surface(&self) -> VisibleSurface<'_> {
@@ -6332,7 +6292,7 @@ impl AgentPanel {
     }
 
     fn render_agent_comments_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (store, _) = self.visible_comment_store(cx)?;
+        let store = self.visible_comment_store(cx)?;
         let count = store.read(cx).len();
         if count == 0 {
             return None;
@@ -6375,7 +6335,7 @@ impl AgentPanel {
     }
 
     fn clear_visible_agent_comments(&mut self, cx: &mut Context<Self>) {
-        let Some((store, _)) = self.visible_comment_store(cx) else {
+        let Some(store) = self.visible_comment_store(cx) else {
             return;
         };
         store.update(cx, |store, cx| store.clear(cx));
@@ -6394,7 +6354,7 @@ impl AgentPanel {
     /// Inserts the visible session's pending agent comments into its prompt,
     /// without submitting it, and removes them from the session.
     fn insert_agent_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((store, _)) = self.visible_comment_store(cx) else {
+        let Some(store) = self.visible_comment_store(cx) else {
             return;
         };
         match self.visible_surface() {
@@ -9789,8 +9749,17 @@ mod tests {
         (workspace, panel, cx)
     }
 
-    fn active_comment_store(cx: &mut VisualTestContext) -> Option<Entity<AgentCommentStore>> {
-        cx.update(|_, cx| agent_comments::active_comment_store(cx))
+    fn workspace_comment_store(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<AgentCommentStore> {
+        cx.update(|_, cx| agent_comments::workspace_comment_store(workspace, cx))
+    }
+
+    fn comments_button_shown(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) -> bool {
+        panel.update(cx, |panel, cx| {
+            panel.render_agent_comments_button(cx).is_some()
+        })
     }
 
     fn visible_comment_store(
@@ -9801,7 +9770,6 @@ mod tests {
             panel
                 .visible_comment_store(cx)
                 .expect("a session should be visible")
-                .0
         })
     }
 
@@ -9840,16 +9808,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_agent_comments_go_to_the_visible_thread(cx: &mut TestAppContext) {
+    async fn test_agent_comments_belong_to_the_workspace(cx: &mut TestAppContext) {
         let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
-        assert!(active_comment_store(&mut cx).is_none(), "no session yet");
+        let store = workspace_comment_store(&workspace, &mut cx);
 
-        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
-        let first_store = visible_comment_store(&panel, &mut cx);
-        assert_eq!(
-            active_comment_store(&mut cx).map(|store| store.entity_id()),
-            Some(first_store.entity_id())
-        );
         comment_in_editor(
             &workspace,
             language::Point::new(0, 4)..language::Point::new(0, 7),
@@ -9857,20 +9819,39 @@ mod tests {
             &mut cx,
         )
         .await;
-        first_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store.len(),
+                1,
+                "comments are kept without a visible session"
+            )
+        });
 
         open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
-        let second_store = visible_comment_store(&panel, &mut cx);
-        assert_ne!(first_store.entity_id(), second_store.entity_id());
-        comment_in_editor(
-            &workspace,
-            language::Point::new(1, 0)..language::Point::new(1, 5),
-            "Three.",
-            &mut cx,
-        )
-        .await;
-        first_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
-        second_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        assert_eq!(
+            visible_comment_store(&panel, &mut cx).entity_id(),
+            store.entity_id()
+        );
+        assert!(comments_button_shown(&panel, &mut cx));
+
+        let first_thread_id = active_thread_id(&panel, &cx);
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        assert_eq!(
+            visible_comment_store(&panel, &mut cx).entity_id(),
+            store.entity_id()
+        );
+        assert!(
+            comments_button_shown(&panel, &mut cx),
+            "switching threads keeps the comments"
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.remove_thread_without_activating_draft(first_thread_id, window, cx)
+        });
+        cx.run_until_parked();
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.len(), 1, "removing a thread keeps the comments")
+        });
 
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
@@ -9881,18 +9862,15 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(
-            active_comment_store(&mut cx).is_none(),
+            !comments_button_shown(&panel, &mut cx),
             "the setting turns comments off"
         );
-        second_store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
     }
 
     #[gpui::test]
-    async fn test_agent_comments_are_dropped_with_their_session(cx: &mut TestAppContext) {
+    async fn test_agent_comments_show_in_terminal_sessions(cx: &mut TestAppContext) {
         let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
-
-        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
-        let thread_store = visible_comment_store(&panel, &mut cx);
         comment_in_editor(
             &workspace,
             language::Point::new(0, 4)..language::Point::new(0, 7),
@@ -9900,21 +9878,11 @@ mod tests {
             &mut cx,
         )
         .await;
-        let thread_id = active_thread_id(&panel, &cx);
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.remove_thread_without_activating_draft(thread_id, window, cx)
-        });
-        cx.run_until_parked();
-        thread_store.read_with(&cx, |store, _| {
-            assert!(store.is_empty(), "removing a thread drops its comments")
-        });
-        assert!(active_comment_store(&mut cx).is_none());
 
-        let terminal_id = TerminalId::new();
         panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.insert_display_only_terminal(
-                    terminal_id,
+                    TerminalId::new(),
                     Some(PathBuf::from("/project")),
                     Some("Terminal".into()),
                     None,
@@ -9929,25 +9897,11 @@ mod tests {
             })
             .expect("display-only terminal should be inserted");
         cx.run_until_parked();
-        let terminal_store = visible_comment_store(&panel, &mut cx).downgrade();
-        comment_in_editor(
-            &workspace,
-            language::Point::new(0, 4)..language::Point::new(0, 7),
-            "Two.",
-            &mut cx,
-        )
-        .await;
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.close_terminal_without_activating_draft(terminal_id, window, cx)
-        });
-        cx.run_until_parked();
-        // The last rendered frame still holds the session's views.
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            terminal_store.upgrade().is_none(),
-            "closing a terminal drops its comments"
+        assert_eq!(
+            visible_comment_store(&panel, &mut cx).entity_id(),
+            workspace_comment_store(&workspace, &mut cx).entity_id()
         );
+        assert!(comments_button_shown(&panel, &mut cx));
     }
 
     #[gpui::test]

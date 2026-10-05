@@ -9,7 +9,7 @@ Users can leave comments for the AI agent on text in two places:
 - a **source code editor**;
 - the **markdown preview**.
 
-Commented text stays tinted in both places, so the user can see what they've already commented on and reopen a comment to edit or remove it. The comments collect against the active agent thread. A button on the agent toolbar shows how many are pending, and clicking it inserts them into the prompt as plain text.
+Commented text stays tinted in both places, so the user can see what they've already commented on and reopen a comment to edit or remove it. The comments collect in the workspace they were written in. A button on the agent toolbar shows how many are pending, and clicking it inserts them into the prompt as plain text.
 
 This feature is separate from the diff review comments (`stored_review_comments`, `AddDiffReviewComment` in `crates/editor/src/git.rs`). It shares no storage, actions or UI with them.
 
@@ -18,7 +18,7 @@ This feature is separate from the diff review comments (`stored_review_comments`
 **In scope**
 - Adding, viewing, editing and removing comments in full-mode project editors.
 - The same, in the markdown preview.
-- Collecting comments per agent session and inserting them into the prompt (Phases 2–4).
+- Collecting comments per workspace and inserting them into the visible session's prompt (Phases 2–4).
 - The `agent.enable_comments` setting, off by default.
 
 **Out of scope**
@@ -435,7 +435,7 @@ Each one must be closed before release.
 **Goal:** submitted comments go into the active session's store instead of a notification.
 
 - The submit paths in the editor block and the preview popover call `store.add`, through the active-store slot.
-- On success, show a brief toast: "Comment added to ‹thread title›". With no active session, follow the Phase 2 decision.
+- On success, show a brief toast: "Comment added for the agent".
 - `format_comment` stays the one place that builds payloads.
 
 ### Phase 3 acceptance
@@ -550,10 +550,9 @@ Otherwise it isn't rendered at all, so the toolbar layout stays the same as upst
 
 ## Implementation notes
 
-- **Store:** `AgentCommentStore` and the `ActiveCommentStore` slot replace `CommentRegions`. The slot is an entity that notifies when the session or its comments change; editors and previews observe it. `AgentPanel::sync_active_comment_store` updates it from `refresh_base_view_subscriptions`, the conversation view observer (title changes) and the settings observer, never from render. With several windows, the panel that changed last owns the slot.
+- **Store (2026-10-05):** one `AgentCommentStore` per workspace, replacing the per-session stores and the app-wide `ActiveCommentStore` slot described in Phase 2. With one global slot, the panel that synced last owned it, so comments written in one workspace could land in another workspace's thread with no error. `AgentCommentStores` maps each workspace to its store, drops the store when the workspace is released, and notifies when any store changes or comments are turned on or off; editors and previews observe it and resolve the store from their own workspace. Comments are kept while no agent panel is open or no session is visible, and every thread and terminal thread in the workspace shows the same count. The "No active session" rules no longer apply: only the setting hides the icons and tints.
 - **Comment ids** are unique across stores, so an open input can tell that its comment is gone (text deleted, or the visible session changed) and close itself.
-- **Session end:** closing a terminal thread drops its store. A removed or archived Zed thread's view can outlive the removal, so `remove_thread` and `ThreadArchived` also clear its store, which releases the buffers.
-- **Idle thread eviction:** `cleanup_retained_threads` doesn't evict an idle thread that has pending comments, since the comments exist only in its view.
+- **Session end:** closing or archiving a thread or terminal thread no longer drops comments, since they belong to the workspace. Inserting or clearing them is the only way to remove them, other than deleting the commented text or closing the workspace.
 - **Input block height:** 4 lines of chrome plus the input's wrapped row count (2 to 4), resized with `resize_blocks` when that count changes. The input watches its editor, since wrapping is only known after layout.
 - **Preview link clicks:** the modifier-click toggle is ignored while a link is hovered.
 - **Preview without a buffer:** no comment can be made (comments need a buffer). A buffer without a file uses the quote fallback.
