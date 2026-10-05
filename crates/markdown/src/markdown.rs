@@ -1931,8 +1931,19 @@ impl MarkdownElement {
             position.x + px(4.),
             position.y + (line_height - button_size) / 2.,
         );
+        // Theme element colors are translucent, so the text would show through. The backdrop
+        // paints opaque colors itself, layering the hover color over the resting fill.
+        let colors = cx.theme().colors();
+        let resting_background = colors
+            .editor_background
+            .alpha(1.)
+            .blend(colors.element_background);
+        let hover_background = resting_background.blend(colors.element_hover);
         let button = div()
             .occlude()
+            .rounded_sm()
+            .bg(resting_background)
+            .hover(move |style| style.bg(hover_background))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 on_selection_action(
@@ -1947,7 +1958,7 @@ impl MarkdownElement {
                 IconButton::new("markdown-selection-action", IconName::Chat)
                     .icon_size(icon_size)
                     .shape(ui::IconButtonShape::Square)
-                    .style(ButtonStyle::Filled)
+                    .style(ButtonStyle::Transparent)
                     .tooltip(Tooltip::text("Comment for Agent")),
             );
         let mut button = WithRemSize::new(ui_font_size)
