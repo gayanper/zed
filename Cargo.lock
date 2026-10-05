@@ -379,6 +379,7 @@ dependencies = [
 name = "agent_comments"
 version = "0.1.0"
 dependencies = [
+ "agent_settings",
  "collections",
  "db",
  "editor",
@@ -389,6 +390,7 @@ dependencies = [
  "multi_buffer",
  "project",
  "serde_json",
+ "settings",
  "ui",
  "util",
  "workspace",

@@ -9,7 +9,6 @@ use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
 use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
-use agent_comments::AgentCommentStore;
 #[cfg(test)]
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
@@ -658,7 +657,6 @@ pub struct ConversationView {
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
     request_elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
-    agent_comment_store: Entity<AgentCommentStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -673,11 +671,6 @@ impl ConversationView {
         self.as_connected().is_some_and(|connected| {
             connected.auth_state.is_ok() && connected.connection.supports_logout()
         })
-    }
-
-    /// Comments the user left for this conversation's agent.
-    pub fn agent_comment_store(&self) -> &Entity<AgentCommentStore> {
-        &self.agent_comment_store
     }
 
     pub fn active_thread(&self) -> Option<&Entity<ThreadView>> {
@@ -941,7 +934,6 @@ impl ConversationView {
             draft_prompt_persist_task: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
-            agent_comment_store: cx.new(|_| AgentCommentStore::default()),
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
         }
