@@ -50,7 +50,7 @@ actions!(
 /// Editor lines taken by the comment input's title, button row and padding.
 const INPUT_BLOCK_CHROME_LINES: u32 = 4;
 const INPUT_MIN_LINES: usize = 2;
-const INPUT_MAX_LINES: usize = 4;
+const INPUT_MAX_LINES: usize = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommentSource {
@@ -900,7 +900,14 @@ pub struct CommentInput {
     /// Whether this edits an existing comment rather than adding one.
     is_existing: bool,
     visible_lines: usize,
+    /// Set for popovers floating over text, so the text underneath shows
+    /// through while the user works elsewhere.
+    translucent_when_unfocused: bool,
+    /// Covers the editor and the buttons, unlike the editor's own handle
+    /// that `Focusable` returns.
+    focus_handle: FocusHandle,
     _editor_subscription: Subscription,
+    _focus_subscriptions: Vec<Subscription>,
 }
 
 impl CommentInput {
@@ -922,12 +929,20 @@ impl CommentInput {
                 cx.notify();
             }
         });
+        let focus_handle = cx.focus_handle();
+        let focus_subscriptions = vec![
+            cx.on_focus_in(&focus_handle, window, |_, _, cx| cx.notify()),
+            cx.on_focus_out(&focus_handle, window, |_, _, _, cx| cx.notify()),
+        ];
         Self {
             title,
             editor,
             is_existing: false,
             visible_lines: INPUT_MIN_LINES,
+            translucent_when_unfocused: false,
+            focus_handle,
             _editor_subscription: editor_subscription,
+            _focus_subscriptions: focus_subscriptions,
         }
     }
 
@@ -942,6 +957,11 @@ impl CommentInput {
             .update(cx, |editor, cx| editor.set_text(body, window, cx));
         this.is_existing = true;
         this
+    }
+
+    fn set_translucent_when_unfocused(&mut self, translucent: bool, cx: &mut Context<Self>) {
+        self.translucent_when_unfocused = translucent;
+        cx.notify();
     }
 
     /// Lines of text the input shows, within its minimum and maximum height.
@@ -991,11 +1011,17 @@ impl Focusable for CommentInput {
 }
 
 impl Render for CommentInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let focus_handle = self.editor.focus_handle(cx);
+        let translucent =
+            self.translucent_when_unfocused && !self.focus_handle.contains_focused(window, cx);
         v_flex()
             .id("agent-comment-input")
+            .track_focus(&self.focus_handle)
+            .when(translucent, |this| {
+                this.opacity(0.4).hover(|style| style.opacity(1.))
+            })
             .key_context("AgentCommentInput")
             .aria_label(self.title.clone())
             .tab_group()
@@ -1003,7 +1029,7 @@ impl Render for CommentInput {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_previous))
-            .w(rems(28.))
+            .w(rems(36.))
             .p_2()
             .gap_2()
             .bg(colors.elevated_surface_background)
@@ -1148,6 +1174,7 @@ impl CommentPopover {
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
+        input.update(cx, |input, cx| input.set_translucent_when_unfocused(true, cx));
         // Deferred so the focus change made by the mouse down that opened
         // the popover doesn't steal focus back from the input.
         let focus_handle = input.focus_handle(cx);
