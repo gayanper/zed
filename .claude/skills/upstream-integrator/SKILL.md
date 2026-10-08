@@ -1,9 +1,7 @@
 ---
 name: upstream-integrator
 description: Integrates an upstream Zed stable release tag (vX.Y.Z) into the private `myzed` branch by merging it, resolving conflicts while keeping the private features intact, and verifying with build, clippy and targeted tests. Stops before committing. Use when the user asks to integrate, sync or merge an upstream Zed release.
-tools: Bash, Read, Edit, Write, Grep, Glob, Skill
-model: claude-opus-5-5
-effort: medium
+disable-model-invocation: true
 ---
 
 You integrate upstream Zed releases into the private branch `myzed`. The private features on `myzed` are the top priority: after integration every one of them must still exist and behave the same way.
@@ -18,8 +16,8 @@ You integrate upstream Zed releases into the private branch `myzed`. The private
 ## Hard rules
 
 - Never run `git commit`, `git push`, `git rebase`, `git reset --hard`, or `git checkout -- <path>` on work you did not create. Leave the merge staged for the user.
-- Never drop, disable or rewrite a private feature to make a conflict go away. If a conflict cannot be resolved without changing how a private feature behaves, stop and report it with both sides and your proposed options.
-- Never edit `.rules`, and never remove the `> [!IMPORTANT]` lines at the top of `README.md` if present.
+- Never drop, disable or rewrite a private feature to make a conflict go away. If a conflict cannot be resolved without changing how a private feature behaves, show the user both sides and your proposed options, and wait for their decision.
+- Never edit `.rules`, and never remove the `> [!IMPORTANT]` lines at the top of `README.md`. If you adapt private code during the merge, add them first if missing.
 - Follow the repo `CLAUDE.md` coding rules for any code you write while adapting private features (no `unwrap()`, no `let _ =` on fallible calls, no `mod.rs`, etc.).
 - For builds, clippy and tests, use the `shell-runner` skill if it is available; otherwise redirect output to a log file in the scratchpad/`/tmp` and read only the failing lines.
 
@@ -66,7 +64,7 @@ Run in order, fixing only breakage caused by the merge or by adapting private co
 2. `./script/clippy`
 3. `cargo test -p <crate>` for each crate touched by the private commits (from step 3).
 
-If a step still fails after 2 fix attempts, stop and report the exact error. Pre-existing upstream failures unrelated to the private features: record them, do not fix them.
+If a step still fails after 2 fix attempts, show the user the exact error and ask for advice. Pre-existing upstream failures unrelated to the private features: record them, do not fix them.
 
 ### 7. Feature check
 Walk the checklist from step 3. For each private feature confirm its code is present in the merged tree (`git diff <target-tag> -- <files>` should show the private changes) and its tests pass. Mark each ✅ or ❌.
