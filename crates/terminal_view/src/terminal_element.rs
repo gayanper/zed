@@ -21,14 +21,19 @@ use terminal::{
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
-use ui::{ParentElement, Tooltip};
+use ui::{
+    ButtonCommon as _, ButtonStyle, IconButton, IconButtonShape, IconName, IconSize, ParentElement,
+    Tooltip,
+};
 use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
-use std::{fmt::Debug, rc::Rc};
+use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
-use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
+use crate::{
+    BlockContext, BlockProperties, ContentMode, SelectionAction, TerminalMode, TerminalView,
+};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -44,6 +49,8 @@ pub struct LayoutState {
     display_offset: usize,
     hyperlink_tooltip: Option<AnyElement>,
     block_below_cursor_element: Option<AnyElement>,
+    selection_action_button: Option<AnyElement>,
+    gutter_markers: Vec<(RangeInclusive<usize>, Hsla)>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
 }
@@ -433,6 +440,64 @@ impl TerminalElement {
             interactivity: Default::default(),
         }
         .track_focus(&focus)
+    }
+
+    /// Lays out the selection action's button one cell after the end of a
+    /// finished selection.
+    fn layout_selection_action_button(
+        terminal: &Entity<Terminal>,
+        terminal_view: &Entity<TerminalView>,
+        dimensions: TerminalBounds,
+        scroll_top: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let SelectionAction { tooltip, handler } =
+            terminal_view.read(cx).selection_action.clone()?;
+        let terminal = terminal.read(cx);
+        if terminal.selection_started() {
+            return None;
+        }
+        let content = terminal.last_content();
+        let selection = content.selection?;
+        // Captured now because clicking the button may change the selection
+        // before its handler runs.
+        let text = content
+            .selection_text
+            .clone()
+            .filter(|text| !text.is_empty())?;
+        let row = selection.end.line + i32::try_from(content.display_offset).ok()?;
+        if row < 0 || row as usize >= dimensions.num_lines() {
+            return None;
+        }
+
+        let icon_size = IconSize::Small;
+        let button_size = icon_size.square(window, cx) + px(4.);
+        let x = (dimensions.bounds.origin.x
+            + (selection.end.column + 2) as f32 * dimensions.cell_width)
+            .min(dimensions.bounds.right() - button_size);
+        let y = dimensions.bounds.origin.y
+            + row as f32 * dimensions.line_height
+            + (dimensions.line_height - button_size) / 2.
+            - scroll_top;
+        let origin = point(x, y);
+        let range = selection.point_range();
+        let mut button = div()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                handler(range, text.clone(), origin, window, cx);
+            })
+            .child(
+                IconButton::new("terminal-selection-action", IconName::Chat)
+                    .icon_size(icon_size)
+                    .shape(IconButtonShape::Square)
+                    .style(ButtonStyle::Filled)
+                    .tooltip(Tooltip::text(tooltip)),
+            )
+            .into_any_element();
+        button.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
+        Some(button)
     }
 
     pub fn layout_grid<T: TerminalLayoutCell>(
@@ -1550,6 +1615,27 @@ impl Element for TerminalElement {
                     None
                 };
 
+                let gutter_markers = match self.terminal_view.read(cx).gutter_markers.clone() {
+                    Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
+                    None => Vec::new(),
+                };
+                let gutter_markers = gutter_markers
+                    .iter()
+                    .filter_map(|(lines, color)| {
+                        let rows =
+                            gutter_marker_rows(lines, display_offset, dimensions.num_lines())?;
+                        Some((rows, *color))
+                    })
+                    .collect();
+                let selection_action_button = Self::layout_selection_action_button(
+                    &self.terminal,
+                    &self.terminal_view,
+                    dimensions,
+                    scroll_top,
+                    window,
+                    cx,
+                );
+
                 LayoutState {
                     hitbox,
                     batched_text_runs,
@@ -1563,6 +1649,8 @@ impl Element for TerminalElement {
                     display_offset,
                     hyperlink_tooltip,
                     block_below_cursor_element,
+                    selection_action_button,
+                    gutter_markers,
                     base_text_style: text_style,
                     content_mode,
                 }
@@ -1629,6 +1717,7 @@ impl Element for TerminalElement {
             let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
+            let selection_action_button = layout.selection_action_button.take();
             self.interactivity.paint(
                 global_id,
                 inspector_id,
@@ -1675,6 +1764,18 @@ impl Element for TerminalElement {
                             };
                             hr.paint(true, bounds, window);
                         }
+                    }
+
+                    let marker_width = px(2.);
+                    let marker_x = origin.x - (layout.dimensions.cell_width + marker_width) / 2.;
+                    for (rows, color) in &layout.gutter_markers {
+                        let line_height = layout.dimensions.line_height;
+                        let top = origin.y + *rows.start() as f32 * line_height;
+                        let height = (rows.end() - rows.start() + 1) as f32 * line_height;
+                        window.paint_quad(fill(
+                            Bounds::new(point(marker_x, top), size(marker_width, height)),
+                            *color,
+                        ));
                     }
 
                     // Paint batched text runs instead of individual cells
@@ -1739,6 +1840,10 @@ impl Element for TerminalElement {
                     }
 
                     if let Some(mut element) = block_below_cursor_element {
+                        element.paint(window, cx);
+                    }
+
+                    if let Some(mut element) = selection_action_button {
                         element.paint(window, cx);
                     }
 
@@ -1902,6 +2007,19 @@ pub fn is_blank(cell: &Cell) -> bool {
     }
 
     true
+}
+
+/// The visible rows a gutter marker over grid `lines` covers.
+fn gutter_marker_rows(
+    lines: &RangeInclusive<i32>,
+    display_offset: usize,
+    num_lines: usize,
+) -> Option<RangeInclusive<usize>> {
+    let display_offset = i32::try_from(display_offset).ok()?;
+    let last_row = i32::try_from(num_lines).ok()? - 1;
+    let start = lines.start().saturating_add(display_offset).max(0);
+    let end = lines.end().saturating_add(display_offset).min(last_row);
+    (start <= end).then(|| start as usize..=end as usize)
 }
 
 fn to_highlighted_range_lines(
@@ -2145,6 +2263,18 @@ mod tests {
         assert!(TerminalElement::is_decorative_character('\u{1FB3B}')); // Last char
         assert!(!TerminalElement::is_decorative_character('\u{1FAFF}')); // Just before
         assert!(!TerminalElement::is_decorative_character('\u{1FB3C}')); // Just after
+    }
+
+    #[test]
+    fn test_gutter_marker_rows() {
+        // Five visible lines, scrolled up by two: grid lines -2..=2 are shown.
+        let rows = |lines: std::ops::RangeInclusive<i32>| gutter_marker_rows(&lines, 2, 5);
+        assert_eq!(rows(-2..=0), Some(0..=2));
+        assert_eq!(rows(-10..=-1), Some(0..=1), "clipped at the top");
+        assert_eq!(rows(1..=10), Some(3..=4), "clipped at the bottom");
+        assert_eq!(rows(-10..=10), Some(0..=4));
+        assert_eq!(rows(-10..=-3), None, "above the viewport");
+        assert_eq!(rows(3..=10), None, "below the viewport");
     }
 
     #[test]

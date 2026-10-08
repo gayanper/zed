@@ -4570,6 +4570,7 @@ mod tests {
 
         let payload = cx.update(|_, cx| {
             agent_comments::format_comments(&store.read(cx).pending_comments(
+                None,
                 |buffer, cx| {
                     let file = buffer.file()?;
                     Some(file.path().display(file.path_style(cx)).into_owned().into())
@@ -4679,6 +4680,7 @@ mod tests {
 
         let payload = cx.update(|_, cx| {
             agent_comments::format_comments(&store.read(cx).pending_comments(
+                None,
                 |buffer, cx| {
                     let file = buffer.file()?;
                     Some(file.path().display(file.path_style(cx)).into_owned().into())
