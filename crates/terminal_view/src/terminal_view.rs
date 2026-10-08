@@ -10,9 +10,9 @@ use editor::{
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, Corners, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled,
-    Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
+    ExternalPaths, FocusHandle, Focusable, Font, Hsla, KeyContext, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent,
+    Styled, Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -25,7 +25,7 @@ use settings::{
 use std::{
     any::Any,
     cmp,
-    ops::Range as StdRange,
+    ops::{Range as StdRange, RangeInclusive},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -33,7 +33,7 @@ use std::{
 };
 use task::TaskId;
 use terminal::{
-    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
+    Clear, Content, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
     PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
     ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
     TerminalBounds, ToggleViMode,
@@ -74,6 +74,14 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
     } else {
         usize::try_from(line).ok()
     }
+}
+
+pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)>>;
+
+#[derive(Clone)]
+pub(crate) struct SelectionAction {
+    pub(crate) tooltip: SharedString,
+    pub(crate) handler: Rc<dyn Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App)>,
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -158,6 +166,8 @@ pub struct TerminalView {
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
+    selection_action: Option<SelectionAction>,
+    gutter_markers: Option<GutterMarkers>,
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
@@ -305,6 +315,8 @@ impl TerminalView {
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
+            selection_action: None,
+            gutter_markers: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
             needs_serialize: false,
@@ -367,6 +379,43 @@ impl TerminalView {
     /// visibility is derived from the terminal's `mode`.
     pub fn set_show_workspace_actions(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_workspace_actions = Some(show);
+        cx.notify();
+    }
+
+    /// Shows a button after a finished selection that runs `handler` with
+    /// the selected range, its text and the button's window position.
+    pub fn on_selection_action(
+        &mut self,
+        tooltip: impl Into<SharedString>,
+        handler: impl Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection_action = Some(SelectionAction {
+            tooltip: tooltip.into(),
+            handler: Rc::new(handler),
+        });
+        cx.notify();
+    }
+
+    pub fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
+        self.selection_action = None;
+        cx.notify();
+    }
+
+    /// Marks ranges of grid lines with a bar in the gutter left of the text.
+    /// `markers` runs on every paint, with the content being painted, so the
+    /// marks follow the terminal's output.
+    pub fn set_gutter_markers(
+        &mut self,
+        markers: impl Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.gutter_markers = Some(Rc::new(markers));
+        cx.notify();
+    }
+
+    pub fn clear_gutter_markers(&mut self, cx: &mut Context<Self>) {
+        self.gutter_markers = None;
         cx.notify();
     }
 
@@ -2281,6 +2330,7 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
     use remote::RemoteClient;
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
@@ -2558,6 +2608,111 @@ mod tests {
             terminal
                 .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
                 .is_empty()
+        );
+    }
+
+    type SelectionActions = Rc<RefCell<Vec<(Range, String)>>>;
+
+    fn record_selection_actions(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> SelectionActions {
+        let actions = SelectionActions::default();
+        terminal_view.update(cx, |terminal_view, cx| {
+            let actions = actions.clone();
+            terminal_view.on_selection_action(
+                "Act on Selection",
+                move |range, text, _, _, _| actions.borrow_mut().push((range, text)),
+                cx,
+            );
+        });
+        actions
+    }
+
+    /// Writes `text` on the first line and returns the window position of
+    /// the middle of the cell at `column`.
+    fn write_first_line(
+        terminal: &Entity<Terminal>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) -> impl Fn(f32) -> GpuiPoint<Pixels> + use<> {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(text.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let bounds = terminal.read_with(cx, |terminal, _| terminal.last_content.terminal_bounds);
+        move |column| {
+            bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * 0.5)
+        }
+    }
+
+    fn drag(from: GpuiPoint<Pixels>, to: GpuiPoint<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    fn click(position: GpuiPoint<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn selection_action_button_receives_the_selection(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
+
+        drag(cell(0.1), cell(4.9), &mut cx);
+        // The button sits one cell after the selection's last cell.
+        click(cell(6.3), &mut cx);
+
+        let actions = actions.borrow();
+        assert_eq!(actions.len(), 1, "the button should run the action once");
+        let (range, text) = &actions[0];
+        assert_eq!(text, "hello");
+        assert_eq!(range.start(), Point::new(0, 0));
+        assert_eq!(range.end(), Point::new(0, 4));
+        assert_eq!(
+            terminal.read_with(&cx, |terminal, _| terminal
+                .last_content
+                .selection_text
+                .clone()),
+            Some("hello".into()),
+            "clicking the button should keep the selection",
+        );
+    }
+
+    #[gpui::test]
+    async fn selection_action_button_is_hidden_without_a_selection(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
+
+        click(cell(6.3), &mut cx);
+        assert!(actions.borrow().is_empty());
+
+        drag(cell(0.1), cell(4.9), &mut cx);
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.clear_selection_action(cx)
+        });
+        click(cell(6.3), &mut cx);
+        assert!(
+            actions.borrow().is_empty(),
+            "a cleared action should hide the button",
         );
     }
 

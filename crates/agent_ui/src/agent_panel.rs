@@ -14,7 +14,8 @@ use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_comments::{
-    AgentCommentStore, AgentCommentStoreEvent, ClearPendingComments, InsertPendingComments,
+    AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, ClearPendingComments,
+    CommentPopover, InsertPendingComments, TerminalComment,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -79,8 +80,8 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, KeyContext,
+    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
 use language::LanguageRegistry;
@@ -90,9 +91,9 @@ use project::{Project, ProjectPath, Worktree};
 use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::Event as TerminalEvent;
 #[cfg(any(test, feature = "test-support"))]
 use terminal::terminal_settings::TerminalSettings;
+use terminal::{Content as TerminalContent, Event as TerminalEvent};
 use terminal_view::TerminalView;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
@@ -751,6 +752,82 @@ fn format_selection_for_terminal(
     }
 }
 
+/// Rows are counted from the start of the scrollback, so a row keeps its
+/// number as output scrolls it up.
+fn scrollback_row(content: &TerminalContent, line: i32) -> i64 {
+    content.total_lines as i64 - content.screen_lines as i64 + i64::from(line)
+}
+
+/// The text on screen without whitespace, with the grid line of each byte.
+/// Whitespace and line breaks are left out because a resize changes them:
+/// lines rewrap and TUIs redraw with other padding.
+struct ScreenText {
+    text: String,
+    byte_lines: Vec<i32>,
+}
+
+impl ScreenText {
+    fn new(content: &TerminalContent) -> Self {
+        let mut text = String::new();
+        let mut byte_lines = Vec::new();
+        for cell in &content.cells {
+            let character = cell.character();
+            if !character.is_whitespace() {
+                text.push(character);
+                byte_lines.extend(std::iter::repeat_n(cell.point.line, character.len_utf8()));
+            }
+        }
+        Self { text, byte_lines }
+    }
+
+    /// The grid lines that show a terminal comment's text, closest to where
+    /// it was made.
+    fn comment_lines(
+        &self,
+        comment: &TerminalComment,
+        content: &TerminalContent,
+    ) -> Option<std::ops::RangeInclusive<i32>> {
+        let anchor = comment
+            .quoted_text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if anchor.is_empty() {
+            return None;
+        }
+        self.text
+            .match_indices(&anchor)
+            .filter_map(|(start, matched)| {
+                let first_line = *self.byte_lines.get(start)?;
+                let last_line = *self.byte_lines.get(start + matched.len() - 1)?;
+                Some(first_line..=last_line)
+            })
+            .min_by_key(|lines| (scrollback_row(content, *lines.start()) - comment.first_row).abs())
+    }
+}
+
+fn terminal_comment_markers(
+    store: &Entity<AgentCommentStore>,
+    terminal_entity_id: EntityId,
+    content: &TerminalContent,
+    cx: &App,
+) -> Vec<(std::ops::RangeInclusive<i32>, Hsla)> {
+    let mut comments = store
+        .read(cx)
+        .terminal_comments(terminal_entity_id)
+        .peekable();
+    // Runs on every paint, so skip building the screen text when there's
+    // nothing to find.
+    if comments.peek().is_none() {
+        return Vec::new();
+    }
+    let color = cx.theme().status().info;
+    let screen_text = ScreenText::new(content);
+    comments
+        .filter_map(|comment| Some((screen_text.comment_lines(comment, content)?, color)))
+        .collect()
+}
+
 /// Path for a terminal mention: relative to the terminal cwd if possible, else absolute.
 fn mention_path_for_terminal(
     project: &Entity<Project>,
@@ -1143,6 +1220,9 @@ pub struct AgentPanel {
     _settings_subscription: Subscription,
     agent_comment_store: Entity<AgentCommentStore>,
     _agent_comment_store_subscription: Subscription,
+    /// The comment input opened from the visible terminal thread.
+    terminal_comment: Option<CommentPopover>,
+    _agent_comment_stores_subscription: Subscription,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
 
@@ -1452,7 +1532,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1470,6 +1550,12 @@ impl AgentPanel {
             &agent_comment_store,
             |_, _, _: &AgentCommentStoreEvent, cx| cx.notify(),
         );
+        // Also notifies when comments are turned on or off.
+        let agent_comment_stores = AgentCommentStores::global(cx);
+        let _agent_comment_stores_subscription =
+            cx.observe_in(&agent_comment_stores, window, |this, _, window, cx| {
+                this.refresh_terminal_comments(window, cx)
+            });
 
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
@@ -1578,6 +1664,8 @@ impl AgentPanel {
             _settings_subscription,
             agent_comment_store,
             _agent_comment_store_subscription,
+            terminal_comment: None,
+            _agent_comment_stores_subscription,
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
@@ -2272,6 +2360,8 @@ impl AgentPanel {
             },
         );
 
+        self.register_terminal_comment_hooks(terminal_id, &terminal_view, cx);
+
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
@@ -2360,9 +2450,13 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
-        if self.terminals.remove(&terminal_id).is_none() {
+        let Some(terminal) = self.terminals.remove(&terminal_id) else {
             return;
-        }
+        };
+        let terminal_entity_id = terminal.view.read(cx).terminal().entity_id();
+        self.agent_comment_store.update(cx, |store, cx| {
+            store.remove_terminal_comments(terminal_entity_id, cx)
+        });
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
@@ -4371,6 +4465,8 @@ impl AgentPanel {
     }
 
     fn refresh_base_view_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A terminal comment input belongs to the session that was visible.
+        self.terminal_comment = None;
         self._base_view_observation = match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
                 self._thread_view_subscription =
@@ -4433,6 +4529,18 @@ impl AgentPanel {
             BaseView::Uninitialized => false,
         };
         session_visible.then(|| self.agent_comment_store.clone())
+    }
+
+    /// The terminal whose comments apply to the visible thread. Terminal
+    /// comments quote text that only that terminal shows, so other threads
+    /// leave them out, while buffer comments apply to every thread.
+    fn visible_comment_terminal(&self, cx: &App) -> Option<EntityId> {
+        match self.visible_surface() {
+            VisibleSurface::Terminal(terminal_view) => {
+                Some(terminal_view.read(cx).terminal().entity_id())
+            }
+            VisibleSurface::Uninitialized | VisibleSurface::AgentThread(_) => None,
+        }
     }
 
     fn visible_surface(&self) -> VisibleSurface<'_> {
@@ -6293,7 +6401,9 @@ impl AgentPanel {
 
     fn render_agent_comments_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.visible_comment_store(cx)?;
-        let count = store.read(cx).len();
+        let count = store
+            .read(cx)
+            .visible_len(self.visible_comment_terminal(cx));
         if count == 0 {
             return None;
         }
@@ -6334,11 +6444,154 @@ impl AgentPanel {
         )
     }
 
+    /// Turns terminal comments on or off for every terminal thread, and
+    /// closes the comment input once its comment is gone.
+    fn refresh_terminal_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .terminal_comment
+            .as_ref()
+            .is_some_and(|popover| popover.is_stale(self.workspace.upgrade().as_ref(), cx))
+        {
+            self.close_terminal_comment(window, cx);
+        }
+        let terminal_views = self
+            .terminals
+            .iter()
+            .map(|(terminal_id, terminal)| (*terminal_id, terminal.view.clone()))
+            .collect::<Vec<_>>();
+        for (terminal_id, terminal_view) in terminal_views {
+            self.register_terminal_comment_hooks(terminal_id, &terminal_view, cx);
+        }
+    }
+
+    fn register_terminal_comment_hooks(
+        &self,
+        terminal_id: TerminalId,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let enabled = agent_comments::comments_enabled(cx);
+        let panel = cx.entity().downgrade();
+        let store = self.agent_comment_store.downgrade();
+        terminal_view.update(cx, |terminal_view, cx| {
+            if !enabled {
+                terminal_view.clear_selection_action(cx);
+                terminal_view.clear_gutter_markers(cx);
+                return;
+            }
+            let terminal_entity_id = terminal_view.terminal().entity_id();
+            terminal_view.set_gutter_markers(
+                move |content, cx| match store.upgrade() {
+                    Some(store) => {
+                        terminal_comment_markers(&store, terminal_entity_id, content, cx)
+                    }
+                    None => Vec::new(),
+                },
+                cx,
+            );
+            terminal_view.on_selection_action(
+                "Comment for Agent",
+                move |range, text, position, window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.open_terminal_comment(
+                                terminal_id,
+                                range,
+                                text,
+                                position,
+                                window,
+                                cx,
+                            )
+                        })
+                        .log_err();
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Comments on text selected in a terminal thread, or edits the comment
+    /// on a selected row, since comments don't overlap.
+    fn open_terminal_comment(
+        &mut self,
+        terminal_id: TerminalId,
+        range: terminal::Range,
+        text: String,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(store) = agent_comments::comment_store(Some(&workspace), cx) else {
+            return;
+        };
+        let Some(terminal) = self
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.view.read(cx).terminal().clone())
+        else {
+            return;
+        };
+        let terminal_entity_id = terminal.entity_id();
+        let content = terminal.read(cx).last_content();
+        let screen_text = ScreenText::new(content);
+        let selected_lines = range.start().line..=range.end().line;
+        let existing = store
+            .read(cx)
+            .terminal_comments(terminal_entity_id)
+            .filter_map(|comment| {
+                let lines = screen_text.comment_lines(comment, content)?;
+                (lines.start() <= selected_lines.end() && selected_lines.start() <= lines.end())
+                    .then(|| (*lines.start(), comment))
+            })
+            .min_by_key(|(first_line, _)| *first_line)
+            .map(|(_, comment)| comment.clone());
+        let first_row = scrollback_row(content, range.start().line);
+
+        let on_close = |panel: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            panel.close_terminal_comment(window, cx)
+        };
+        self.terminal_comment = match existing {
+            Some(comment) => CommentPopover::edit_terminal(
+                &comment,
+                position,
+                Some(&workspace),
+                window,
+                cx,
+                on_close,
+            ),
+            None => Some(CommentPopover::new_terminal(
+                terminal_entity_id,
+                first_row,
+                text,
+                position,
+                workspace.downgrade(),
+                window,
+                cx,
+                on_close,
+            )),
+        };
+        cx.notify();
+    }
+
+    fn close_terminal_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_comment.take().is_none() {
+            return;
+        }
+        if let VisibleSurface::Terminal(terminal_view) = self.visible_surface() {
+            window.focus(&terminal_view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
     fn clear_visible_agent_comments(&mut self, cx: &mut Context<Self>) {
         let Some(store) = self.visible_comment_store(cx) else {
             return;
         };
-        store.update(cx, |store, cx| store.clear(cx));
+        let visible_terminal = self.visible_comment_terminal(cx);
+        store.update(cx, |store, cx| store.clear_visible(visible_terminal, cx));
     }
 
     fn comments_prompt_text(comments: &[agent_comments::CommentPayload], cx: &App) -> String {
@@ -6357,6 +6610,7 @@ impl AgentPanel {
         let Some(store) = self.visible_comment_store(cx) else {
             return;
         };
+        let visible_terminal = self.visible_comment_terminal(cx);
         match self.visible_surface() {
             VisibleSurface::Uninitialized => {}
             VisibleSurface::AgentThread(conversation_view) => {
@@ -6370,6 +6624,7 @@ impl AgentPanel {
                 };
                 let comments = store.update(cx, |store, cx| {
                     store.take_pending_comments(
+                        visible_terminal,
                         |buffer, cx| {
                             let file = buffer.file()?;
                             Some(file.path().display(file.path_style(cx)).into_owned().into())
@@ -6401,6 +6656,7 @@ impl AgentPanel {
                 let path_style = project.read(cx).path_style(cx);
                 let comments = store.update(cx, |store, cx| {
                     store.take_pending_comments(
+                        visible_terminal,
                         |buffer, cx| {
                             let project_path = buffer.project_path(cx)?;
                             Some(
@@ -6810,7 +7066,12 @@ impl Render for AgentPanel {
                         .child(self.render_drag_target(cx))
                 }
             })
-            .children(self.render_trial_end_upsell(window, cx));
+            .children(self.render_trial_end_upsell(window, cx))
+            .children(
+                self.terminal_comment
+                    .as_ref()
+                    .map(|popover| popover.render()),
+            );
 
         match self.visible_font_size() {
             WhichFontSize::AgentFont => {
@@ -9990,6 +10251,519 @@ mod tests {
             panel.render_agent_comments_button(cx).is_some()
         });
         assert!(!button_shown, "the count returns to 0");
+    }
+
+    /// Opens a terminal thread showing `output` and returns its id and terminal.
+    fn open_terminal_with_output(
+        panel: &Entity<AgentPanel>,
+        output: &str,
+        cx: &mut VisualTestContext,
+    ) -> (TerminalId, Entity<terminal::Terminal>) {
+        let terminal_id = TerminalId::new();
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    Some(PathBuf::from("/project")),
+                    Some("Terminal".into()),
+                    None,
+                    None,
+                    true,
+                    true,
+                    None,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+            .expect("display-only terminal should be inserted");
+        // The comment input only takes focus once the panel renders it.
+        let workspace = panel.read_with(cx, |panel, _| {
+            panel.workspace.upgrade().expect("workspace should exist")
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<AgentPanel>(window, cx)
+        });
+        let terminal = panel.read_with(cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        write_terminal_output(&terminal, output, cx);
+        (terminal_id, terminal)
+    }
+
+    fn write_terminal_output(
+        terminal: &Entity<terminal::Terminal>,
+        output: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(output.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    /// Comments on the text between two terminal points, as the selection
+    /// action would.
+    fn comment_in_terminal(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        range: (terminal::Point, terminal::Point),
+        text: &str,
+        body: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_terminal_comment(
+                terminal_id,
+                terminal::Range::new(range.0, range.1),
+                text.to_string(),
+                gpui::point(px(0.), px(0.)),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.simulate_input(body);
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+    }
+
+    fn terminal_marker_lines(
+        panel: &Entity<AgentPanel>,
+        terminal: &Entity<terminal::Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<std::ops::RangeInclusive<i32>> {
+        panel.read_with(cx, |panel, cx| {
+            terminal_comment_markers(
+                &panel.agent_comment_store,
+                terminal.entity_id(),
+                terminal.read(cx).last_content(),
+                cx,
+            )
+            .into_iter()
+            .map(|(lines, _)| lines)
+            .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_comment_on_agent_terminal_text(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\ngamma\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        assert!(comments_button_shown(&panel, &mut cx));
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=1]);
+
+        terminal.update(&mut cx, |terminal, _| {
+            terminal.take_input_log();
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_agent_comments(window, cx)
+        });
+        cx.run_until_parked();
+        let pasted: String = terminal
+            .update(&mut cx, |terminal, _| terminal.take_input_log())
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
+            .collect();
+        assert!(
+            pasted.ends_with("\r\r> beta\rFix beta."),
+            "the quote has no label line: {pasted:?}"
+        );
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
+        assert!(terminal_marker_lines(&panel, &terminal, &mut cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_follows_its_row(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\ngamma\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+
+        let output = (0..200)
+            .map(|line| format!("line {line}\r\n"))
+            .collect::<String>();
+        write_terminal_output(&terminal, &output, &mut cx);
+        assert!(
+            terminal_marker_lines(&panel, &terminal, &mut cx).is_empty(),
+            "the commented row scrolled out of view"
+        );
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.scroll_to_top();
+                terminal.sync(window, cx);
+            });
+        });
+        let history_size = terminal.read_with(&cx, |terminal, _| {
+            let content = terminal.last_content();
+            (content.total_lines - content.screen_lines) as i32
+        });
+        assert!(history_size > 0, "the output should scroll");
+        assert_eq!(
+            terminal_marker_lines(&panel, &terminal, &mut cx),
+            [1 - history_size..=1 - history_size],
+            "the marker follows the commented row into the scrollback"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_follows_its_text_when_redrawn(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\ngamma\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(0, 2), terminal::Point::new(1, 3)),
+            "pha\nbeta",
+            "Fix these.",
+            &mut cx,
+        );
+
+        // Clears the screen and redraws it scrolled by a row, as TUIs do when
+        // they scroll their own view or redraw after a resize.
+        write_terminal_output(
+            &terminal,
+            "\x1b[H\x1b[2Jzero\r\nalpha\r\nbeta\r\ngamma\r\n",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=2]);
+
+        write_terminal_output(
+            &terminal,
+            "\x1b[H\x1b[2Jalpha\r\nbeta\r\ngamma\r\n",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [0..=1]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_follows_its_text_through_a_resize(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta gamma delta\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 5), terminal::Point::new(1, 15)),
+            "gamma delta",
+            "Fix these.",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=1]);
+
+        // Narrows the terminal to 8 columns, so the commented text wraps onto
+        // the next row in the middle of a word.
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                let bounds = terminal.last_content().terminal_bounds;
+                let mut narrow_bounds = bounds.bounds;
+                narrow_bounds.size.width = bounds.cell_width * 8.;
+                terminal.set_size(terminal::TerminalBounds::new(
+                    bounds.line_height,
+                    bounds.cell_width,
+                    narrow_bounds,
+                ));
+                terminal.sync(window, cx);
+            });
+        });
+        let marked_rows = terminal_marker_lines(&panel, &terminal, &mut cx)
+            .into_iter()
+            .flatten()
+            .map(|line| {
+                terminal.read_with(&cx, |terminal, _| {
+                    terminal
+                        .last_content()
+                        .cells
+                        .iter()
+                        .filter(|cell| cell.point.line == line)
+                        .map(|cell| cell.character())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(marked_rows, ["beta gam", "ma delta"]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_ignores_redrawn_padding(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "| alpha    |\r\n| beta     |\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(0, 2), terminal::Point::new(1, 5)),
+            "alpha    |\n| beta",
+            "Fix these.",
+            &mut cx,
+        );
+
+        // A TUI redraws its box narrower and a row lower after a resize.
+        write_terminal_output(
+            &terminal,
+            "\x1b[H\x1b[2Jtitle\r\n| alpha |\r\n| beta  |\r\n",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=2]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_prefers_the_commented_row(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "same\r\nother\r\nsame\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(2, 0), terminal::Point::new(2, 3)),
+            "same",
+            "Fix the second.",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [2..=2]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_hides_when_its_row_changes(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\ngamma\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+
+        // Moves to the second row, clears it and writes over it, as TUIs do.
+        write_terminal_output(&terminal, "\x1b[2;1H\x1b[2Kdelta", &mut cx);
+        assert!(terminal_marker_lines(&panel, &terminal, &mut cx).is_empty());
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.len(), 1, "the comment is kept")
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_on_commented_terminal_row_edits_the_comment(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\ngamma\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(0, 2), terminal::Point::new(1, 1)),
+            "pha\nbe",
+            "",
+            &mut cx,
+        );
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, cx| {
+            assert_eq!(store.len(), 1, "the selection opened the existing comment");
+            let terminal_entity_id = terminal.entity_id();
+            let comments = store.pending_comments(Some(terminal_entity_id), |_, _| None, cx);
+            assert_eq!(comments[0].body, "Fix beta.");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comments_only_apply_to_their_terminal_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (commented_terminal_id, _commented_terminal) =
+            open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            commented_terminal_id,
+            (terminal::Point::new(0, 0), terminal::Point::new(0, 4)),
+            "alpha",
+            "Fix alpha.",
+            &mut cx,
+        );
+        assert!(comments_button_shown(&panel, &mut cx));
+
+        let (_other_terminal_id, other_terminal) =
+            open_terminal_with_output(&panel, "beta\r\n", &mut cx);
+        assert!(
+            !comments_button_shown(&panel, &mut cx),
+            "another terminal thread doesn't count the comment"
+        );
+        other_terminal.update(&mut cx, |terminal, _| {
+            terminal.take_input_log();
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_agent_comments(window, cx);
+            panel.clear_visible_agent_comments(cx);
+        });
+        cx.run_until_parked();
+        let pasted = other_terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert!(pasted.is_empty(), "nothing is pasted: {pasted:?}");
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.len(), 1, "the comment is kept for its terminal")
+        });
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        assert!(
+            !comments_button_shown(&panel, &mut cx),
+            "an agent thread doesn't count the comment"
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(commented_terminal_id, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(comments_button_shown(&panel, &mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_file_comments_apply_to_every_thread(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 0)..language::Point::new(0, 3),
+            "One.",
+            &mut cx,
+        )
+        .await;
+        open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        assert!(comments_button_shown(&panel, &mut cx));
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        assert!(comments_button_shown(&panel, &mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_closing_terminal_thread_drops_its_comments(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, _terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(0, 0), terminal::Point::new(0, 4)),
+            "alpha",
+            "Fix alpha.",
+            &mut cx,
+        );
+        comment_in_editor(
+            &workspace,
+            language::Point::new(0, 0)..language::Point::new(0, 3),
+            "Kept.",
+            &mut cx,
+        )
+        .await;
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 2));
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(terminal_id, window, cx)
+        });
+        cx.run_until_parked();
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.len(), 1, "only the terminal's comments are dropped")
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_selection_button_opens_a_comment(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (_terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content().terminal_bounds);
+        let cell = |column: f32| {
+            bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * 0.5)
+        };
+        let no_modifiers = gpui::Modifiers::default();
+        cx.simulate_mouse_move(cell(0.1), None, no_modifiers);
+        cx.simulate_mouse_down(cell(0.1), gpui::MouseButton::Left, no_modifiers);
+        cx.simulate_mouse_move(cell(4.9), Some(gpui::MouseButton::Left), no_modifiers);
+        cx.simulate_mouse_up(cell(4.9), gpui::MouseButton::Left, no_modifiers);
+        cx.run_until_parked();
+        cx.simulate_click(cell(6.3), no_modifiers);
+        cx.run_until_parked();
+        cx.simulate_input("Fix alpha.");
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        let text = store.read_with(&cx, |store, cx| {
+            agent_comments::format_comments(&store.pending_comments(
+                Some(terminal.entity_id()),
+                |_, _| None,
+                cx,
+            ))
+        });
+        assert_eq!(text, "> alpha\nFix alpha.");
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [0..=0]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comments_are_off_with_the_setting(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, _terminal) = open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(0, 0), terminal::Point::new(0, 4)),
+            "alpha",
+            "Ignored.",
+            &mut cx,
+        );
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
     }
 
     #[gpui::test]

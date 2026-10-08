@@ -63,6 +63,10 @@ pub enum CommentSource {
         label: SharedString,
         text: String,
     },
+    /// Text selected in a terminal, quoted without a label.
+    Terminal {
+        text: String,
+    },
 }
 
 impl CommentSource {
@@ -70,6 +74,7 @@ impl CommentSource {
         match self {
             Self::Code { path, rows } => format!("Comment on {}", code_location(path, rows)).into(),
             Self::Quote { label, .. } => format!("Comment on selection from {label}").into(),
+            Self::Terminal { .. } => "Comment on terminal selection".into(),
         }
     }
 }
@@ -108,6 +113,34 @@ impl AgentComment {
     }
 }
 
+/// A comment on text in a terminal. Terminal text has no buffer to anchor
+/// to, and a resize moves it to other rows: lines rewrap, and TUIs redraw
+/// with other padding. So the comment is found again by its text, ignoring
+/// whitespace and line breaks.
+#[derive(Clone, Debug)]
+pub struct TerminalComment {
+    pub id: AgentCommentId,
+    pub terminal_id: EntityId,
+    /// The first commented row, counted from the start of the scrollback.
+    /// When the text shows in more than one place, the place closest to this
+    /// row is taken.
+    pub first_row: i64,
+    /// The commented text, kept as it was when the comment was made.
+    pub quoted_text: String,
+    pub body: String,
+}
+
+impl TerminalComment {
+    fn payload(&self) -> CommentPayload {
+        CommentPayload {
+            source: CommentSource::Terminal {
+                text: self.quoted_text.clone(),
+            },
+            body: self.body.clone(),
+        }
+    }
+}
+
 pub enum AgentCommentStoreEvent {
     Changed,
 }
@@ -117,6 +150,7 @@ pub enum AgentCommentStoreEvent {
 #[derive(Default)]
 pub struct AgentCommentStore {
     comments: Vec<AgentComment>,
+    terminal_comments: Vec<TerminalComment>,
     buffer_subscriptions: HashMap<BufferId, Subscription>,
 }
 
@@ -151,18 +185,56 @@ impl AgentCommentStore {
         id
     }
 
+    pub fn add_terminal(
+        &mut self,
+        terminal_id: EntityId,
+        first_row: i64,
+        quoted_text: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) -> AgentCommentId {
+        let id = AgentCommentId::next();
+        self.terminal_comments.push(TerminalComment {
+            id,
+            terminal_id,
+            first_row,
+            quoted_text,
+            body,
+        });
+        cx.emit(AgentCommentStoreEvent::Changed);
+        id
+    }
+
     pub fn update(&mut self, id: AgentCommentId, body: String, cx: &mut Context<Self>) {
         if let Some(comment) = self.comments.iter_mut().find(|comment| comment.id == id) {
+            comment.body = body;
+            cx.emit(AgentCommentStoreEvent::Changed);
+        } else if let Some(comment) = self
+            .terminal_comments
+            .iter_mut()
+            .find(|comment| comment.id == id)
+        {
             comment.body = body;
             cx.emit(AgentCommentStoreEvent::Changed);
         }
     }
 
     pub fn remove(&mut self, id: AgentCommentId, cx: &mut Context<Self>) {
-        let len = self.comments.len();
+        let len = self.len();
         self.comments.retain(|comment| comment.id != id);
-        if self.comments.len() != len {
+        self.terminal_comments.retain(|comment| comment.id != id);
+        if self.len() != len {
             self.drop_unused_subscriptions(cx);
+            cx.emit(AgentCommentStoreEvent::Changed);
+        }
+    }
+
+    /// Removes the comments made in a terminal, when it closes.
+    pub fn remove_terminal_comments(&mut self, terminal_id: EntityId, cx: &mut Context<Self>) {
+        let len = self.terminal_comments.len();
+        self.terminal_comments
+            .retain(|comment| comment.terminal_id != terminal_id);
+        if self.terminal_comments.len() != len {
             cx.emit(AgentCommentStoreEvent::Changed);
         }
     }
@@ -171,25 +243,41 @@ impl AgentCommentStore {
         self.drain(cx);
     }
 
+    /// Removes every comment and returns the buffer comments. Terminal
+    /// comments are dropped, not returned.
     pub fn drain(&mut self, cx: &mut Context<Self>) -> Vec<AgentComment> {
         let comments = std::mem::take(&mut self.comments);
+        let terminal_comments = std::mem::take(&mut self.terminal_comments);
         self.buffer_subscriptions.clear();
-        if !comments.is_empty() {
+        if !comments.is_empty() || !terminal_comments.is_empty() {
             cx.emit(AgentCommentStoreEvent::Changed);
         }
         comments
     }
 
     pub fn len(&self) -> usize {
-        self.comments.len()
+        self.comments.len() + self.terminal_comments.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.comments.is_empty()
+        self.comments.is_empty() && self.terminal_comments.is_empty()
     }
 
     pub fn contains(&self, id: AgentCommentId) -> bool {
         self.comments.iter().any(|comment| comment.id == id)
+            || self
+                .terminal_comments
+                .iter()
+                .any(|comment| comment.id == id)
+    }
+
+    pub fn terminal_comments(
+        &self,
+        terminal_id: EntityId,
+    ) -> impl Iterator<Item = &TerminalComment> {
+        self.terminal_comments
+            .iter()
+            .filter(move |comment| comment.terminal_id == terminal_id)
     }
 
     pub fn comments(&self) -> &[AgentComment] {
@@ -242,24 +330,63 @@ impl AgentCommentStore {
         ranges
     }
 
-    /// All comments in the order they were added, with their locations read
-    /// from the buffers now. `path_for` names each comment's file; comments it
-    /// returns `None` for are skipped.
+    /// The number of comments that apply to the visible thread: every buffer
+    /// comment, and the terminal comments of `visible_terminal`, since their
+    /// quoted text is only in that terminal.
+    pub fn visible_len(&self, visible_terminal: Option<EntityId>) -> usize {
+        self.comments.len()
+            + self
+                .terminal_comments
+                .iter()
+                .filter(|comment| Some(comment.terminal_id) == visible_terminal)
+                .count()
+    }
+
+    /// Removes the comments that apply to the visible thread, as counted by
+    /// [`Self::visible_len`].
+    pub fn clear_visible(&mut self, visible_terminal: Option<EntityId>, cx: &mut Context<Self>) {
+        let len = self.len();
+        self.comments.clear();
+        self.buffer_subscriptions.clear();
+        self.terminal_comments
+            .retain(|comment| Some(comment.terminal_id) != visible_terminal);
+        if self.len() != len {
+            cx.emit(AgentCommentStoreEvent::Changed);
+        }
+    }
+
+    /// The comments that apply to the visible thread, as counted by
+    /// [`Self::visible_len`], in the order they were added, with their
+    /// locations read from the buffers now. `path_for` names each comment's
+    /// file; comments it returns `None` for are skipped.
     pub fn pending_comments(
         &self,
+        visible_terminal: Option<EntityId>,
         path_for: impl Fn(&Buffer, &App) -> Option<SharedString>,
         cx: &App,
     ) -> Vec<CommentPayload> {
-        self.comments
+        let mut payloads = self
+            .comments
             .iter()
-            .filter_map(|comment| comment_payload(comment, &path_for, cx))
-            .collect()
+            .filter_map(|comment| Some((comment.id, comment_payload(comment, &path_for, cx)?)))
+            .chain(
+                self.terminal_comments
+                    .iter()
+                    .filter(|comment| Some(comment.terminal_id) == visible_terminal)
+                    .map(|comment| (comment.id, comment.payload())),
+            )
+            .collect::<Vec<_>>();
+        // Ids increase as comments are added.
+        payloads.sort_by_key(|(id, _)| *id);
+        payloads.into_iter().map(|(_, payload)| payload).collect()
     }
 
-    /// Removes and returns the comments `path_for` can name. The others are
-    /// kept, so nothing the user wrote is lost.
+    /// Removes and returns the comments that apply to the visible thread and
+    /// that `path_for` can name. The others are kept, so nothing the user
+    /// wrote is lost.
     pub fn take_pending_comments(
         &mut self,
+        visible_terminal: Option<EntityId>,
         path_for: impl Fn(&Buffer, &App) -> Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Vec<CommentPayload> {
@@ -267,16 +394,26 @@ impl AgentCommentStore {
         let mut taken = HashSet::default();
         for comment in &self.comments {
             if let Some(payload) = comment_payload(comment, &path_for, cx) {
-                payloads.push(payload);
+                payloads.push((comment.id, payload));
                 taken.insert(comment.id);
             }
         }
-        if !taken.is_empty() {
+        for comment in &self.terminal_comments {
+            if Some(comment.terminal_id) == visible_terminal {
+                payloads.push((comment.id, comment.payload()));
+                taken.insert(comment.id);
+            }
+        }
+        if !payloads.is_empty() {
             self.comments.retain(|comment| !taken.contains(&comment.id));
+            self.terminal_comments
+                .retain(|comment| !taken.contains(&comment.id));
             self.drop_unused_subscriptions(cx);
             cx.emit(AgentCommentStoreEvent::Changed);
         }
-        payloads
+        // Ids increase as comments are added.
+        payloads.sort_by_key(|(id, _)| *id);
+        payloads.into_iter().map(|(_, payload)| payload).collect()
     }
 
     /// Drops comments whose text was deleted.
@@ -464,17 +601,22 @@ pub fn format_comment(comment: &CommentPayload) -> String {
         }
         CommentSource::Quote { label, text } => {
             output.push_str(&format!("From {label}:\n"));
-            for line in trimmed_lines(text) {
-                if line.is_empty() {
-                    output.push_str(">\n");
-                } else {
-                    output.push_str(&format!("> {line}\n"));
-                }
-            }
+            push_quote(&mut output, text);
         }
+        CommentSource::Terminal { text } => push_quote(&mut output, text),
     }
     output.push_str(comment.body.trim());
     output
+}
+
+fn push_quote(output: &mut String, text: &str) {
+    for line in trimmed_lines(text) {
+        if line.is_empty() {
+            output.push_str(">\n");
+        } else {
+            output.push_str(&format!("> {line}\n"));
+        }
+    }
 }
 
 pub fn format_comments(comments: &[CommentPayload]) -> String {
@@ -502,6 +644,10 @@ fn add_comment(
         return;
     };
     store.update(cx, |store, cx| store.add(buffer, range, body, cx));
+    show_comment_added_toast(&workspace, cx);
+}
+
+fn show_comment_added_toast(workspace: &Entity<Workspace>, cx: &mut App) {
     workspace.update(cx, |workspace, cx| {
         workspace.show_toast(
             Toast::new(
@@ -1131,6 +1277,70 @@ impl CommentPopover {
         Self::with_input(input, None, position, subscription, window, cx)
     }
 
+    /// Starts a new comment on text selected in a terminal. `first_row` is
+    /// described on [`TerminalComment`].
+    pub fn new_terminal<V: 'static>(
+        terminal_id: EntityId,
+        first_row: i64,
+        quoted_text: String,
+        position: Point<Pixels>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        let source = CommentSource::Terminal {
+            text: quoted_text.clone(),
+        };
+        let input = cx.new(|cx| CommentInput::new(source.title(), window, cx));
+        let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
+            if let CommentInputEvent::Submitted(body) = event
+                && let Some(workspace) = workspace.upgrade()
+                && let Some(store) = comment_store(Some(&workspace), cx)
+            {
+                store.update(cx, |store, cx| {
+                    store.add_terminal(
+                        terminal_id,
+                        first_row,
+                        quoted_text.clone(),
+                        body.clone(),
+                        cx,
+                    )
+                });
+                show_comment_added_toast(&workspace, cx);
+            }
+            on_close(view, window, cx);
+        });
+        Self::with_input(input, None, position, subscription, window, cx)
+    }
+
+    /// Opens a terminal comment for editing.
+    pub fn edit_terminal<V: 'static>(
+        comment: &TerminalComment,
+        position: Point<Pixels>,
+        workspace: Option<&Entity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    ) -> Option<Self> {
+        let store = comment_store(workspace, cx)?.downgrade();
+        let comment_id = comment.id;
+        let title = comment.payload().source.title();
+        let input = cx.new(|cx| CommentInput::editing(title, &comment.body, window, cx));
+        let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
+            apply_edit_event(event, &store, comment_id, cx);
+            on_close(view, window, cx);
+        });
+        Some(Self::with_input(
+            input,
+            Some(comment_id),
+            position,
+            subscription,
+            window,
+            cx,
+        ))
+    }
+
     /// Opens the first comment, in document order, overlapping `range` in
     /// `buffer` for editing, if there is one.
     pub fn edit_existing<V: 'static>(
@@ -1174,7 +1384,9 @@ impl CommentPopover {
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
-        input.update(cx, |input, cx| input.set_translucent_when_unfocused(true, cx));
+        input.update(cx, |input, cx| {
+            input.set_translucent_when_unfocused(true, cx)
+        });
         // Deferred so the focus change made by the mouse down that opened
         // the popover doesn't steal focus back from the input.
         let focus_handle = input.focus_handle(cx);
@@ -1465,11 +1677,11 @@ mod tests {
         add(&store, &buffer, 0..4, "Ends at column zero.", cx);
 
         let text = cx.update(|cx| {
-            format_comments(
-                &store
-                    .read(cx)
-                    .pending_comments(|_, _| Some("src/a.rs".into()), cx),
-            )
+            format_comments(&store.read(cx).pending_comments(
+                None,
+                |_, _| Some("src/a.rs".into()),
+                cx,
+            ))
         });
         assert_eq!(
             text,
@@ -1478,11 +1690,11 @@ mod tests {
 
         buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "zero\n")], None, cx));
         let text = cx.update(|cx| {
-            format_comments(
-                &store
-                    .read(cx)
-                    .pending_comments(|_, _| Some("src/a.rs".into()), cx),
-            )
+            format_comments(&store.read(cx).pending_comments(
+                None,
+                |_, _| Some("src/a.rs".into()),
+                cx,
+            ))
         });
         assert_eq!(
             text, "`src/a.rs:3-4`\nLines two and three.\n\n`src/a.rs:2`\nEnds at column zero.",
@@ -1501,6 +1713,7 @@ mod tests {
         let named_id = named.read_with(cx, |buffer, _| buffer.remote_id());
         let payloads = store.update(cx, |store, cx| {
             store.take_pending_comments(
+                None,
                 |buffer, _| (buffer.remote_id() == named_id).then(|| "a.rs".into()),
                 cx,
             )
@@ -1511,6 +1724,181 @@ mod tests {
             assert_eq!(store.len(), 1);
             assert_eq!(store.comments()[0].body, "Kept in store.");
         });
+    }
+
+    #[test]
+    fn test_format_terminal_comment() {
+        let comment = CommentPayload {
+            source: CommentSource::Terminal {
+                text: "\n  line one  \n\n line two\n\n".to_string(),
+            },
+            body: " Fix this. ".to_string(),
+        };
+        assert_eq!(
+            format_comment(&comment),
+            ">   line one\n>\n>  line two\nFix this."
+        );
+    }
+
+    fn add_terminal(
+        store: &Entity<AgentCommentStore>,
+        terminal_id: EntityId,
+        first_row: i64,
+        body: &str,
+        cx: &mut TestAppContext,
+    ) -> AgentCommentId {
+        store.update(cx, |store, cx| {
+            store.add_terminal(
+                terminal_id,
+                first_row,
+                format!("quoted {body}"),
+                body.to_string(),
+                cx,
+            )
+        })
+    }
+
+    fn terminal_bodies(
+        store: &Entity<AgentCommentStore>,
+        terminal_id: EntityId,
+        cx: &mut TestAppContext,
+    ) -> Vec<String> {
+        store.read_with(cx, |store, _| {
+            store
+                .terminal_comments(terminal_id)
+                .map(|comment| comment.body.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn test_store_terminal_comments(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| ()).entity_id();
+        let (store, changes) = new_store(cx);
+        let id = add_terminal(&store, terminal, 3, "One.", cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.len(), 1);
+            assert!(!store.is_empty());
+            assert!(store.contains(id));
+            let comment = store
+                .terminal_comments(terminal)
+                .next()
+                .expect("the comment was added");
+            assert_eq!(comment.first_row, 3);
+            assert_eq!(comment.quoted_text, "quoted One.");
+        });
+
+        store.update(cx, |store, cx| store.update(id, "Two.".to_string(), cx));
+        assert_eq!(terminal_bodies(&store, terminal, cx), ["Two."]);
+
+        store.update(cx, |store, cx| store.remove(id, cx));
+        store.read_with(cx, |store, _| {
+            assert!(store.is_empty());
+            assert!(!store.contains(id));
+        });
+        assert_eq!(*changes.borrow(), 3);
+    }
+
+    #[gpui::test]
+    fn test_store_remove_terminal_comments(cx: &mut TestAppContext) {
+        let closed = cx.new(|_| ()).entity_id();
+        let open = cx.new(|_| ()).entity_id();
+        let buffer = cx.new(|cx| Buffer::local("text", cx));
+        let (store, changes) = new_store(cx);
+        add_terminal(&store, closed, 0, "Closed.", cx);
+        add_terminal(&store, open, 0, "Open.", cx);
+        add(&store, &buffer, 0..4, "Buffer.", cx);
+
+        store.update(cx, |store, cx| store.remove_terminal_comments(closed, cx));
+        assert!(terminal_bodies(&store, closed, cx).is_empty());
+        assert_eq!(terminal_bodies(&store, open, cx), ["Open."]);
+        store.read_with(cx, |store, _| assert_eq!(store.len(), 2));
+
+        store.update(cx, |store, cx| store.remove_terminal_comments(closed, cx));
+        assert_eq!(*changes.borrow(), 4, "removing nothing doesn't notify");
+
+        store.update(cx, |store, cx| store.clear(cx));
+        store.read_with(cx, |store, _| assert!(store.is_empty()));
+    }
+
+    #[gpui::test]
+    fn test_store_pending_comments_keep_order_across_kinds(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| ()).entity_id();
+        let buffer = cx.new(|cx| Buffer::local("one\ntwo\n", cx));
+        let (store, _) = new_store(cx);
+        add(&store, &buffer, 0..3, "First.", cx);
+        add_terminal(&store, terminal, 0, "Second.", cx);
+        add(&store, &buffer, 4..7, "Third.", cx);
+
+        let text = cx.update(|cx| {
+            format_comments(&store.read(cx).pending_comments(
+                Some(terminal),
+                |_, _| Some("a.rs".into()),
+                cx,
+            ))
+        });
+        assert_eq!(
+            text,
+            "`a.rs:1`\nFirst.\n\n> quoted Second.\nSecond.\n\n`a.rs:2`\nThird."
+        );
+
+        let payloads = store.update(cx, |store, cx| {
+            store.take_pending_comments(Some(terminal), |_, _| None, cx)
+        });
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload.body.as_str())
+                .collect::<Vec<_>>(),
+            ["Second."],
+            "terminal comments don't need a path"
+        );
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.len(), 2, "comments without a path are kept");
+            assert!(store.terminal_comments(terminal).next().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_store_scopes_terminal_comments_to_the_visible_terminal(cx: &mut TestAppContext) {
+        let visible = cx.new(|_| ()).entity_id();
+        let other = cx.new(|_| ()).entity_id();
+        let buffer = cx.new(|cx| Buffer::local("one\ntwo\n", cx));
+        let (store, _) = new_store(cx);
+        add(&store, &buffer, 0..3, "File.", cx);
+        add_terminal(&store, visible, 0, "Visible.", cx);
+        add_terminal(&store, other, 0, "Other.", cx);
+
+        let pending_bodies = |visible_terminal: Option<EntityId>, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                store
+                    .read(cx)
+                    .pending_comments(visible_terminal, |_, _| Some("a.rs".into()), cx)
+                    .into_iter()
+                    .map(|payload| payload.body)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(pending_bodies(None, cx), ["File."]);
+        assert_eq!(pending_bodies(Some(visible), cx), ["File.", "Visible."]);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.visible_len(None), 1);
+            assert_eq!(store.visible_len(Some(visible)), 2);
+        });
+
+        let payloads = store.update(cx, |store, cx| {
+            store.take_pending_comments(Some(visible), |_, _| Some("a.rs".into()), cx)
+        });
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(terminal_bodies(&store, other, cx), ["Other."]);
+
+        add(&store, &buffer, 4..7, "File again.", cx);
+        add_terminal(&store, visible, 0, "Visible again.", cx);
+        store.update(cx, |store, cx| store.clear_visible(Some(visible), cx));
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.len(), 1, "other terminals keep their comments");
+        });
+        assert_eq!(terminal_bodies(&store, other, cx), ["Other."]);
     }
 
     mod editor_tests {

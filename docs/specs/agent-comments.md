@@ -5,11 +5,12 @@ Branch: `agent-comments`
 
 ## Summary
 
-Users can leave comments for the AI agent on text in two places:
+Users can leave comments for the AI agent on text in three places:
 - a **source code editor**;
-- the **markdown preview**.
+- the **markdown preview**;
+- an **agent terminal thread** (a terminal session in the agent panel).
 
-Commented text stays tinted in both places, so the user can see what they've already commented on and reopen a comment to edit or remove it. The comments collect in the workspace they were written in. A button on the agent toolbar shows how many are pending, and clicking it inserts them into the prompt as plain text.
+Commented text stays tinted in the editor and the preview, and terminal comments get a gutter marker, so the user can see what they've already commented on and reopen a comment to edit or remove it. The comments collect in the workspace they were written in. A button on the agent toolbar shows how many are pending, and clicking it inserts them into the prompt as plain text.
 
 This feature is separate from the diff review comments (`stored_review_comments`, `AddDiffReviewComment` in `crates/editor/src/git.rs`). It shares no storage, actions or UI with them.
 
@@ -18,11 +19,12 @@ This feature is separate from the diff review comments (`stored_review_comments`
 **In scope**
 - Adding, viewing, editing and removing comments in full-mode project editors.
 - The same, in the markdown preview.
+- Adding, editing and removing comments on text in agent panel terminal threads (see Agent terminal threads).
 - Collecting comments per workspace and inserting them into the visible session's prompt (Phases 2–4).
 - The `agent.enable_comments` setting, off by default.
 
 **Out of scope**
-- **Commenting from the terminal.** The proof of concept had it; production must not ship it. Remove the terminal code: `terminal_view.rs`, `terminal_element.rs`, and the `agent_comments` dependency in `terminal_view/Cargo.toml`.
+- Commenting from terminals outside the agent panel (terminal panel, center pane) and from terminals embedded in thread tool calls.
 - Changes to diff review comments.
 - Keeping comments across restarts.
 - Sending comments automatically, or opening a new thread for them.
@@ -108,7 +110,7 @@ The icon's click follows the same rules.
 - This applies to `ToggleComment`, the editor icon, and the preview icon alike. The editor icon shows for a selection that overlaps a comment, as for any selection.
 - Validated in the proof of concept, including partial overlaps.
 
-**Setting.** The feature is off unless `"agent": { "enable_comments": true }` is set (default `false`). It is also off when the agent is disabled (`agent.enabled: false` or `disable_ai`). While it is off, everything behaves as with no active agent thread: no icons, no tints, no toolbar button, and `ToggleComment` and modifier-click do nothing. Existing comments are kept and come back when it is turned on again. Changing the setting takes effect immediately.
+**Setting.** The feature is off unless `"agent": { "enable_comments": true }` is set (default `false`). It is also off when the agent is disabled (`agent.enabled: false` or `disable_ai`). While it is off, everything behaves as with no active agent thread: no icons, no tints, no terminal selection button or gutter markers, no toolbar button, and `ToggleComment` and modifier-click do nothing. Existing comments are kept and come back when it is turned on again. Changing the setting takes effect immediately.
 
 **No active agent thread.** When the agent panel has no visible thread or terminal thread:
 - the comment icon is hidden in the editor (for selections and for the cursor in a comment) and in the preview;
@@ -149,6 +151,27 @@ The icon comes back as soon as a thread becomes visible. Validated in the proof 
 - Search highlights and the selection are drawn on top of it.
 - Find keeps working alongside it.
 
+### Agent terminal threads
+
+Terminal text has no buffer, so terminal comments are kept apart from buffer comments and work differently.
+
+**Adding a comment**
+1. The user selects terminal text. In a TUI that captures the mouse, that takes shift-drag.
+2. When the selection is finished, the comment icon appears one cell after its last cell, centred on the line. Clicking it opens `CommentInput` as a floating popover at the icon, titled "Comment on terminal selection".
+3. On submit, the comment is added with the selected text, captured as it is now; it is never re-read.
+
+**Marker instead of a tint.** A thin bar in `status().info` marks the comment's rows in the terminal's left gutter. The text isn't tinted.
+
+**Anchor.** A resize changes which rows show the text: lines rewrap, and TUIs redraw with other padding and at other rows. So a comment is found by its selected text with whitespace and line breaks left out, matched against the on-screen text with the same characters left out. The marker covers the lines from the first to the last matched character. When the text shows in more than one place, the place closest to the row the comment started on (`history size + grid line`) wins. When the text isn't on screen, for example because it was cleared or scrolled away, the marker hides. The comment is kept, counts on the toolbar and is inserted with its captured text; it shows again when its text comes back.
+
+**Editing.** Selecting text on any row of a comment whose marker shows opens that comment for editing (the topmost if several), with `Remove`, `Cancel` and `Update Comment`. Overlap is judged by whole rows: the selected rows against the rows the marker covers. There is no modifier-click toggle (cmd/ctrl-click opens links in the terminal) and no keyboard binding: `ToggleComment` isn't bound in the terminal.
+
+**Scope.** A terminal comment applies only to the terminal thread it was made in, because the text it quotes is only in that terminal. File comments apply to every thread, since they name their file and location. The toolbar's count, Insert and Clear cover the file comments plus the visible terminal thread's own comments; an agent thread or another terminal thread leaves them out, and the button shows only when that count is above 0. Clear in any thread still removes every file comment.
+
+**Lifetime.** Closing or archiving the terminal thread drops its comments. Otherwise they are removed like other comments: by inserting them, by the toolbar's Clear, or by closing the workspace. A comment whose marker is hidden can't be edited or removed on its own.
+
+**Popover.** The agent panel hosts the popover. It closes when the visible session changes, when its comment is gone, when comments are turned off, and on submit or cancel; focus returns to the terminal.
+
 ### Shared behaviour across the editor and the preview
 
 - The preview shows exactly the file's buffer text, so preview source offsets equal buffer offsets.
@@ -174,6 +197,15 @@ Rules:
 - **Body:** the comment is trimmed, then placed on the line after the location.
 - **Several comments:** joined with one blank line between them.
 - **Line numbers are read when the payload is built** (Phase 4 insert), from the current anchor positions. Edits made after commenting are reflected, so they are not frozen at the time of commenting.
+- **Terminal comments** are quoted without a label, from the text captured when the comment was made, with the quote trimming rules below:
+
+```text
+> quoted terminal line
+> another line
+Comment body
+```
+
+- Terminal and code comments are inserted together, in the order they were added.
 - **Quote fallback,** only for a preview with no file behind it:
 
 ```text
@@ -307,6 +339,15 @@ The editor's button dispatches `zed_actions::agent_comments::ToggleComment`. The
 | `set_range_highlights(Vec<(Range<usize>, Hsla)>)` | Background highlights by source range. Merged in `MarkdownHighlights::highlights_for_line` before search and selection. Unlike search highlights, `reset` does not clear them. |
 | `cursor_offset() -> Option<usize>` | Read-only getter. |
 | `RenderedMarkdown.selection_action_button` | Laid out in prepaint, painted after the text. |
+
+### `terminal_view` (about 150 lines, low to medium merge risk)
+
+| Change | Notes |
+|---|---|
+| `TerminalView::on_selection_action(tooltip, Fn(Range, String, Point<Pixels>, &mut Window, &mut App))` / `clear_selection_action` | Opt-in. `TerminalElement` lays out an icon button one cell after a finished, non-empty selection, and paints it after the text. The range and text are captured in prepaint. The button uses `on_mouse_down` and `occlude`, so the click keeps the selection. |
+| `TerminalView::set_gutter_markers(Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)>)` / `clear_gutter_markers` | Opt-in. Called on every paint with the content being painted; the ranges of grid lines get a 2px bar in the existing one-cell left gutter. |
+
+`terminal` itself is unchanged: the on-screen text and its grid lines come from the public `Content`.
 
 ### `settings_content`, `agent_settings` (about 10 lines, low merge risk)
 
@@ -544,13 +585,13 @@ Otherwise it isn't rendered at all, so the toolbar layout stays the same as upst
 | Setting | `crates/settings_content/src/agent.rs`, `crates/agent_settings/src/agent_settings.rs`, `assets/settings/default.json`, fixtures in `crates/agent_ui/src/agent_ui.rs` and `crates/agent/src/tool_permissions.rs`; settings UI in `crates/settings_ui/src/page_data.rs` (production) |
 | Keymaps | `assets/keymaps/default-{macos,linux,windows}.json` |
 | Agent integration (Phases 2–4) | `crates/agent_ui/src/{conversation_view,agent_panel,message_editor}.rs`, `crates/agent_ui/Cargo.toml` |
-| To revert (out of scope) | `crates/terminal_view/src/{terminal_view,terminal_element}.rs`, `crates/terminal_view/Cargo.toml` |
+| Terminal hooks | `crates/terminal_view/src/{terminal_view,terminal_element}.rs` |
 
 ---
 
 ## Implementation notes
 
-- **Store (2026-10-05):** one `AgentCommentStore` per workspace, replacing the per-session stores and the app-wide `ActiveCommentStore` slot described in Phase 2. With one global slot, the panel that synced last owned it, so comments written in one workspace could land in another workspace's thread with no error. `AgentCommentStores` maps each workspace to its store, drops the store when the workspace is released, and notifies when any store changes or comments are turned on or off; editors and previews observe it and resolve the store from their own workspace. Comments are kept while no agent panel is open or no session is visible, and every thread and terminal thread in the workspace shows the same count. The "No active session" rules no longer apply: only the setting hides the icons and tints.
+- **Store (2026-10-05):** one `AgentCommentStore` per workspace, replacing the per-session stores and the app-wide `ActiveCommentStore` slot described in Phase 2. With one global slot, the panel that synced last owned it, so comments written in one workspace could land in another workspace's thread with no error. `AgentCommentStores` maps each workspace to its store, drops the store when the workspace is released, and notifies when any store changes or comments are turned on or off; editors and previews observe it and resolve the store from their own workspace. Comments are kept while no agent panel is open or no session is visible, and every thread and terminal thread in the workspace counts the same file comments. Terminal comments count only in their own terminal thread (2026-10-08); see Agent terminal threads. The "No active session" rules no longer apply: only the setting hides the icons and tints.
 - **Comment ids** are unique across stores, so an open input can tell that its comment is gone (text deleted, or the visible session changed) and close itself.
 - **Session end:** closing or archiving a thread or terminal thread no longer drops comments, since they belong to the workspace. Inserting or clearing them is the only way to remove them, other than deleting the commented text or closing the workspace.
 - **Input block height:** 4 lines of chrome plus the input's wrapped row count (2 to 4), resized with `resize_blocks` when that count changes. The input watches its editor, since wrapping is only known after layout.
@@ -558,4 +599,5 @@ Otherwise it isn't rendered at all, so the toolbar layout stays the same as upst
 - **Preview without a buffer:** no comment can be made (comments need a buffer). A buffer without a file uses the quote fallback.
 - **`InsertPendingComments`** (`agent_comments::InsertPendingComments`) is handled by the agent panel and shown in the button's tooltip. It has no default binding.
 - **Not covered by tests:** remote/collab buffers (gap 6); the one-input-per-view rule is structural (gap 7).
+- **Terminal comments (2026-10-08):** `TerminalComment` lives in a second list of the workspace store (`add_terminal`, `terminal_comments`, `remove_terminal_comments`); `len`, `contains`, `update`, `remove` and `clear` cover both lists. The toolbar uses `visible_len`, `clear_visible`, `pending_comments` and `take_pending_comments`, which take the visible terminal (`None` for an agent thread) and leave out other terminals' comments; payloads are ordered by `AgentCommentId`. The wiring is in `agent_panel.rs` (`register_terminal_comment_hooks`, `open_terminal_comment`, `terminal_comment_markers`, `ScreenText`, `visible_comment_terminal`). Comments were first anchored to fixed scrollback rows and then to whole-row text; both hid the marker after a resize, since lines rewrap and TUIs redraw with other padding, so a comment is now found by its selected text without whitespace.
 
