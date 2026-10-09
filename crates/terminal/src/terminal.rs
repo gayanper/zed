@@ -2106,6 +2106,10 @@ impl Terminal {
         self.set_selection(Some(Selection::simple_range(range)));
     }
 
+    pub fn clear_selection(&mut self) {
+        self.set_selection(None);
+    }
+
     fn set_selection(&mut self, selection: Option<Selection>) {
         self.events
             .push_back(InternalEvent::SetSelection(selection));
@@ -4304,6 +4308,23 @@ mod tests {
                     .any(|event| matches!(event, InternalEvent::SetSelection(Some(_)))),
                 "shift+click should extend, not re-anchor, an existing selection"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_clear_selection_queues_set_selection_none(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(cx, b"hello world\r\n");
+
+        terminal.update(cx, |terminal, _| {
+            terminal.select_all();
+            terminal.events.clear();
+
+            terminal.clear_selection();
+
+            assert!(matches!(
+                terminal.events.back(),
+                Some(InternalEvent::SetSelection(None))
+            ));
         });
     }
 

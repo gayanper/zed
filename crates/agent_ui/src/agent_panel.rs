@@ -6591,7 +6591,15 @@ impl AgentPanel {
             .map(|(_, comment)| comment.clone());
         let first_row = scrollback_row(content, range.start().line);
 
-        let on_close = |panel: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+        let on_close = move |panel: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            if let Some(terminal) = panel.terminals.get(&terminal_id) {
+                terminal
+                    .view
+                    .read(cx)
+                    .terminal()
+                    .clone()
+                    .update(cx, |terminal, _| terminal.clear_selection());
+            }
             panel.close_terminal_comment(window, cx)
         };
         self.terminal_comment = match existing {
@@ -10705,6 +10713,76 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(comments_button_shown(&panel, &mut cx));
+    }
+
+    fn select_all_in_terminal(terminal: &Entity<terminal::Terminal>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.select_all();
+                terminal.sync(window, cx);
+            });
+        });
+    }
+
+    fn terminal_has_selection(
+        terminal: &Entity<terminal::Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.sync(window, cx);
+                terminal.last_content().selection.is_some()
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_submitting_a_terminal_comment_clears_the_selection(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        select_all_in_terminal(&terminal, &mut cx);
+        assert!(terminal_has_selection(&terminal, &mut cx));
+
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        assert!(!terminal_has_selection(&terminal, &mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_a_terminal_comment_clears_the_selection(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        select_all_in_terminal(&terminal, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_terminal_comment(
+                terminal_id,
+                terminal::Range::new(terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
+                "beta".to_string(),
+                gpui::point(px(0.), px(0.)),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(editor::actions::Cancel);
+        cx.run_until_parked();
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
+        assert!(panel.read_with(&cx, |panel, _| panel.terminal_comment.is_none()));
+        assert!(!terminal_has_selection(&terminal, &mut cx));
     }
 
     fn terminal_comment_mode_button_shown(
