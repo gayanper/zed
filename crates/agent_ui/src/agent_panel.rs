@@ -821,7 +821,7 @@ fn terminal_comment_markers(
     if comments.peek().is_none() {
         return Vec::new();
     }
-    let color = cx.theme().status().info;
+    let color = agent_comments::agent_comment_color(cx.theme());
     let screen_text = ScreenText::new(content);
     comments
         .filter_map(|comment| Some((screen_text.comment_lines(comment, content)?, color)))

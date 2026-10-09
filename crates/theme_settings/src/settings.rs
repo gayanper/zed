@@ -841,6 +841,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_comment_colors_from_theme_survive_info_override() {
+        let magenta = ::theme::try_parse_color("#ff00ff").unwrap();
+        let green = ::theme::try_parse_color("#00ff0040").unwrap();
+        let blue = ::theme::try_parse_color("#0000ff").unwrap();
+        let theme_style: ::settings::ThemeStyleContent =
+            serde_json::from_value(serde_json::json!({
+                "agent_comment": "#ff00ff",
+                "agent_comment.background": "#00ff0040",
+            }))
+            .unwrap();
+        let mut test_theme = theme_with_colors(theme_style.colors);
+
+        let override_style: ::settings::ThemeStyleContent =
+            serde_json::from_value(serde_json::json!({ "info": "#0000ff" })).unwrap();
+        ThemeSettings::modify_theme(&mut test_theme, &override_style);
+
+        assert_eq!(test_theme.styles.colors.agent_comment, Some(magenta));
+        assert_eq!(
+            test_theme.styles.colors.agent_comment_background,
+            Some(green)
+        );
+        assert_eq!(test_theme.styles.status.info, blue);
+    }
+
+    #[test]
     fn code_lens_foreground_follows_effective_text_muted_without_explicit_color() {
         let green = ::theme::try_parse_color("#00ff00").unwrap();
         let mut test_theme = theme_with_colors(Default::default());

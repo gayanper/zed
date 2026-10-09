@@ -917,6 +917,18 @@ pub struct ThemeColorsContent {
     #[serde(rename = "editor.document_highlight.bracket_background")]
     pub editor_document_highlight_bracket_background: Option<ThemeColor>,
 
+    /// Color of the gutter bar marking text commented for the agent.
+    ///
+    /// Falls back to `info` when not set.
+    #[serde(rename = "agent_comment")]
+    pub agent_comment: Option<ThemeColor>,
+
+    /// Background tint behind text commented for the agent.
+    ///
+    /// Falls back to `info.background` when not set.
+    #[serde(rename = "agent_comment.background")]
+    pub agent_comment_background: Option<ThemeColor>,
+
     /// Filled background color for added diff hunk row highlights in the editor.
     #[serde(rename = "editor.diff_hunk.added.background")]
     pub editor_diff_hunk_added_background: Option<ThemeColor>,

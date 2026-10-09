@@ -391,6 +391,7 @@ dependencies = [
  "project",
  "serde_json",
  "settings",
+ "theme",
  "ui",
  "util",
  "workspace",

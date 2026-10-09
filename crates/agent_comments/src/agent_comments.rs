@@ -19,13 +19,15 @@ use editor::{
 };
 use gpui::{
     Anchor, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    Global, Pixels, Point, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
+    Global, Hsla, Pixels, Point, Subscription, Task, WeakEntity, Window, actions, anchored,
+    deferred, px,
 };
 use language::{
     Buffer, BufferEvent, BufferId, BufferSnapshot, Point as BufferPoint, ToOffset as _,
 };
 use multi_buffer::MultiBufferRow;
 use settings::{Settings as _, SettingsStore};
+use theme::Theme;
 use ui::{KeyBinding, prelude::*};
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -705,15 +707,26 @@ fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Edito
     }
     editor.highlight_gutter::<AgentCommentGutter>(
         ranges.clone(),
-        |cx| cx.theme().status().info,
+        |cx| agent_comment_color(cx.theme()),
         cx,
     );
     editor.highlight_background(
         HighlightKey::AgentComment,
         &ranges,
-        |_, theme| theme.status().info_background,
+        |_, theme| agent_comment_background(theme),
         cx,
     );
+}
+
+pub fn agent_comment_color(theme: &Theme) -> Hsla {
+    theme.colors().agent_comment.unwrap_or(theme.status().info)
+}
+
+pub fn agent_comment_background(theme: &Theme) -> Hsla {
+    theme
+        .colors()
+        .agent_comment_background
+        .unwrap_or(theme.status().info_background)
 }
 
 /// While comments are turned off, the icons are hidden.
@@ -1536,6 +1549,26 @@ mod tests {
                 .map(|comment| comment.id)
                 .collect()
         })
+    }
+
+    #[gpui::test]
+    fn test_agent_comment_colors_fall_back_to_info(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let mut theme = cx.update(|cx| cx.theme().as_ref().clone());
+        theme.styles.colors.agent_comment = None;
+        theme.styles.colors.agent_comment_background = None;
+        assert_eq!(agent_comment_color(&theme), theme.status().info);
+        assert_eq!(
+            agent_comment_background(&theme),
+            theme.status().info_background
+        );
+
+        let color = gpui::red();
+        let background = gpui::green();
+        theme.styles.colors.agent_comment = Some(color);
+        theme.styles.colors.agent_comment_background = Some(background);
+        assert_eq!(agent_comment_color(&theme), color);
+        assert_eq!(agent_comment_background(&theme), background);
     }
 
     #[gpui::test]

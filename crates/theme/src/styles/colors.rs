@@ -245,6 +245,14 @@ pub struct ThemeColors {
     ///
     /// Matching brackets in the cursor scope are highlighted with this background color.
     pub editor_document_highlight_bracket_background: Hsla,
+    /// Color of the gutter bar marking text commented for the agent.
+    ///
+    /// Falls back to the `info` status color when not explicitly set.
+    pub agent_comment: Option<Hsla>,
+    /// Background tint behind text commented for the agent.
+    ///
+    /// Falls back to the `info.background` status color when not explicitly set.
+    pub agent_comment_background: Option<Hsla>,
     /// Filled background color for added diff hunk row highlights in the editor.
     pub editor_diff_hunk_added_background: Hsla,
     /// Hollow background color for added diff hunk row highlights in the editor.
