@@ -611,6 +611,14 @@ pub fn theme_colors_refinement(
             .as_ref()
             .and_then(|color| try_parse_color(color).ok())
             .or(editor_document_highlight_read_background),
+        agent_comment: this
+            .agent_comment
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
+        agent_comment_background: this
+            .agent_comment_background
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
         editor_diff_hunk_added_background: this
             .editor_diff_hunk_added_background
             .as_ref()

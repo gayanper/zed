@@ -1812,7 +1812,7 @@ impl MarkdownPreviewView {
         let store = self.agent_comment_store(cx);
         let highlights = match (self.active_buffer(cx), store) {
             (Some(buffer), Some(store)) => {
-                let color = cx.theme().status().info_background;
+                let color = agent_comments::agent_comment_background(cx.theme());
                 store
                     .read(cx)
                     .offset_ranges(&buffer.read(cx).snapshot(), cx)

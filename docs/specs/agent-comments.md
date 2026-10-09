@@ -31,7 +31,6 @@ This feature is separate from the diff review comments (`stored_review_comments`
 - Comments in collab participants' views.
 - Comments in other markdown views, such as agent panel messages, hover popovers and the channel notes renderer.
 - Showing that a file has comments in a thread other than the visible one.
-- A theme color of its own for the tint.
 
 ---
 
@@ -45,11 +44,11 @@ Everything in this section was built and approved in the proof of concept. Produ
 |---|---|---|
 | Comment action icon | `IconButton`, `IconName::Chat`, `IconSize::Small`, square, `ButtonStyle::Filled` | button defaults |
 | Icon tooltip | "Comment for Agent", with the `ToggleComment` keybinding in the editor | — |
-| Tint on commented text | Background behind the exact commented range, in the editor and the preview | `status().info_background` |
-| Gutter bar (editor only) | Thin bar in the gutter spanning the commented rows | `status().info` |
+| Tint on commented text | Background behind the exact commented range, in the editor and the preview | `agent_comment.background` (falls back to `info.background`) |
+| Gutter bar (editor only) | Thin bar in the gutter spanning the commented rows | `agent_comment` (falls back to `info`) |
 | Comment input | Card, 28 rems wide, `elevated_surface_background`, 1px `border`, rounded, `shadow_md` | theme colors |
 
-No theme schema changes are allowed. Use existing tokens only. A dedicated tint color (`editor.agent_comment.background`) was prototyped and dropped to keep the theme crates untouched.
+Themes and `theme_overrides` can set `agent_comment` (gutter bar in the editor, terminal gutter marker) and `agent_comment.background` (tint in the editor and the preview). Both are optional in `ThemeColors`; `agent_comments::agent_comment_color` and `agent_comment_background` fall back to `info` and `info.background` when a theme leaves them unset. A theme that sets `info` without `info.background` gets an opaque tint: `info.background` then keeps the base `StatusColors` value (opaque blue step 9), because no translucent background is derived from the theme's `info`.
 
 ### The comment input
 
@@ -343,6 +342,16 @@ The editor's button dispatches `zed_actions::agent_comments::ToggleComment`. The
 | `cursor_offset() -> Option<usize>` | Read-only getter. |
 | `RenderedMarkdown.selection_action_button` | Laid out in prepaint, painted after the text. |
 
+### `theme`, `settings_content`, `theme_settings` (about 30 lines, low merge risk)
+
+| Change | File | Notes |
+|---|---|---|
+| `agent_comment`, `agent_comment_background: Option<Hsla>` | `crates/theme/src/styles/colors.rs` | optional, like `editor_code_lens_foreground` |
+| `None` defaults | `crates/theme/src/{default_colors,fallback_themes}.rs` | |
+| `agent_comment`, `agent_comment.background` keys | `crates/settings_content/src/theme.rs` | |
+| Parse-only refinement | `crates/theme_settings/src/schema.rs` | no fallback; `agent_comments` resolves it at use time |
+| Override test | `crates/theme_settings/src/settings.rs` | `agent_comment_colors_from_theme_survive_info_override` |
+
 ### `terminal_view` (about 165 lines, low to medium merge risk)
 
 | Change | Notes |
@@ -590,6 +599,7 @@ Otherwise it isn't rendered at all. With no comments, the toolbar layout is the 
 | Keymaps | `assets/keymaps/default-{macos,linux,windows}.json` |
 | Agent integration (Phases 2–4) | `crates/agent_ui/src/{conversation_view,agent_panel,message_editor}.rs`, `crates/agent_ui/Cargo.toml` |
 | Terminal hooks | `crates/terminal_view/src/{terminal_view,terminal_element}.rs` |
+| Theme keys | `crates/theme/src/styles/colors.rs`, `crates/theme/src/{default_colors,fallback_themes}.rs`, `crates/settings_content/src/theme.rs`, `crates/theme_settings/src/schema.rs` |
 
 ---
 

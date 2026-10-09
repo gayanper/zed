@@ -185,6 +185,8 @@ pub(crate) fn zed_default_dark() -> Theme {
                 ),
                 editor_document_highlight_write_background: gpui::red(),
                 editor_document_highlight_bracket_background: gpui::green(),
+                agent_comment: None,
+                agent_comment_background: None,
                 editor_diff_hunk_added_background: ADDED_COLOR.opacity(0.12),
                 editor_diff_hunk_added_hollow_background: ADDED_COLOR.opacity(0.06),
                 editor_diff_hunk_added_hollow_border: ADDED_COLOR.opacity(0.36),
