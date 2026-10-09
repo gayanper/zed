@@ -155,6 +155,7 @@ pub struct TerminalView {
     /// rounded, terminal content isn't clipped.
     background_corner_radii: Option<Corners<Rems>>,
     read_only: bool,
+    local_selection: bool,
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
     show_workspace_actions: Option<bool>,
@@ -311,6 +312,7 @@ impl TerminalView {
             mode: TerminalMode::Standalone,
             background_corner_radii: None,
             read_only: false,
+            local_selection: false,
             show_workspace_actions: None,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
@@ -363,8 +365,20 @@ impl TerminalView {
         self
     }
 
+    pub fn is_local_selection(&self) -> bool {
+        self.local_selection
+    }
+
+    /// Keeps mouse clicks, drags and moves local even when the program captures
+    /// the mouse, as holding shift does, so a drag selects text. Scrolling
+    /// still goes to the program.
+    pub fn set_local_selection(&mut self, local_selection: bool, cx: &mut Context<Self>) {
+        self.local_selection = local_selection;
+        cx.notify();
+    }
+
     fn mouse_input_mode(&self) -> MouseInputMode {
-        if self.read_only {
+        if self.read_only || self.local_selection {
             MouseInputMode::LocalSelection
         } else {
             MouseInputMode::ReportToTerminal
@@ -810,11 +824,18 @@ impl TerminalView {
                 return;
             }
         }
+        // Not `mouse_input_mode()`: under local selection the wheel still
+        // reports to the program, so TUIs keep scrolling their own view.
+        let mode = if self.read_only {
+            MouseInputMode::LocalSelection
+        } else {
+            MouseInputMode::ReportToTerminal
+        };
         self.terminal.update(cx, |term, cx| {
             term.scroll_wheel(
                 event,
                 TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
-                self.mouse_input_mode(),
+                mode,
             )
         });
     }
@@ -2713,6 +2734,78 @@ mod tests {
         assert!(
             actions.borrow().is_empty(),
             "a cleared action should hide the button",
+        );
+    }
+
+    const ENABLE_MOUSE_REPORTING: &str = "\x1b[?1002h\x1b[?1006h";
+
+    #[gpui::test]
+    async fn local_selection_drag_selects_in_mouse_mode(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let cell = write_first_line(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
+            &mut cx,
+        );
+        let selection_text = |cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal.last_content.selection_text.clone()
+            })
+        };
+
+        drag(cell(0.1), cell(4.9), &mut cx);
+        assert_eq!(selection_text(&mut cx), None);
+        assert!(
+            !terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "without local selection the drag goes to the program",
+        );
+
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.set_local_selection(true, cx)
+        });
+        drag(cell(0.1), cell(4.9), &mut cx);
+        assert_eq!(selection_text(&mut cx), Some("hello".into()));
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "with local selection the drag isn't reported to the program",
+        );
+    }
+
+    #[gpui::test]
+    async fn local_selection_keeps_scroll_reports(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let cell = write_first_line(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
+            &mut cx,
+        );
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.set_local_selection(true, cx)
+        });
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: cell(2.0),
+            delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 1.0)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "scrolling should still be reported to the program",
         );
     }
 

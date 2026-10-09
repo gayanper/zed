@@ -156,7 +156,7 @@ The icon comes back as soon as a thread becomes visible. Validated in the proof 
 Terminal text has no buffer, so terminal comments are kept apart from buffer comments and work differently.
 
 **Adding a comment**
-1. The user selects terminal text. In a TUI that captures the mouse, that takes shift-drag.
+1. The user selects terminal text. In a TUI that captures the mouse, that takes shift-drag, or a plain drag while comment mode is on (see Comment mode).
 2. When the selection is finished, the comment icon appears one cell after its last cell, centred on the line. Clicking it opens `CommentInput` as a floating popover at the icon, titled "Comment on terminal selection".
 3. On submit, the comment is added with the selected text, captured as it is now; it is never re-read.
 
@@ -169,6 +169,8 @@ Terminal text has no buffer, so terminal comments are kept apart from buffer com
 **Scope.** A terminal comment applies only to the terminal thread it was made in, because the text it quotes is only in that terminal. File comments apply to every thread, since they name their file and location. The toolbar's count, Insert and Clear cover the file comments plus the visible terminal thread's own comments; an agent thread or another terminal thread leaves them out, and the button shows only when that count is above 0. Clear in any thread still removes every file comment.
 
 **Lifetime.** Closing or archiving the terminal thread drops its comments. Otherwise they are removed like other comments: by inserting them, by the toolbar's Clear, or by closing the workspace. A comment whose marker is hidden can't be edited or removed on its own.
+
+**Comment mode.** A toolbar toggle (`IconName::CursorIBeam`, tooltip "Select text for comments"), shown for a terminal thread while comments are on, keeps mouse clicks, drags and moves local. A plain drag then selects text as shift-drag does, and several comments in a row don't need shift. Scrolling still goes to the program. While it is on, right-click opens Zed's terminal context menu, middle-click isn't sent to the program and the program gets no hover events. The state belongs to each terminal thread and survives switching threads. It is turned off by the toggle, by `ToggleTerminalCommentMode`, or by turning comments off.
 
 **Popover.** The agent panel hosts the popover. It closes when the visible session changes, when its comment is gone, when comments are turned off, and on submit or cancel; focus returns to the terminal.
 
@@ -272,6 +274,7 @@ pub struct AgentComment {
 |---|---|---|
 | `agent_comments::ToggleComment` | `zed_actions::agent_comments` | Toggle for the icon and the keyboard (see Source code editor). It is defined in `zed_actions` so `editor` can dispatch it without depending on `agent_comments`. |
 | `agent_comments::Submit` | `agent_comments` | Submits `CommentInput`. |
+| `agent_comments::ToggleTerminalCommentMode` | `agent_comments` | Toggles comment mode in the visible terminal thread. Handled by the agent panel. It has no default binding; a user binding belongs in `AgentPanel > Terminal`. |
 
 Default keymap entries, in all three platform files:
 
@@ -340,11 +343,12 @@ The editor's button dispatches `zed_actions::agent_comments::ToggleComment`. The
 | `cursor_offset() -> Option<usize>` | Read-only getter. |
 | `RenderedMarkdown.selection_action_button` | Laid out in prepaint, painted after the text. |
 
-### `terminal_view` (about 150 lines, low to medium merge risk)
+### `terminal_view` (about 165 lines, low to medium merge risk)
 
 | Change | Notes |
 |---|---|
 | `TerminalView::on_selection_action(tooltip, Fn(Range, String, Point<Pixels>, &mut Window, &mut App))` / `clear_selection_action` | Opt-in. `TerminalElement` lays out an icon button one cell after a finished, non-empty selection, and paints it after the text. The range and text are captured in prepaint. The button uses `on_mouse_down` and `occlude`, so the click keeps the selection. |
+| `TerminalView::set_local_selection(bool)` / `is_local_selection` | Opt-in, off by default. When on, mouse clicks, drags and moves use `MouseInputMode::LocalSelection`, as read-only views do. Scrolling keeps `ReportToTerminal` unless the view is read-only. |
 | `TerminalView::set_gutter_markers(Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)>)` / `clear_gutter_markers` | Opt-in. Called on every paint with the content being painted; the ranges of grid lines get a 2px bar in the existing one-cell left gutter. |
 
 `terminal` itself is unchanged: the on-screen text and its grid lines come from the public `Content`.
@@ -497,7 +501,7 @@ Each one must be closed before release.
 ### Placement
 
 - In `AgentPanel::render_toolbar` (`crates/agent_ui/src/agent_panel.rs`), inside the right-hand button group.
-- **Order in that group:** sandbox status, **comments button**, new-thread "+" menu, full-screen toggle, options menu.
+- **Order in that group:** sandbox status, terminal comment mode toggle (terminal threads only, see Comment mode), **comments button**, new-thread "+" menu, full-screen toggle, options menu.
 - It is one toolbar shared by normal threads and terminal threads, so the button appears in the same place for both.
 
 ### Visibility
@@ -506,7 +510,7 @@ The button shows only when both of these hold:
 - the panel is showing a session (`visible_surface()` is `AgentThread` or `Terminal`, not `Uninitialized`);
 - the visible session's store has at least one comment.
 
-Otherwise it isn't rendered at all, so the toolbar layout stays the same as upstream.
+Otherwise it isn't rendered at all. With no comments, the toolbar layout is the same as upstream, except that a terminal thread shows the comment mode toggle while comments are on.
 
 ### Look
 
@@ -600,4 +604,4 @@ Otherwise it isn't rendered at all, so the toolbar layout stays the same as upst
 - **`InsertPendingComments`** (`agent_comments::InsertPendingComments`) is handled by the agent panel and shown in the button's tooltip. It has no default binding.
 - **Not covered by tests:** remote/collab buffers (gap 6); the one-input-per-view rule is structural (gap 7).
 - **Terminal comments (2026-10-08):** `TerminalComment` lives in a second list of the workspace store (`add_terminal`, `terminal_comments`, `remove_terminal_comments`); `len`, `contains`, `update`, `remove` and `clear` cover both lists. The toolbar uses `visible_len`, `clear_visible`, `pending_comments` and `take_pending_comments`, which take the visible terminal (`None` for an agent thread) and leave out other terminals' comments; payloads are ordered by `AgentCommentId`. The wiring is in `agent_panel.rs` (`register_terminal_comment_hooks`, `open_terminal_comment`, `terminal_comment_markers`, `ScreenText`, `visible_comment_terminal`). Comments were first anchored to fixed scrollback rows and then to whole-row text; both hid the marker after a resize, since lines rewrap and TUIs redraw with other padding, so a comment is now found by its selected text without whitespace.
-
+- **Terminal comment mode (2026-10-09):** `TerminalView::set_local_selection` reuses the existing `MouseInputMode::LocalSelection`, so `terminal` stays unchanged. `scroll_wheel` picks its mode from `read_only` alone, which keeps the wheel going to the TUI. The panel wiring is `render_terminal_comment_mode_button` and `toggle_terminal_comment_mode` in `agent_panel.rs`; `register_terminal_comment_hooks` turns the mode off when comments are off.

@@ -15,7 +15,7 @@ use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_comments::{
     AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, ClearPendingComments,
-    CommentPopover, InsertPendingComments, TerminalComment,
+    CommentPopover, InsertPendingComments, TerminalComment, ToggleTerminalCommentMode,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -6380,6 +6380,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .children(self.render_terminal_comment_mode_button(cx))
                         .children(self.render_agent_comments_button(cx))
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
@@ -6444,6 +6445,45 @@ impl AgentPanel {
         )
     }
 
+    fn render_terminal_comment_mode_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !agent_comments::comments_enabled(cx) {
+            return None;
+        }
+        let terminal_view = self.visible_terminal_view()?;
+        let focus_handle = self.focus_handle.clone();
+        Some(
+            IconButton::new("agent-comments-terminal-mode", IconName::CursorIBeam)
+                .icon_size(IconSize::Small)
+                .toggle_state(terminal_view.read(cx).is_local_selection())
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in(
+                        "Select text for comments",
+                        &ToggleTerminalCommentMode,
+                        &focus_handle,
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.toggle_terminal_comment_mode(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_terminal_comment_mode(&mut self, cx: &mut Context<Self>) {
+        if !agent_comments::comments_enabled(cx) {
+            return;
+        }
+        let Some(terminal_view) = self.visible_terminal_view().cloned() else {
+            return;
+        };
+        terminal_view.update(cx, |terminal_view, cx| {
+            let local_selection = !terminal_view.is_local_selection();
+            terminal_view.set_local_selection(local_selection, cx);
+        });
+        cx.notify();
+    }
+
     /// Turns terminal comments on or off for every terminal thread, and
     /// closes the comment input once its comment is gone.
     fn refresh_terminal_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6477,6 +6517,7 @@ impl AgentPanel {
             if !enabled {
                 terminal_view.clear_selection_action(cx);
                 terminal_view.clear_gutter_markers(cx);
+                terminal_view.set_local_selection(false, cx);
                 return;
             }
             let terminal_entity_id = terminal_view.terminal().entity_id();
@@ -6992,6 +7033,11 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, _: &ClearPendingComments, _window, cx| {
                 this.clear_visible_agent_comments(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &ToggleTerminalCommentMode, _window, cx| {
+                    this.toggle_terminal_comment_mode(cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
@@ -10659,6 +10705,115 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(comments_button_shown(&panel, &mut cx));
+    }
+
+    fn terminal_comment_mode_button_shown(
+        panel: &Entity<AgentPanel>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        panel.update(cx, |panel, cx| {
+            panel.render_terminal_comment_mode_button(cx).is_some()
+        })
+    }
+
+    fn terminal_local_selection(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .is_local_selection()
+        })
+    }
+
+    fn toggle_terminal_comment_mode(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+        panel.update(cx, |panel, cx| panel.toggle_terminal_comment_mode(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_mode_toggles_per_terminal_thread(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (first_terminal_id, _) = open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        assert!(!terminal_local_selection(
+            &panel,
+            first_terminal_id,
+            &mut cx
+        ));
+
+        toggle_terminal_comment_mode(&panel, &mut cx);
+        assert!(terminal_local_selection(&panel, first_terminal_id, &mut cx));
+
+        let (second_terminal_id, _) = open_terminal_with_output(&panel, "beta\r\n", &mut cx);
+        assert!(
+            !terminal_local_selection(&panel, second_terminal_id, &mut cx),
+            "another terminal thread starts with the mode off"
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(first_terminal_id, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            terminal_local_selection(&panel, first_terminal_id, &mut cx),
+            "the mode survives switching threads"
+        );
+
+        toggle_terminal_comment_mode(&panel, &mut cx);
+        assert!(!terminal_local_selection(
+            &panel,
+            first_terminal_id,
+            &mut cx
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_mode_button_visibility(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        assert!(
+            terminal_comment_mode_button_shown(&panel, &mut cx),
+            "a terminal thread shows the toggle without any comments"
+        );
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        assert!(!terminal_comment_mode_button_shown(&panel, &mut cx));
+
+        open_terminal_with_output(&panel, "beta\r\n", &mut cx);
+        assert!(terminal_comment_mode_button_shown(&panel, &mut cx));
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert!(!terminal_comment_mode_button_shown(&panel, &mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_disabling_comments_turns_terminal_comment_mode_off(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, _) = open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        toggle_terminal_comment_mode(&panel, &mut cx);
+        assert!(terminal_local_selection(&panel, terminal_id, &mut cx));
+
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert!(!terminal_local_selection(&panel, terminal_id, &mut cx));
     }
 
     #[gpui::test]

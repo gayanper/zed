@@ -44,6 +44,8 @@ actions!(
         InsertPendingComments,
         /// Removes the workspace's pending agent comments without inserting them.
         ClearPendingComments,
+        /// Toggles selecting terminal text without holding shift, for commenting.
+        ToggleTerminalCommentMode,
     ]
 );
 
