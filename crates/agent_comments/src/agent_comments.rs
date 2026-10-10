@@ -685,8 +685,6 @@ fn apply_edit_event(
     }
 }
 
-struct AgentCommentGutter;
-
 fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Editor>) {
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let buffer_ids = snapshot.all_buffer_ids().collect::<HashSet<_>>();
@@ -701,15 +699,9 @@ fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Edito
         None => Vec::new(),
     };
     if ranges.is_empty() {
-        editor.clear_gutter_highlights::<AgentCommentGutter>(cx);
         editor.clear_background_highlights(HighlightKey::AgentComment, cx);
         return;
     }
-    editor.highlight_gutter::<AgentCommentGutter>(
-        ranges.clone(),
-        |cx| agent_comment_color(cx.theme()),
-        cx,
-    );
     editor.highlight_background(
         HighlightKey::AgentComment,
         &ranges,
@@ -2046,6 +2038,19 @@ mod tests {
             })
         }
 
+        fn gutter_highlight_count(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> usize {
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                editor
+                    .gutter_highlights_in_range(
+                        editor::Anchor::Min..editor::Anchor::Max,
+                        &snapshot.display_snapshot,
+                        cx,
+                    )
+                    .len()
+            })
+        }
+
         #[gpui::test]
         async fn test_buttons_follow_selection_and_setting(cx: &mut TestAppContext) {
             let (editor, cx) = open_editor("one two three\n", cx).await;
@@ -2112,6 +2117,11 @@ mod tests {
             assert!(editor_focused(&editor, cx), "focus returns to the editor");
             assert_eq!(bodies(&store, cx), ["Rename."]);
             assert_eq!(highlight_count(&editor, cx), 1);
+            assert_eq!(
+                gutter_highlight_count(&editor, cx),
+                0,
+                "comments leave the gutter to git hunks"
+            );
             let comment = store.read_with(cx, |store, cx| {
                 let comment = &store.comments()[0];
                 let snapshot = comment.buffer.read(cx).snapshot();

@@ -1191,6 +1191,7 @@ Set `[]` to clear the inherited list. Omit this setting to inherit it unchanged.
     "search_results": true,
     "selected_text": true,
     "selected_symbol": true,
+    "agent_comments": true,
     "diagnostics": "all",
     "axes": {
       "horizontal": true,
@@ -1303,6 +1304,18 @@ Selected text indicators appear as marks showing all occurrences of the currentl
 - Default: `true`
 
 Selected symbol indicators appear as marks showing all occurrences of the currently selected symbol (like a function or variable name) throughout the file.
+
+**Options**
+
+`boolean` values
+
+### Agent Comments Indicators
+
+- Description: Whether to show agent comment indicators in the scrollbar.
+- Setting: `agent_comments`
+- Default: `true`
+
+Agent comment indicators mark the rows of comments for the agent, in the same column as search result and selection indicators.
 
 **Options**
 

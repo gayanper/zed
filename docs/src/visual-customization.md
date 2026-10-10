@@ -291,6 +291,7 @@ TBD: Centered layout related settings
     "search_results": true,   // Show buffer search results in the scrollbar.
     "selected_text": true,    // Show selected text occurrences in the scrollbar.
     "selected_symbol": true,  // Show selected symbol occurrences in the scrollbar.
+    "agent_comments": true,   // Show agent comment indicators in the scrollbar.
     "diagnostics": "all",     // Show diagnostics (none, error, warning, information, all)
     "axes": {
       "horizontal": true,     // Show/hide the horizontal scrollbar
