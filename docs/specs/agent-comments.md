@@ -48,7 +48,7 @@ Everything in this section was built and approved in the proof of concept. Produ
 | Scrollbar marker (editor only) | Marker in the middle column of the vertical scrollbar spanning the commented rows; the left gutter is left to git diff hunks | `agent_comment` (falls back to `info`) |
 | Comment input | Card, 28 rems wide, `elevated_surface_background`, 1px `border`, rounded, `shadow_md` | theme colors |
 
-Themes and `theme_overrides` can set `agent_comment` (scrollbar marker in the editor, terminal gutter marker) and `agent_comment.background` (tint in the editor and the preview). Both are optional in `ThemeColors`; `agent_comments::agent_comment_color` and `agent_comment_background` fall back to `info` and `info.background` when a theme leaves them unset. A theme that sets `info` without `info.background` gets an opaque tint: `info.background` then keeps the base `StatusColors` value (opaque blue step 9), because no translucent background is derived from the theme's `info`.
+Themes and `theme_overrides` can set `agent_comment` (scrollbar marker in the editor, terminal gutter marker) and `agent_comment.background` (tint in the editor and the preview). Both are optional in `ThemeColors`; `agent_comments::agent_comment_color` and `agent_comment_background` fall back to `info` and `info.background` when a theme leaves them unset. A theme that sets `info` without `info.background` gets an opaque tint: `info.background` then keeps the base `StatusColors` value (opaque blue step 9), because no translucent background is derived from the theme's `info`. Switching themes, or editing `theme_overrides`, re-tints existing comments in the editor and the preview without reopening the file.
 
 ### The comment input
 
