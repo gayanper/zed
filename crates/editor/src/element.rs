@@ -1527,6 +1527,9 @@ impl EditorElement {
                 // Selected Symbol Occurrences
                 (is_singleton && scrollbar_settings.selected_symbol && (editor.has_background_highlights(HighlightKey::DocumentHighlightRead) || editor.has_background_highlights(HighlightKey::DocumentHighlightWrite)))
                 ||
+                // Agent Comments
+                (is_singleton && scrollbar_settings.agent_comments && editor.has_background_highlights(HighlightKey::AgentComment))
+                ||
                 // Diagnostics
                 (is_singleton && scrollbar_settings.diagnostics != ScrollbarDiagnostics::None && snapshot.buffer_snapshot().has_diagnostics())
                 ||
@@ -6468,6 +6471,32 @@ impl EditorElement {
                                 marker_quads.extend(
                                     scrollbar_layout
                                         .marker_quads_for_ranges(marker_row_ranges, Some(0)),
+                                );
+                            }
+
+                            // Painted before the other column 1 markers, so that the
+                            // transient search and selection markers stay on top.
+                            if is_singleton
+                                && scrollbar_settings.agent_comments
+                                && let Some((_, comment_ranges)) =
+                                    background_highlights.get(&HighlightKey::AgentComment)
+                            {
+                                let color =
+                                    theme.colors().agent_comment.unwrap_or(theme.status().info);
+                                let marker_row_ranges = comment_ranges.iter().map(|range| {
+                                    let display_start =
+                                        range.start.to_display_point(&snapshot.display_snapshot);
+                                    let display_end =
+                                        range.end.to_display_point(&snapshot.display_snapshot);
+                                    ColoredRange {
+                                        start: display_start.row(),
+                                        end: display_end.row(),
+                                        color,
+                                    }
+                                });
+                                marker_quads.extend(
+                                    scrollbar_layout
+                                        .marker_quads_for_ranges(marker_row_ranges, Some(1)),
                                 );
                             }
 
@@ -12406,6 +12435,85 @@ mod tests {
             .position_map
             .point_for_position(point(click_x, px(0.)));
         assert_eq!(point.nearest_valid, target_point);
+    }
+
+    fn agent_comment_scrollbar_markers(
+        show_agent_comments: bool,
+        cx: &mut TestAppContext,
+    ) -> Vec<Bounds<Pixels>> {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .editor
+                        .scrollbar
+                        .get_or_insert_default()
+                        .agent_comments = Some(show_agent_comments);
+                });
+            });
+        });
+
+        let text = "line\n".repeat(100);
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range =
+                snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(4, 2));
+            editor.highlight_background(
+                HighlightKey::AgentComment,
+                &[range],
+                |_, theme| theme.status().info_background,
+                cx,
+            );
+            let search_range =
+                snapshot.anchor_before(Point::new(80, 0))..snapshot.anchor_after(Point::new(80, 4));
+            editor.highlight_background(
+                HighlightKey::BufferSearchHighlights,
+                &[search_range],
+                |_, theme| theme.status().info_background,
+                cx,
+            );
+        });
+
+        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style)
+        });
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, _| {
+            editor
+                .scrollbar_marker_state
+                .markers
+                .iter()
+                .map(|marker| marker.bounds)
+                .sorted_by_key(|bounds| bounds.origin.y)
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn test_agent_comment_scrollbar_markers_in_second_column(cx: &mut TestAppContext) {
+        let markers = agent_comment_scrollbar_markers(true, cx);
+        assert_eq!(markers.len(), 2, "one comment and one search marker");
+        let column_width = markers[0].size.width;
+        assert!(column_width > px(0.));
+        assert_eq!(
+            markers[0].origin.x,
+            ScrollbarLayout::BORDER_WIDTH + column_width
+        );
+    }
+
+    #[gpui::test]
+    fn test_agent_comment_scrollbar_markers_follow_setting(cx: &mut TestAppContext) {
+        let markers = agent_comment_scrollbar_markers(false, cx);
+        assert_eq!(markers.len(), 1, "only the search marker");
     }
 
     #[gpui::test]

@@ -666,6 +666,8 @@
     "selected_text": true,
     // Whether to show selected symbol occurrences in the scrollbar.
     "selected_symbol": true,
+    // Whether to show agent comment indicators in the scrollbar.
+    "agent_comments": true,
     // Which diagnostic indicators to show in the scrollbar:
     //  - "none" or false: do not show diagnostics
     //  - "error": show only errors

@@ -426,6 +426,10 @@ pub struct ScrollbarContent {
     ///
     /// Default: true
     pub selected_symbol: Option<bool>,
+    /// Whether to show agent comment indicators in the scrollbar.
+    ///
+    /// Default: true
+    pub agent_comments: Option<bool>,
     /// Which diagnostic indicators to show in the scrollbar:
     ///
     /// Default: all

@@ -2516,7 +2516,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn scrollbar_section() -> [SettingsPageItem; 10] {
+    fn scrollbar_section() -> [SettingsPageItem; 11] {
         [
             SettingsPageItem::SectionHeader("Scrollbar"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2654,6 +2654,31 @@ fn editor_page() -> SettingsPage {
                             .scrollbar
                             .get_or_insert_default()
                             .selected_symbol = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Agent Comments",
+                description: "Show agent comment indicators in the scrollbar.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("scrollbar.agent_comments"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .scrollbar
+                            .as_ref()?
+                            .agent_comments
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .scrollbar
+                            .get_or_insert_default()
+                            .agent_comments = value;
                     },
                 }),
                 metadata: None,

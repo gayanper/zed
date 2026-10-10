@@ -45,10 +45,10 @@ Everything in this section was built and approved in the proof of concept. Produ
 | Comment action icon | `IconButton`, `IconName::Chat`, `IconSize::Small`, square, `ButtonStyle::Filled` | button defaults |
 | Icon tooltip | "Comment for Agent", with the `ToggleComment` keybinding in the editor | — |
 | Tint on commented text | Background behind the exact commented range, in the editor and the preview | `agent_comment.background` (falls back to `info.background`) |
-| Gutter bar (editor only) | Thin bar in the gutter spanning the commented rows | `agent_comment` (falls back to `info`) |
+| Scrollbar marker (editor only) | Marker in the middle column of the vertical scrollbar spanning the commented rows; the left gutter is left to git diff hunks | `agent_comment` (falls back to `info`) |
 | Comment input | Card, 28 rems wide, `elevated_surface_background`, 1px `border`, rounded, `shadow_md` | theme colors |
 
-Themes and `theme_overrides` can set `agent_comment` (gutter bar in the editor, terminal gutter marker) and `agent_comment.background` (tint in the editor and the preview). Both are optional in `ThemeColors`; `agent_comments::agent_comment_color` and `agent_comment_background` fall back to `info` and `info.background` when a theme leaves them unset. A theme that sets `info` without `info.background` gets an opaque tint: `info.background` then keeps the base `StatusColors` value (opaque blue step 9), because no translucent background is derived from the theme's `info`.
+Themes and `theme_overrides` can set `agent_comment` (scrollbar marker in the editor, terminal gutter marker) and `agent_comment.background` (tint in the editor and the preview). Both are optional in `ThemeColors`; `agent_comments::agent_comment_color` and `agent_comment_background` fall back to `info` and `info.background` when a theme leaves them unset. A theme that sets `info` without `info.background` gets an opaque tint: `info.background` then keeps the base `StatusColors` value (opaque blue step 9), because no translucent background is derived from the theme's `info`.
 
 ### The comment input
 
@@ -84,13 +84,13 @@ Behaviour:
 3. Clicking the icon, or pressing `ctrl-alt-m`, opens `CommentInput` as a block below the selection's last line, indented past the gutter. The editor scrolls so the block is visible.
 4. On submit:
    - the comment is added;
-   - the range gets its tint and gutter bar;
+   - the range gets its tint and scrollbar marker;
    - Phase 1 only: a notification shows the payload.
 
 **Viewing and editing a comment**
 1. When the cursor sits inside a tinted range with nothing selected, the same icon appears at the end of the cursor's line. The input doesn't open by itself when the cursor lands there.
 2. Clicking the icon, or pressing `ctrl-alt-m`, opens the input below the comment's last line, filled with the existing text, with `Remove`, `Cancel` and `Update Comment`.
-3. `Update Comment` replaces the text. `Remove` deletes the comment and its tint and gutter bar.
+3. `Update Comment` replaces the text. `Remove` deletes the comment and its tint and scrollbar marker.
 
 **`ctrl-alt-m` toggles.** Evaluated in this order:
 1. An input is open in this editor: close it (same as cancel).
@@ -118,11 +118,13 @@ The icon's click follows the same rules.
 
 The icon comes back as soon as a thread becomes visible. Validated in the proof of concept.
 
-**Tint and gutter bar**
+**Tint and scrollbar marker**
 - The tint covers the exact commented characters.
-- The gutter bar covers every row the range touches.
+- The scrollbar marker covers every row the range touches. It sits in the scrollbar's middle column, with search, selected-text and symbol markers, which are painted on top of it (symbol markers are half transparent, so the comment color shows through them). Its color repeats the `agent_comment` → `info` fallback in `editor`'s `refresh_slow_scrollbar_markers`, because `editor` can't depend on `agent_comments`; keep the two in sync. Git diff markers keep the left column.
 - Both follow the text as the file is edited, because ranges are stored as buffer anchors.
-- They show in every editor that displays the buffer, including split panes and multibuffers that contain an excerpt of it.
+- The tint shows in every editor that displays the buffer, including split panes and multibuffers that contain an excerpt of it. The scrollbar marker shows only in single-buffer editors, like the other middle-column markers.
+- The marker is controlled by `"scrollbar": { "agent_comments": true }` (default `true`, also in the settings UI under Scrollbar). With `show: "auto"`, comments make the scrollbar visible. Turning the marker off leaves only the tint.
+- Comments don't draw in the left gutter, so they never cover git diff hunks.
 
 ### Markdown preview
 
@@ -293,7 +295,7 @@ The input also binds `tab` / `shift-tab` to `agent_comments::FocusNext` / `Focus
   - `set_show_cursor_comment_button` is true while a thread is active and the newest selection overlaps a comment (see No overlapping comments).
 - **Highlights:** on store change, and when the editor is set up:
   - collect the comment ranges of every buffer in the editor's multibuffer and turn them into multibuffer anchors (`anchor_range_in_buffer`);
-  - then call `highlight_gutter::<AgentCommentGutter>` and `highlight_background(HighlightKey::AgentComment, …)`, or clear both when there are none.
+  - then call `highlight_background(HighlightKey::AgentComment, …)`, or clear it when there are none. The editor builds the scrollbar markers from this highlight in `refresh_slow_scrollbar_markers`.
   - Production must also refresh when excerpts are added to a multibuffer (`EditorEvent::ExcerptsAdded`); the proof of concept doesn't.
 - **Input block:**
   - `insert_blocks` with `BlockStyle::Sticky`, `BlockPlacement::Below(end of the last commented line)`, `Autoscroll::fit()`.
@@ -548,7 +550,7 @@ Otherwise it isn't rendered at all. With no comments, the toolbar layout is the 
 1. Collect the visible session's comments in the order they were added.
 2. Build the text with `format_comments`. Each comment's path and line numbers are computed at click time from its buffer and anchors, so edits made after commenting are reflected.
 3. Insert the text into the visible session's input (see below). Nothing is submitted or run.
-4. Clear the session's store. That hides the button, removes the tints and gutter bars in every editor and preview, and releases the buffers the comments were holding.
+4. Clear the session's store. That hides the button, removes the tints and scrollbar markers in every editor and preview, and releases the buffers the comments were holding.
 5. If the text comes out empty (for example, every comment's file has gone), insert nothing and keep the store unchanged.
 
 **Normal thread**
