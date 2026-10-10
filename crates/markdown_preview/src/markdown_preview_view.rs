@@ -82,6 +82,9 @@ pub struct MarkdownPreviewView {
     markdown_parse_pending: bool,
     agent_comment: Option<CommentPopover>,
     _active_comment_store_subscription: Subscription,
+    _theme_subscription: Subscription,
+    #[cfg(test)]
+    applied_agent_comment_background: Option<gpui::Hsla>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -437,6 +440,11 @@ impl MarkdownPreviewView {
                         cx.notify();
                     },
                 ),
+                _theme_subscription: cx.observe_global::<theme::GlobalTheme>(|this, cx| {
+                    this.refresh_agent_comment_highlights(cx);
+                }),
+                #[cfg(test)]
+                applied_agent_comment_background: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -1813,6 +1821,10 @@ impl MarkdownPreviewView {
         let highlights = match (self.active_buffer(cx), store) {
             (Some(buffer), Some(store)) => {
                 let color = agent_comments::agent_comment_background(cx.theme());
+                #[cfg(test)]
+                {
+                    self.applied_agent_comment_background = Some(color);
+                }
                 store
                     .read(cx)
                     .offset_ranges(&buffer.read(cx).snapshot(), cx)
@@ -2394,7 +2406,7 @@ mod tests {
     use fs::FakeFs;
     use gpui::UpdateGlobal as _;
     use gpui::{
-        App, AppContext as _, Entity, Focusable as _, Modifiers, MouseButton, MouseUpEvent,
+        App, AppContext as _, Entity, Focusable as _, Hsla, Modifiers, MouseButton, MouseUpEvent,
         TestAppContext, VisualTestContext, WindowHandle, point, px,
     };
     use language::{Buffer, DiskState, Point};
@@ -4611,6 +4623,76 @@ mod tests {
             };
             preview.toggle_agent_comment_on_click(&event, window, cx);
             assert!(preview.agent_comment.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_comment_tint_follows_theme(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({"docs": {"README.md": "# Title\n\nSome text here.\n"}}),
+            false,
+        )
+        .await;
+        cx.update(|cx| {
+            set_auto_preview_enabled(cx, false);
+            agent_comments::init(cx);
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_comments = Some(true);
+                });
+            });
+        });
+        let item =
+            open_project_file(cx, &project, &multi_workspace, "docs/README.md", None, true).await;
+        let editor = cx
+            .update(|cx| item.act_as::<Editor>(cx))
+            .expect("file should open in an editor");
+        let preview = multi_workspace
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        preview.update_in(cx, |preview, window, cx| {
+            preview.open_agent_comment(9..13, "Some".into(), point(px(0.), px(0.)), window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_input("Clarify.");
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+
+        let initial = cx.update(|_, cx| {
+            agent_comments::agent_comment_background(theme::GlobalTheme::theme(cx))
+        });
+        preview.read_with(cx, |preview, _| {
+            assert_eq!(preview.applied_agent_comment_background, Some(initial));
+        });
+
+        let background = Hsla::from(gpui::rgb(0x00ff00)).alpha(0.25);
+        assert_ne!(background, initial);
+        cx.update(|_, cx| {
+            let mut theme = theme::GlobalTheme::theme(cx).as_ref().clone();
+            theme.styles.colors.agent_comment_background = Some(background);
+            theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+        cx.run_until_parked();
+
+        preview.read_with(cx, |preview, _| {
+            assert_eq!(preview.applied_agent_comment_background, Some(background));
         });
     }
 
