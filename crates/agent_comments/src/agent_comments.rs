@@ -9,6 +9,7 @@ use std::{
 };
 
 use agent_settings::AgentSettings;
+use buffer_diff::{BufferDiffSnapshot, DiffHunk};
 use collections::{HashMap, HashSet};
 use editor::{
     CODE_ACTIONS_DEBOUNCE_TIMEOUT, Editor, EditorEvent, ToPoint as _,
@@ -25,7 +26,7 @@ use gpui::{
 use language::{
     Buffer, BufferEvent, BufferId, BufferSnapshot, Point as BufferPoint, ToOffset as _,
 };
-use multi_buffer::MultiBufferRow;
+use multi_buffer::{MultiBuffer, MultiBufferRow, MultiBufferSnapshot};
 use settings::{Settings as _, SettingsStore};
 use theme::Theme;
 use ui::{KeyBinding, prelude::*};
@@ -109,6 +110,9 @@ pub struct AgentComment {
     pub buffer: Entity<Buffer>,
     pub range: Range<language::Anchor>,
     pub body: String,
+    /// Set for a comment on lines removed from this buffer, when `buffer` is
+    /// the base text of this buffer's diff. Kept alive to name the file.
+    pub diff_base_of: Option<Entity<Buffer>>,
 }
 
 impl AgentComment {
@@ -168,6 +172,30 @@ impl AgentCommentStore {
         body: String,
         cx: &mut Context<Self>,
     ) -> AgentCommentId {
+        self.push(buffer, range, body, None, cx)
+    }
+
+    /// Adds a comment on lines removed from `main`, where `base` is the base
+    /// text of `main`'s diff and `range` is in `base`.
+    pub fn add_removed_lines(
+        &mut self,
+        base: Entity<Buffer>,
+        main: Entity<Buffer>,
+        range: Range<language::Anchor>,
+        body: String,
+        cx: &mut Context<Self>,
+    ) -> AgentCommentId {
+        self.push(base, range, body, Some(main), cx)
+    }
+
+    fn push(
+        &mut self,
+        buffer: Entity<Buffer>,
+        range: Range<language::Anchor>,
+        body: String,
+        diff_base_of: Option<Entity<Buffer>>,
+        cx: &mut Context<Self>,
+    ) -> AgentCommentId {
         let buffer_id = buffer.read(cx).remote_id();
         if let collections::hash_map::Entry::Vacant(entry) =
             self.buffer_subscriptions.entry(buffer_id)
@@ -184,6 +212,7 @@ impl AgentCommentStore {
             buffer,
             range,
             body,
+            diff_base_of,
         });
         cx.emit(AgentCommentStoreEvent::Changed);
         id
@@ -454,6 +483,16 @@ fn comment_payload(
 ) -> Option<CommentPayload> {
     let buffer = comment.buffer.read(cx);
     let snapshot = buffer.snapshot();
+    if let Some(main) = &comment.diff_base_of {
+        return Some(CommentPayload {
+            source: removed_lines_source(
+                &path_for(main.read(cx), cx)?,
+                &snapshot,
+                comment.offset_range(&snapshot),
+            ),
+            body: comment.body.clone(),
+        });
+    }
     Some(CommentPayload {
         source: CommentSource::Code {
             path: path_for(buffer, cx)?,
@@ -564,6 +603,15 @@ pub fn code_source_for_buffer_range(
     })
 }
 
+/// Describes lines removed from the file at `path`, quoting them from the
+/// diff's base text `base`, since base rows can't be opened in the file.
+fn removed_lines_source(path: &str, base: &BufferSnapshot, range: Range<usize>) -> CommentSource {
+    CommentSource::Quote {
+        label: format!("removed lines of `{path}`").into(),
+        text: base.text_for_range(range).collect(),
+    }
+}
+
 fn comment_rows(buffer: &BufferSnapshot, range: Range<usize>) -> RangeInclusive<u32> {
     let start = buffer.offset_to_point(range.start);
     let mut end = buffer.offset_to_point(range.end);
@@ -638,6 +686,7 @@ fn add_comment(
     buffer: Entity<Buffer>,
     range: Range<language::Anchor>,
     body: String,
+    diff_base_of: Option<Entity<Buffer>>,
     workspace: &WeakEntity<Workspace>,
     cx: &mut App,
 ) {
@@ -647,7 +696,10 @@ fn add_comment(
     let Some(store) = comment_store(Some(&workspace), cx) else {
         return;
     };
-    store.update(cx, |store, cx| store.add(buffer, range, body, cx));
+    store.update(cx, |store, cx| match diff_base_of {
+        Some(main) => store.add_removed_lines(buffer, main, range, body, cx),
+        None => store.add(buffer, range, body, cx),
+    });
     show_comment_added_toast(&workspace, cx);
 }
 
@@ -686,18 +738,36 @@ fn apply_edit_event(
 }
 
 fn refresh_editor_comment_highlights(editor: &mut Editor, cx: &mut Context<Editor>) {
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let store = comment_store(editor.workspace().as_ref(), cx);
+    let multi_buffer = editor.buffer().read(cx);
+    let snapshot = multi_buffer.snapshot(cx);
     let buffer_ids = snapshot.all_buffer_ids().collect::<HashSet<_>>();
-    let ranges = match comment_store(editor.workspace().as_ref(), cx) {
+    let mut ranges = match store {
         Some(store) => store
             .read(cx)
             .comments()
             .iter()
-            .filter(|comment| buffer_ids.contains(&comment.buffer.read(cx).remote_id()))
-            .filter_map(|comment| snapshot.anchor_range_in_buffer(comment.range.clone()))
+            .filter_map(|comment| {
+                comment_multi_buffer_range(
+                    &comment.buffer,
+                    &comment.range,
+                    comment.diff_base_of.as_ref(),
+                    multi_buffer,
+                    &snapshot,
+                    &buffer_ids,
+                    cx,
+                )
+            })
             .collect::<Vec<_>>(),
         None => Vec::new(),
     };
+    // Highlights are searched by binary search, but comments are kept in the
+    // order they were added.
+    ranges.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start, &snapshot)
+            .then_with(|| left.end.cmp(&right.end, &snapshot))
+    });
     if ranges.is_empty() {
         editor.clear_background_highlights(HighlightKey::AgentComment, cx);
         return;
@@ -740,15 +810,131 @@ fn comment_at_cursor(
 ) -> Option<(Entity<AgentCommentStore>, BufferSnapshot, AgentComment)> {
     let store = comment_store(editor.workspace().as_ref(), cx)?;
     let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
-    let (snapshot, range) = multi_buffer_snapshot
-        .anchor_range_to_buffer_anchor_range(editor.selections.newest_anchor().range())?;
-    let range = range.start.to_offset(snapshot)..range.end.to_offset(snapshot);
+    let selection = editor.selections.newest_anchor().range();
+    let (snapshot, range) =
+        multi_buffer_snapshot.anchor_range_to_buffer_anchor_range(selection.clone())?;
+    let (snapshot, range) = match removed_lines_in_range(editor, &selection, snapshot, &range, cx)
+    {
+        Some(removed_lines) => (removed_lines.base.read(cx).snapshot(), removed_lines.range),
+        None => (
+            snapshot.clone(),
+            range.start.to_offset(snapshot)..range.end.to_offset(snapshot),
+        ),
+    };
     let comment = store
         .read(cx)
-        .comments_at(snapshot, range, cx)
+        .comments_at(&snapshot, range, cx)
         .into_iter()
         .next()?;
-    Some((store, snapshot.clone(), comment))
+    Some((store, snapshot, comment))
+}
+
+/// Lines a diff shows as deleted: text of `main`'s diff base `base`.
+struct RemovedLines {
+    base: Entity<Buffer>,
+    main: Entity<Buffer>,
+    range: Range<usize>,
+}
+
+/// The removed lines `selection` covers, when both its ends are in the
+/// deleted text of one diff hunk. `buffer_snapshot` and `buffer_range` are
+/// `selection` in the buffer the multibuffer shows there.
+fn removed_lines_in_range(
+    editor: &Editor,
+    selection: &Range<editor::Anchor>,
+    buffer_snapshot: &BufferSnapshot,
+    buffer_range: &Range<language::Anchor>,
+    cx: &App,
+) -> Option<RemovedLines> {
+    let multi_buffer = editor.buffer().read(cx);
+    let buffer_id = buffer_snapshot.remote_id();
+    let diff = multi_buffer.diff_for(buffer_id)?;
+    let diff = diff.read(cx);
+    let (base, main, base_range) = if diff.buffer_id == buffer_id {
+        // Deleted rows shown between the current rows keep their base text
+        // positions only in the anchors' diff base anchors.
+        let start = selection.start.diff_base_anchor()?;
+        let end = selection.end.diff_base_anchor()?;
+        let base = diff.base_text_buffer().clone();
+        let base_snapshot = base.read(cx).snapshot();
+        if !base_snapshot.can_resolve(&start) || !base_snapshot.can_resolve(&end) {
+            return None;
+        }
+        let main = multi_buffer.buffer(buffer_id)?;
+        (
+            base,
+            main,
+            start.to_offset(&base_snapshot)..end.to_offset(&base_snapshot),
+        )
+    } else {
+        // The left side of a split diff shows the base text itself.
+        let base = multi_buffer.buffer(buffer_id)?;
+        let main = multi_buffer.inverted_diff_main_buffer(buffer_id)?;
+        (
+            base,
+            main,
+            buffer_range.start.to_offset(buffer_snapshot)
+                ..buffer_range.end.to_offset(buffer_snapshot),
+        )
+    };
+    let main_snapshot = main.read(cx).snapshot();
+    deleted_hunk_containing(&diff.snapshot(cx), &base_range, &main_snapshot)?;
+    Some(RemovedLines {
+        base,
+        main,
+        range: base_range,
+    })
+}
+
+/// The hunk whose deleted text contains `base_range`.
+fn deleted_hunk_containing(
+    diff: &BufferDiffSnapshot,
+    base_range: &Range<usize>,
+    main: &BufferSnapshot,
+) -> Option<DiffHunk> {
+    diff.hunks_intersecting_base_text_range(base_range.clone(), main)
+        .find(|hunk| {
+            !hunk.diff_base_byte_range.is_empty()
+                && hunk.diff_base_byte_range.start <= base_range.start
+                && base_range.end <= hunk.diff_base_byte_range.end
+        })
+}
+
+/// Where a comment on `range` of `buffer` shows in `snapshot`, if it does.
+/// A comment on removed lines shows on the deleted rows of its hunk, when
+/// `main`'s diff is expanded there.
+fn comment_multi_buffer_range(
+    buffer: &Entity<Buffer>,
+    range: &Range<language::Anchor>,
+    diff_base_of: Option<&Entity<Buffer>>,
+    multi_buffer: &MultiBuffer,
+    snapshot: &MultiBufferSnapshot,
+    buffer_ids: &HashSet<BufferId>,
+    cx: &App,
+) -> Option<Range<editor::Anchor>> {
+    if buffer_ids.contains(&buffer.read(cx).remote_id()) {
+        return snapshot.anchor_range_in_buffer(range.clone());
+    }
+    let main = diff_base_of?;
+    let main_id = main.read(cx).remote_id();
+    if !buffer_ids.contains(&main_id) {
+        return None;
+    }
+    let diff = multi_buffer.diff_for(main_id)?;
+    let diff = diff.read(cx);
+    if diff.base_text_buffer() != buffer {
+        return None;
+    }
+    let base_snapshot = buffer.read(cx).snapshot();
+    let base_range = range.start.to_offset(&base_snapshot)..range.end.to_offset(&base_snapshot);
+    let main_snapshot = main.read(cx).snapshot();
+    let hunk = deleted_hunk_containing(&diff.snapshot(cx), &base_range, &main_snapshot)?;
+    let position = hunk.buffer_range.start;
+    let position = snapshot.anchor_range_in_buffer(position..position)?;
+    Some(
+        position.start.with_diff_base_anchor(range.start)
+            ..position.end.with_diff_base_anchor(range.end),
+    )
 }
 
 pub fn init(cx: &mut App) {
@@ -873,11 +1059,22 @@ fn toggle_editor_comment(
         return;
     }
     let multi_buffer_snapshot = display_snapshot.buffer_snapshot();
-    let Some((buffer_snapshot, range)) = multi_buffer_snapshot
-        .anchor_range_to_buffer_anchor_range(editor.selections.newest_anchor().range())
+    let selection_range = editor.selections.newest_anchor().range();
+    let Some((buffer_snapshot, range)) =
+        multi_buffer_snapshot.anchor_range_to_buffer_anchor_range(selection_range.clone())
     else {
         return;
     };
+    if let Some(removed_lines) = removed_lines_in_range(
+        editor,
+        &selection_range,
+        buffer_snapshot,
+        &range,
+        cx,
+    ) {
+        comment_on_removed_lines(editor, removed_lines, open_input, window, cx);
+        return;
+    }
     let Some(buffer) = editor.buffer().read(cx).buffer(buffer_snapshot.remote_id()) else {
         return;
     };
@@ -906,7 +1103,14 @@ fn toggle_editor_comment(
         cx,
         move |event, cx| {
             if let CommentInputEvent::Submitted(body) = event {
-                add_comment(buffer.clone(), range.clone(), body.clone(), &workspace, cx);
+                add_comment(
+                    buffer.clone(),
+                    range.clone(),
+                    body.clone(),
+                    None,
+                    &workspace,
+                    cx,
+                );
             }
         },
     );
@@ -921,16 +1125,102 @@ fn block_anchor_after_line(
 ) -> Option<editor::Anchor> {
     let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
     let end = multi_buffer_snapshot.anchor_in_buffer(anchor)?;
-    let end_point = end.to_point(&multi_buffer_snapshot);
+    Some(block_anchor_after_row(&multi_buffer_snapshot, end))
+}
+
+/// The end of the multibuffer line containing `end`.
+fn block_anchor_after_row(snapshot: &MultiBufferSnapshot, end: editor::Anchor) -> editor::Anchor {
+    let end_point = end.to_point(snapshot);
     let mut end_row = end_point.row;
     // A range ending at the start of a line doesn't include that line.
     if end_point.column == 0 && end_row > 0 {
         end_row -= 1;
     }
-    Some(multi_buffer_snapshot.anchor_after(BufferPoint::new(
+    snapshot.anchor_after(BufferPoint::new(
         end_row,
-        multi_buffer_snapshot.line_len(MultiBufferRow(end_row)),
-    )))
+        snapshot.line_len(MultiBufferRow(end_row)),
+    ))
+}
+
+/// The end of the last deleted row a comment on removed lines shows on.
+fn removed_lines_block_anchor(
+    editor: &Editor,
+    base: &Entity<Buffer>,
+    range: &Range<language::Anchor>,
+    main: &Entity<Buffer>,
+    cx: &App,
+) -> Option<editor::Anchor> {
+    let multi_buffer = editor.buffer().read(cx);
+    let snapshot = multi_buffer.snapshot(cx);
+    let buffer_ids = snapshot.all_buffer_ids().collect::<HashSet<_>>();
+    let range = comment_multi_buffer_range(
+        base,
+        range,
+        Some(main),
+        multi_buffer,
+        &snapshot,
+        &buffer_ids,
+        cx,
+    )?;
+    Some(block_anchor_after_row(&snapshot, range.end))
+}
+
+fn removed_lines_title_source(
+    main: &Entity<Buffer>,
+    base: &BufferSnapshot,
+    range: Range<usize>,
+    cx: &App,
+) -> Option<CommentSource> {
+    let file = main.read(cx).file()?;
+    let path = file.path().display(file.path_style(cx));
+    Some(removed_lines_source(&path, base, range))
+}
+
+fn comment_on_removed_lines(
+    editor: &mut Editor,
+    removed_lines: RemovedLines,
+    open_input: &OpenInputSlot,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let RemovedLines { base, main, range } = removed_lines;
+    let base_snapshot = base.read(cx).snapshot();
+    let anchor_range = comment_anchor_range(&base_snapshot, range.clone());
+    let Some(source) = removed_lines_title_source(&main, &base_snapshot, range, cx) else {
+        log::warn!("agent comment: removed lines are not from a file");
+        return;
+    };
+    let Some(workspace) = editor.workspace().map(|workspace| workspace.downgrade()) else {
+        return;
+    };
+    let Some(block_anchor) = removed_lines_block_anchor(editor, &base, &anchor_range, &main, cx)
+    else {
+        return;
+    };
+    let input = cx.new(|cx| CommentInput::new(source.title(), window, cx));
+    show_input_block(
+        editor,
+        block_anchor,
+        OpenInput {
+            input,
+            comment_id: None,
+        },
+        open_input,
+        window,
+        cx,
+        move |event, cx| {
+            if let CommentInputEvent::Submitted(body) = event {
+                add_comment(
+                    base.clone(),
+                    anchor_range.clone(),
+                    body.clone(),
+                    Some(main.clone()),
+                    &workspace,
+                    cx,
+                );
+            }
+        },
+    );
 }
 
 fn edit_comment_at_cursor(
@@ -942,11 +1232,22 @@ fn edit_comment_at_cursor(
     let Some((store, snapshot, comment)) = comment_at_cursor(editor, cx) else {
         return;
     };
-    let Some(source) = code_source_for_buffer_range(&snapshot, comment.offset_range(&snapshot), cx)
-    else {
+    let source = match &comment.diff_base_of {
+        Some(main) => {
+            removed_lines_title_source(main, &snapshot, comment.offset_range(&snapshot), cx)
+        }
+        None => code_source_for_buffer_range(&snapshot, comment.offset_range(&snapshot), cx),
+    };
+    let Some(source) = source else {
         return;
     };
-    let Some(block_anchor) = block_anchor_after_line(editor, comment.range.end, cx) else {
+    let block_anchor = match &comment.diff_base_of {
+        Some(main) => {
+            removed_lines_block_anchor(editor, &comment.buffer, &comment.range, main, cx)
+        }
+        None => block_anchor_after_line(editor, comment.range.end, cx),
+    };
+    let Some(block_anchor) = block_anchor else {
         return;
     };
     let store = store.downgrade();
@@ -1277,7 +1578,14 @@ impl CommentPopover {
         let input = cx.new(|cx| CommentInput::new(source.title(), window, cx));
         let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
             if let CommentInputEvent::Submitted(body) = event {
-                add_comment(buffer.clone(), range.clone(), body.clone(), &workspace, cx);
+                add_comment(
+                    buffer.clone(),
+                    range.clone(),
+                    body.clone(),
+                    None,
+                    &workspace,
+                    cx,
+                );
             }
             on_close(view, window, cx);
         });
@@ -1930,7 +2238,8 @@ mod tests {
 
     mod editor_tests {
         use super::*;
-        use editor::SelectionEffects;
+        use buffer_diff::BufferDiff;
+        use editor::{SelectionEffects, actions::ExpandAllDiffHunks};
         use fs::FakeFs;
         use gpui::{UpdateGlobal as _, VisualTestContext};
         use project::Project;
@@ -2314,6 +2623,183 @@ mod tests {
                 weak_other_store.upgrade().is_none(),
                 "the store goes with its workspace"
             );
+        }
+
+        async fn open_editor_with_diff<'a>(
+            head_text: &str,
+            text: &str,
+            cx: &'a mut TestAppContext,
+        ) -> (Entity<Editor>, &'a mut VisualTestContext) {
+            let (editor, cx) = open_editor(text, cx).await;
+            editor.update_in(cx, |editor, window, cx| {
+                let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
+                let diff = cx.new(|cx| {
+                    BufferDiff::new_with_base_text(
+                        head_text,
+                        &buffer.read(cx).text_snapshot(),
+                        cx,
+                    )
+                });
+                editor
+                    .buffer()
+                    .update(cx, |multi_buffer, cx| multi_buffer.add_diff(diff, cx));
+                editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+            });
+            cx.run_until_parked();
+            (editor, cx)
+        }
+
+        fn comment_on_selection(body: &str, cx: &mut VisualTestContext) {
+            cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
+            cx.run_until_parked();
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input(body);
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+        }
+
+        /// Each comment's text and whether it's on removed lines.
+        fn comment_texts(
+            store: &Entity<AgentCommentStore>,
+            cx: &mut VisualTestContext,
+        ) -> Vec<(String, bool)> {
+            store.read_with(cx, |store, cx| {
+                store
+                    .comments()
+                    .iter()
+                    .map(|comment| {
+                        let snapshot = comment.buffer.read(cx).snapshot();
+                        let text = snapshot
+                            .text_for_range(comment.offset_range(&snapshot))
+                            .collect::<String>();
+                        (text, comment.diff_base_of.is_some())
+                    })
+                    .collect()
+            })
+        }
+
+        fn highlighted_rows(
+            editor: &Entity<Editor>,
+            cx: &mut VisualTestContext,
+        ) -> Vec<Range<u32>> {
+            editor.update_in(cx, |editor, window, cx| {
+                editor
+                    .all_text_background_highlights(window, cx)
+                    .into_iter()
+                    .map(|(range, _)| range.start.row().0..range.end.row().0)
+                    .collect()
+            })
+        }
+
+        #[gpui::test]
+        async fn test_comment_on_removed_lines(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor_with_diff("one\nold\ntwo\n", "one\ntwo\n", cx).await;
+            let store = enable_comments(&editor, cx);
+
+            select(&editor, 4..7, cx);
+            comment_on_selection("Why removed?", cx);
+            assert_eq!(comment_texts(&store, cx), [("old".to_string(), true)]);
+            assert_eq!(highlighted_rows(&editor, cx), [1..1]);
+
+            let payloads = cx.update(|_, cx| {
+                store
+                    .read(cx)
+                    .pending_comments(None, |_, _| Some("main.rs".into()), cx)
+            });
+            assert_eq!(
+                payloads,
+                [CommentPayload {
+                    source: CommentSource::Quote {
+                        label: "removed lines of `main.rs`".into(),
+                        text: "old".to_string(),
+                    },
+                    body: "Why removed?".to_string(),
+                }]
+            );
+            let skipped = cx.update(|_, cx| store.read(cx).pending_comments(None, |_, _| None, cx));
+            assert!(skipped.is_empty());
+
+            select(&editor, 5..5, cx);
+            cx.run_until_parked();
+            assert!(buttons(&editor, cx).1, "cursor inside the comment");
+
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            assert!(!editor_focused(&editor, cx), "the comment opens for editing");
+            cx.simulate_input(" Still needed.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(comment_texts(&store, cx), [("old".to_string(), true)]);
+            assert_eq!(bodies(&store, cx), ["Why removed? Still needed."]);
+        }
+
+        #[gpui::test]
+        async fn test_selection_beyond_removed_lines_comments_current_text(
+            cx: &mut TestAppContext,
+        ) {
+            let (editor, cx) = open_editor_with_diff("one\nold\ntwo\n", "one\ntwo\n", cx).await;
+            let store = enable_comments(&editor, cx);
+
+            select(&editor, 4..10, cx);
+            comment_on_selection("Mixed.", cx);
+            assert_eq!(comment_texts(&store, cx), [("tw".to_string(), false)]);
+
+            select(&editor, 0..3, cx);
+            comment_on_selection("Current.", cx);
+            assert_eq!(
+                comment_texts(&store, cx),
+                [("tw".to_string(), false), ("one".to_string(), false)]
+            );
+            assert_eq!(highlighted_rows(&editor, cx), [0..0, 2..2]);
+        }
+
+        #[gpui::test]
+        async fn test_removed_lines_comment_goes_when_head_loses_them(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor_with_diff("one\nold\ntwo\n", "one\ntwo\n", cx).await;
+            let store = enable_comments(&editor, cx);
+            select(&editor, 4..7, cx);
+            comment_on_selection("Why removed?", cx);
+            assert_eq!(bodies(&store, cx), ["Why removed?"]);
+
+            let base = store.read_with(cx, |store, _| {
+                store.comments().first().expect("a comment").buffer.clone()
+            });
+            base.update(cx, |base, cx| base.edit([(4..8, "")], None, cx));
+            cx.run_until_parked();
+            assert!(bodies(&store, cx).is_empty());
+            assert!(highlighted_rows(&editor, cx).is_empty());
+        }
+
+        #[gpui::test]
+        async fn test_highlights_are_sorted(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+            let store = enable_comments(&editor, cx);
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
+                let snapshot = buffer.read(cx).snapshot();
+                store.update(cx, |store, cx| {
+                    for (range, body) in [(8..13, "Three."), (0..3, "One.")] {
+                        let range = comment_anchor_range(&snapshot, range);
+                        store.add(buffer.clone(), range, body.to_string(), cx);
+                    }
+                });
+            });
+            cx.run_until_parked();
+            let first_word_highlights = editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let multi_buffer_snapshot = snapshot.buffer_snapshot();
+                let search_range = multi_buffer_snapshot.anchor_before(editor::MultiBufferOffset(0))
+                    ..multi_buffer_snapshot.anchor_after(editor::MultiBufferOffset(4));
+                editor
+                    .background_highlights_in_range(
+                        search_range,
+                        &snapshot.display_snapshot,
+                        cx.theme(),
+                    )
+                    .len()
+            });
+            assert_eq!(first_word_highlights, 1);
         }
     }
 }

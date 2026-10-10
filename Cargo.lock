@@ -380,6 +380,7 @@ name = "agent_comments"
 version = "0.1.0"
 dependencies = [
  "agent_settings",
+ "buffer_diff",
  "collections",
  "db",
  "editor",

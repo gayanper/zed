@@ -2323,6 +2323,15 @@ impl MultiBuffer {
         self.diffs.get(&buffer_id).map(|state| state.diff.clone())
     }
 
+    /// The buffer whose diff base `base_text_buffer_id` is, when it was added
+    /// with [`Self::add_inverted_diff`].
+    pub fn inverted_diff_main_buffer(
+        &self,
+        base_text_buffer_id: BufferId,
+    ) -> Option<Entity<language::Buffer>> {
+        self.diffs.get(&base_text_buffer_id)?.main_buffer.clone()
+    }
+
     pub fn expand_diff_hunks(&mut self, ranges: Vec<Range<Anchor>>, cx: &mut Context<Self>) {
         self.expand_or_collapse_diff_hunks(ranges, true, cx);
     }
