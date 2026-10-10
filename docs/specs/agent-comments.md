@@ -125,6 +125,15 @@ The icon comes back as soon as a thread becomes visible. Validated in the proof 
 - The tint shows in every editor that displays the buffer, including split panes and multibuffers that contain an excerpt of it. The scrollbar marker shows only in single-buffer editors, like the other middle-column markers.
 - The marker is controlled by `"scrollbar": { "agent_comments": true }` (default `true`, also in the settings UI under Scrollbar). With `show: "auto"`, comments make the scrollbar visible. Turning the marker off leaves only the tint.
 - Comments don't draw in the left gutter, so they never cover git diff hunks.
+- Ranges are sorted in multibuffer order before they're handed to the editor, whose highlight lookup is a binary search; comments are kept in the order they were added.
+
+**Comments on removed lines**
+- A selection whose both ends are in the deleted text of one diff hunk comments on the removed lines: in a diff with expanded hunks (project, commit and branch diffs, or hunks expanded in a file), and on the left side of a split diff.
+- The comment is stored against the diff's base text buffer (`BufferDiff::base_text_buffer`: HEAD for working-tree diffs, the parent or merge base for commit and branch diffs), with `diff_base_of` naming the file's buffer. A working-tree diff's base text buffer is edited in place when HEAD changes, so a comment whose text leaves HEAD collapses and is removed like any other.
+- Known limitation: the project holds diffs weakly. If every view of a diff closes and it is opened again, the new diff has a new base text buffer, and older removed-lines comments no longer tint or open for editing there. They are still sent to the agent and can be cleared from the agent panel.
+- The tint shows on the deleted rows wherever the hunk is expanded, and on the left side of a split diff.
+- The agent gets `From removed lines of `path`:` followed by the quoted removed text, since base text rows can't be opened in the file.
+- Any other selection keeps the usual behavior: one that also covers current rows comments on the current-file part only, and one on unchanged rows of a split diff's left side adds nothing.
 
 ### Markdown preview
 
