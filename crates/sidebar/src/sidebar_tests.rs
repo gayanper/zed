@@ -698,7 +698,12 @@ fn visible_entries_as_strings(
                     ListEntry::Terminal(terminal) => {
                         let title = terminal.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
-                        format!("  {title}{worktree}{selected}")
+                        let indent = if terminal.is_nested_sub_terminal {
+                            "    "
+                        } else {
+                            "  "
+                        };
+                        format!("{indent}{title}{worktree}{selected}")
                     }
                 }
             })
@@ -1519,10 +1524,11 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             thread("b-newest"),
         ];
 
-        let neighbor_session = |position: usize| match s.neighboring_activatable_entry(position) {
-            Some(ActivatableEntry::Thread { metadata, .. }) => metadata.session_id,
-            _ => None,
-        };
+        let neighbor_session =
+            |position: usize| match s.neighboring_activatable_entry(position, &[]) {
+                Some(ActivatableEntry::Thread { metadata, .. }) => metadata.session_id,
+                _ => None,
+            };
 
         assert_eq!(
             neighbor_session(2),
@@ -2421,6 +2427,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         remote_connection: None,
         working_directory: None,
         init_command: None,
+        parent_terminal_id: None,
     };
 
     cx.update(|_, cx| {
@@ -3653,6 +3660,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         remote_connection: None,
         working_directory: None,
         init_command: None,
+        parent_terminal_id: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3761,6 +3769,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         remote_connection: None,
         working_directory: None,
         init_command: None,
+        parent_terminal_id: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3831,6 +3840,17 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
 
 #[gpui::test]
 async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut TestAppContext) {
+    archive_closed_linked_worktree_terminal(false, cx).await;
+}
+
+#[gpui::test]
+async fn test_archive_selected_parent_terminal_archives_closed_linked_worktree(
+    cx: &mut TestAppContext,
+) {
+    archive_closed_linked_worktree_terminal(true, cx).await;
+}
+
+async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -3892,8 +3912,19 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
             panel.insert_test_terminal("Feature Terminal", true, window, cx)
         })
         .expect("test terminal should be inserted");
+    let sub_terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Feature Sub Terminal", true, window, cx)
+        })
+        .expect("test sub terminal should be inserted");
     panel.update_in(cx, |panel, window, cx| {
         panel.close_terminal(terminal_id, window, cx);
+        panel.close_terminal(sub_terminal_id, window, cx);
+    });
+    cx.update(|_, cx| {
+        TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.delete(sub_terminal_id, cx);
+        });
     });
     let worktree_folder_paths =
         PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
@@ -3910,10 +3941,20 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         remote_connection: None,
         working_directory: None,
         init_command: None,
+        parent_terminal_id: None,
+    };
+    let sub_terminal_metadata = TerminalThreadMetadata {
+        terminal_id: sub_terminal_id,
+        title: "Feature Sub Terminal".into(),
+        parent_terminal_id: Some(terminal_id),
+        ..metadata.clone()
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(metadata, cx);
+            if with_sub_terminal {
+                store.save(sub_terminal_metadata, cx);
+            }
         });
     });
     let empty_draft_id = save_draft_metadata_with_main_paths(
@@ -3972,6 +4013,16 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
     assert!(
         terminal_metadata_deleted,
         "terminal metadata should be deleted after closing from the sidebar"
+    );
+    let sub_terminal_metadata_deleted = cx.update(|_, cx| {
+        TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(sub_terminal_id)
+            .is_none()
+    });
+    assert!(
+        sub_terminal_metadata_deleted,
+        "sub terminal metadata should be deleted with its parent"
     );
     let empty_draft_metadata_deleted = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -4394,6 +4445,287 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec!["v [my-project]", "  Build"]
+    );
+}
+
+fn terminal_entry(
+    sidebar: &Entity<Sidebar>,
+    terminal_id: TerminalId,
+    cx: &mut gpui::VisualTestContext,
+) -> TerminalEntry {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some(terminal.clone())
+                }
+                _ => None,
+            })
+            .expect("terminal should be visible in sidebar")
+    })
+}
+
+#[gpui::test]
+async fn test_sub_terminals_render_under_parent_oldest_first(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Other", true, window, cx)
+        })
+        .expect("other terminal should be inserted");
+    for title in ["Child 1", "Child 2"] {
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.insert_test_sub_terminal(parent_id, title, window, cx)
+            })
+            .expect("sub terminal should be inserted");
+    }
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Other",
+            "  Parent",
+            "    Child 1",
+            "    Child 2",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_orphan_sub_terminal_renders_top_level(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_sub_terminal(parent_id, "Orphan", window, cx)
+        })
+        .expect("sub terminal should be inserted");
+    cx.run_until_parked();
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.remove_panel(&panel, window, cx);
+    });
+    cx.update(|_, cx| {
+        TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.delete(parent_id, cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Orphan"]
+    );
+}
+
+#[gpui::test]
+async fn test_sub_terminals_with_filtered_out_parent_render_unindented(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Server", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    for title in ["Child Alpha", "Child Beta"] {
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.insert_test_sub_terminal(parent_id, title, window, cx)
+            })
+            .expect("sub terminal should be inserted");
+    }
+    cx.run_until_parked();
+
+    type_in_search(&sidebar, "child", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Child Beta  <== selected",
+            "  Child Alpha",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_parent_terminal_close_event_closes_sub_terminals(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    let child_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+        })
+        .expect("sub terminal should be inserted");
+    cx.run_until_parked();
+
+    panel.update(cx, |panel, cx| {
+        panel.emit_test_terminal_close(parent_id, cx);
+    });
+    cx.run_until_parked();
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(!panel.has_terminal(parent_id));
+        assert!(
+            !panel.has_terminal(child_id),
+            "the parent shell exiting should close its sub terminals"
+        );
+    });
+    sidebar.read_with(cx, |_sidebar, cx| {
+        assert!(
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(child_id)
+                .is_none()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_new_sub_terminal_button_only_on_loaded_parent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    let child_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+        })
+        .expect("sub terminal should be inserted");
+    cx.run_until_parked();
+
+    assert!(terminal_entry(&sidebar, parent_id, cx).can_start_sub_terminal());
+    assert!(!terminal_entry(&sidebar, child_id, cx).can_start_sub_terminal());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.remove_panel(&panel, window, cx);
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert!(!terminal_entry(&sidebar, parent_id, cx).can_start_sub_terminal());
+}
+
+#[gpui::test]
+async fn test_closing_parent_closes_sub_terminals(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let other_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Other", true, window, cx)
+        })
+        .expect("other terminal should be inserted");
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    let child_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+        })
+        .expect("sub terminal should be inserted");
+    cx.run_until_parked();
+
+    let parent = terminal_entry(&sidebar, parent_id, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.close_terminal(&parent.metadata, &parent.workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(!panel.has_terminal(parent_id));
+        assert!(!panel.has_terminal(child_id));
+        assert!(panel.has_terminal(other_id));
+    });
+    sidebar.read_with(cx, |_sidebar, cx| {
+        let store = TerminalThreadMetadataStore::global(cx).read(cx);
+        assert!(store.entry(parent_id).is_none());
+        assert!(store.entry(child_id).is_none());
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Other"]
+    );
+}
+
+#[gpui::test]
+async fn test_closing_sub_terminal_keeps_parent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    let child_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+        })
+        .expect("sub terminal should be inserted");
+    cx.run_until_parked();
+
+    let child = terminal_entry(&sidebar, child_id, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.close_terminal(&child.metadata, &child.workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.has_terminal(parent_id));
+        assert!(!panel.has_terminal(child_id));
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Parent"]
     );
 }
 
@@ -15347,7 +15679,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
                 &worktree_folder_paths,
                 Some(&remote_connection),
                 Some(worktree_thread_id),
-                None,
+                &[],
                 &[],
                 cx,
             )

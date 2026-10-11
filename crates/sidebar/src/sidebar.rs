@@ -412,7 +412,15 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    is_loaded: bool,
+    is_nested_sub_terminal: bool,
     highlight_positions: Vec<usize>,
+}
+
+impl TerminalEntry {
+    fn can_start_sub_terminal(&self) -> bool {
+        self.is_loaded && self.metadata.parent_terminal_id.is_none()
+    }
 }
 
 impl ThreadEntry {
@@ -625,7 +633,7 @@ fn linked_worktree_path_lists_for_workspaces(
 
 fn workspace_has_terminal_metadata_except(
     workspace: &Entity<Workspace>,
-    except_terminal_id: Option<TerminalId>,
+    except_terminal_ids: &[TerminalId],
     cx: &App,
 ) -> bool {
     let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
@@ -640,7 +648,7 @@ fn workspace_has_terminal_metadata_except(
     store
         .read(cx)
         .entries_for_path(&path_list, remote_connection.as_ref())
-        .any(|terminal| except_terminal_id != Some(terminal.terminal_id))
+        .any(|terminal| !except_terminal_ids.contains(&terminal.terminal_id))
 }
 
 #[derive(Clone)]
@@ -853,6 +861,7 @@ pub struct Sidebar {
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
+    sub_terminal_menu_handles: HashMap<TerminalId, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -1025,6 +1034,7 @@ impl Sidebar {
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
             project_header_new_thread_menu_handles: HashMap::new(),
+            sub_terminal_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
             _subscriptions: Vec::new(),
@@ -1509,15 +1519,15 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    live_terminal_ids.insert(terminal.id);
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                }
             }
         }
 
@@ -1581,11 +1591,14 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let is_loaded = live_terminal_ids.contains(&metadata.terminal_id);
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
+                        is_loaded,
+                        is_nested_sub_terminal: false,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -2143,6 +2156,17 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        let listed_terminal_ids: HashSet<TerminalId> = self
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Terminal(terminal) => Some(terminal.metadata.terminal_id),
+                _ => None,
+            })
+            .collect();
+        self.sub_terminal_menu_handles
+            .retain(|terminal_id, _| listed_terminal_ids.contains(terminal_id));
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -2356,6 +2380,11 @@ impl Sidebar {
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
+                if terminal.can_start_sub_terminal() {
+                    self.sub_terminal_menu_handles
+                        .entry(terminal.metadata.terminal_id)
+                        .or_default();
+                }
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
@@ -4608,7 +4637,11 @@ impl Sidebar {
     /// removed: the nearest activatable entry in the same project section,
     /// below first, then above. Only when that section has no other
     /// activatable entry, the nearest one in the whole list.
-    fn neighboring_activatable_entry(&self, current_position: usize) -> Option<ActivatableEntry> {
+    fn neighboring_activatable_entry(
+        &self,
+        current_position: usize,
+        excluded_terminal_ids: &[TerminalId],
+    ) -> Option<ActivatableEntry> {
         let entries = &self.contents.entries;
         let is_header = |entry: &ListEntry| matches!(entry, ListEntry::ProjectHeader { .. });
 
@@ -4634,6 +4667,13 @@ impl Sidebar {
             let Some(entry) = after
                 .iter()
                 .chain(before.iter().rev())
+                .filter(|entry| {
+                    !matches!(
+                        entry,
+                        ListEntry::Terminal(terminal)
+                            if excluded_terminal_ids.contains(&terminal.metadata.terminal_id)
+                    )
+                })
                 .find_map(ActivatableEntry::from_list_entry)
             else {
                 continue;
@@ -4859,7 +4899,7 @@ impl Sidebar {
         project_group_key: &ProjectGroupKey,
         remote_connection: Option<&RemoteConnectionOptions>,
         except_thread_id: Option<ThreadId>,
-        except_terminal_id: Option<TerminalId>,
+        except_terminal_ids: &[TerminalId],
         cx: &App,
     ) -> bool {
         if folder_paths.is_empty() || folder_paths == project_group_key.path_list() {
@@ -4886,7 +4926,7 @@ impl Sidebar {
             let terminal_store = terminal_store.read(cx);
             !folder_paths.ordered_paths().any(|path| {
                 terminal_store.path_is_referenced_by_terminal(
-                    except_terminal_id,
+                    except_terminal_ids,
                     path,
                     remote_connection,
                 )
@@ -4936,7 +4976,7 @@ impl Sidebar {
         folder_paths: &PathList,
         remote_connection: Option<&RemoteConnectionOptions>,
         except_thread_id: Option<ThreadId>,
-        except_terminal_id: Option<TerminalId>,
+        except_terminal_ids: &[TerminalId],
         cx: &App,
     ) -> Vec<thread_worktree_archive::RootPlan> {
         let workspaces = self.archive_workspaces(cx);
@@ -4960,7 +5000,7 @@ impl Sidebar {
             .filter(|root| {
                 TerminalThreadMetadataStore::try_global(cx).is_none_or(|terminal_store| {
                     !terminal_store.read(cx).path_is_referenced_by_terminal(
-                        except_terminal_id,
+                        except_terminal_ids,
                         root.root_path.as_path(),
                         remote_connection,
                     )
@@ -4974,7 +5014,7 @@ impl Sidebar {
         folder_paths: &PathList,
         remote_connection: Option<&RemoteConnectionOptions>,
         except_thread_id: Option<ThreadId>,
-        except_terminal_id: Option<TerminalId>,
+        except_terminal_ids: &[TerminalId],
         roots_to_archive: &[thread_worktree_archive::RootPlan],
         cx: &App,
     ) -> Option<Entity<Workspace>> {
@@ -4999,7 +5039,7 @@ impl Sidebar {
                 .read(cx)
                 .workspace_for_paths(folder_paths, remote_connection, cx)?;
 
-        if workspace_has_terminal_metadata_except(&workspace, except_terminal_id, cx) {
+        if workspace_has_terminal_metadata_except(&workspace, except_terminal_ids, cx) {
             return None;
         }
 
@@ -5175,6 +5215,21 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let terminal_id = metadata.terminal_id;
+        let sub_terminal_ids = TerminalThreadMetadataStore::try_global(cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .entries()
+                    .filter(|entry| entry.parent_terminal_id == Some(terminal_id))
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let closing_terminal_ids: Vec<TerminalId> = std::iter::once(terminal_id)
+            .chain(sub_terminal_ids.iter().copied())
+            .collect();
+
         if let ThreadEntryWorkspace::Closed {
             folder_paths,
             project_group_key,
@@ -5184,7 +5239,7 @@ impl Sidebar {
                 project_group_key,
                 metadata.remote_connection.as_ref(),
                 None,
-                Some(metadata.terminal_id),
+                &closing_terminal_ids,
                 cx,
             )
         {
@@ -5206,11 +5261,12 @@ impl Sidebar {
             return;
         }
 
-        let terminal_id = metadata.terminal_id;
-        let is_active = self
-            .active_entry
-            .as_ref()
-            .is_some_and(|entry| entry.is_active_terminal(terminal_id));
+        let is_active = self.active_entry.as_ref().is_some_and(|entry| {
+            entry.is_active_terminal(terminal_id)
+                || sub_terminal_ids
+                    .iter()
+                    .any(|sub_terminal_id| entry.is_active_terminal(*sub_terminal_id))
+        });
         let neighbor = self
             .contents
             .entries
@@ -5222,14 +5278,16 @@ impl Sidebar {
                         if terminal.metadata.terminal_id == terminal_id
                 )
             })
-            .and_then(|position| self.neighboring_activatable_entry(position));
+            .and_then(|position| {
+                self.neighboring_activatable_entry(position, &closing_terminal_ids)
+            });
 
         let terminal_folder_paths = metadata.folder_paths().clone();
         let roots_to_archive = self.roots_to_archive_for_paths(
             metadata.folder_paths(),
             metadata.remote_connection.as_ref(),
             None,
-            Some(terminal_id),
+            &closing_terminal_ids,
             cx,
         );
 
@@ -5237,7 +5295,7 @@ impl Sidebar {
             &terminal_folder_paths,
             metadata.remote_connection.as_ref(),
             None,
-            Some(terminal_id),
+            &closing_terminal_ids,
             &roots_to_archive,
             cx,
         );
@@ -5264,6 +5322,9 @@ impl Sidebar {
             window,
             cx,
             move |this, window, cx| {
+                if !sub_terminal_ids.is_empty() {
+                    this.close_sub_terminals(&sub_terminal_ids, &workspace, window, cx);
+                }
                 if terminal_workspace_removed {
                     this.delete_empty_drafts_for_archive_paths(
                         metadata.folder_paths(),
@@ -5285,6 +5346,32 @@ impl Sidebar {
                 );
             },
         );
+    }
+
+    fn close_sub_terminals(
+        &mut self,
+        sub_terminal_ids: &[TerminalId],
+        workspace: &ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ThreadEntryWorkspace::Open(workspace) = workspace
+            && let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+        {
+            panel.update(cx, |panel, cx| {
+                for sub_terminal_id in sub_terminal_ids {
+                    panel.close_terminal_without_activating_draft(*sub_terminal_id, window, cx);
+                }
+            });
+        }
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                for sub_terminal_id in sub_terminal_ids {
+                    store.delete(*sub_terminal_id, cx);
+                }
+            });
+        }
+        self.update_entries(cx);
     }
 
     fn close_terminal_entry(
@@ -5525,7 +5612,7 @@ impl Sidebar {
                 &project_group_key,
                 metadata.remote_connection.as_ref(),
                 Some(metadata.thread_id),
-                None,
+                &[],
                 cx,
             )
         {
@@ -5555,7 +5642,7 @@ impl Sidebar {
                     metadata.folder_paths(),
                     metadata.remote_connection.as_ref(),
                     thread_id,
-                    None,
+                    &[],
                     cx,
                 )
             })
@@ -5569,7 +5656,7 @@ impl Sidebar {
             _ => false,
         });
         let neighbor =
-            current_pos.and_then(|position| self.neighboring_activatable_entry(position));
+            current_pos.and_then(|position| self.neighboring_activatable_entry(position, &[]));
 
         // Check if archiving this thread would leave its worktree workspace
         // with no threads, requiring workspace removal.
@@ -5580,7 +5667,7 @@ impl Sidebar {
                 folder_paths,
                 thread_remote_connection,
                 thread_id,
-                None,
+                &[],
                 &roots_to_archive,
                 cx,
             )
@@ -5946,20 +6033,56 @@ impl Sidebar {
             }
         }
 
-        let row_entries = terminals
+        let terminal_ids: HashSet<TerminalId> = terminals
+            .iter()
+            .map(|terminal| terminal.metadata.terminal_id)
+            .collect();
+        let (sub_terminals, top_level_terminals): (Vec<_>, Vec<_>) =
+            terminals.into_iter().partition(|terminal| {
+                terminal
+                    .metadata
+                    .parent_terminal_id
+                    .is_some_and(|parent_id| terminal_ids.contains(&parent_id))
+            });
+        let mut sub_terminals_by_parent: HashMap<TerminalId, Vec<TerminalEntry>> = HashMap::new();
+        for terminal in sub_terminals
+            .into_iter()
+            .sorted_by_key(|terminal| terminal.metadata.created_at)
+        {
+            if let Some(parent_id) = terminal.metadata.parent_terminal_id {
+                let terminal = TerminalEntry {
+                    is_nested_sub_terminal: true,
+                    ..terminal
+                };
+                sub_terminals_by_parent
+                    .entry(parent_id)
+                    .or_default()
+                    .push(terminal);
+            }
+        }
+
+        let row_entries = top_level_terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
 
         for entry in row_entries {
-            if let ListEntry::Thread(thread) = &entry {
-                if let Some(session_id) = &thread.metadata.session_id {
-                    current_session_ids.insert(session_id.clone());
+            let sub_terminals = match &entry {
+                ListEntry::Thread(thread) => {
+                    if let Some(session_id) = &thread.metadata.session_id {
+                        current_session_ids.insert(session_id.clone());
+                    }
+                    current_thread_ids.insert(thread.metadata.thread_id);
+                    None
                 }
-                current_thread_ids.insert(thread.metadata.thread_id);
-            }
+                ListEntry::Terminal(terminal) => {
+                    sub_terminals_by_parent.remove(&terminal.metadata.terminal_id)
+                }
+                ListEntry::ProjectHeader { .. } => None,
+            };
             entries.push(entry);
+            entries.extend(sub_terminals.into_iter().flatten().map(ListEntry::Terminal));
         }
     }
 
@@ -6722,6 +6845,20 @@ impl Sidebar {
         let is_renaming =
             self.rename_target == Some(RenameTarget::Terminal(terminal.metadata.terminal_id));
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
+        let sub_terminal_workspace = match &terminal.workspace {
+            ThreadEntryWorkspace::Open(workspace) if terminal.can_start_sub_terminal() => {
+                Some(workspace.clone())
+            }
+            _ => None,
+        };
+        let is_sub_terminal_menu_open = self
+            .sub_terminal_menu_handles
+            .get(&terminal.metadata.terminal_id)
+            .is_some_and(|handle| handle.is_deployed());
+        let show_actions = (is_hovered || is_sub_terminal_menu_open) && !is_renaming;
+        let new_sub_terminal_button = sub_terminal_workspace
+            .filter(|_| show_actions)
+            .map(|workspace| self.render_new_sub_terminal_button(terminal, workspace, cx));
 
         let display_title = terminal.metadata.display_title();
         let (icon_char, title, highlight_positions) =
@@ -6741,7 +6878,9 @@ impl Sidebar {
             .highlight_positions(highlight_positions)
             .selected(is_active)
             .focused(is_focused)
-            .hovered(is_hovered)
+            // ThreadItem drops its action slot when not hovered, which would unmount
+            // the open sub terminal menu as soon as the mouse moves onto it.
+            .hovered(is_hovered || is_sub_terminal_menu_open)
             .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
                 if *is_hovered {
                     this.hovered_thread_index = Some(ix);
@@ -6753,7 +6892,10 @@ impl Sidebar {
             .when_some(rename_title_editor, |this, title_editor| {
                 this.is_truncated(false).title_slot(title_editor)
             })
-            .when(is_hovered && !is_renaming, |this| {
+            .when_some(new_sub_terminal_button, |this, button| {
+                this.secondary_action_slot(button)
+            })
+            .when(show_actions, |this| {
                 this.action_slot(
                     IconButton::new("close-terminal", IconName::Close)
                         .hover_background(button_hover_bg)
@@ -6795,6 +6937,10 @@ impl Sidebar {
         let terminal_id = terminal.metadata.terminal_id;
         let rename_title = terminal.metadata.editable_title();
         let sidebar = cx.weak_entity();
+
+        let terminal_item = div()
+            .when(terminal.is_nested_sub_terminal, |this| this.pl_4())
+            .child(terminal_item);
 
         right_click_menu(context_menu_id)
             .trigger(move |_, _, _| terminal_item)
@@ -6946,7 +7092,7 @@ impl Sidebar {
                     .as_ref()
                     .and_then(|metadata| metadata.remote_connection.as_ref()),
                 Some(draft_id),
-                None,
+                &[],
                 cx,
             )
         {
@@ -6981,7 +7127,7 @@ impl Sidebar {
                     metadata.folder_paths(),
                     metadata.remote_connection.as_ref(),
                     Some(draft_id),
-                    None,
+                    &[],
                     cx,
                 )
             })
@@ -7001,14 +7147,14 @@ impl Sidebar {
                     ListEntry::Thread(thread) if thread.metadata.thread_id == draft_id
                 )
             })
-            .and_then(|position| self.neighboring_activatable_entry(position));
+            .and_then(|position| self.neighboring_activatable_entry(position, &[]));
 
         let workspace_to_remove = draft_folder_paths.as_ref().and_then(|folder_paths| {
             self.linked_worktree_workspace_to_remove(
                 folder_paths,
                 draft_remote_connection.as_ref(),
                 Some(draft_id),
-                None,
+                &[],
                 &roots_to_archive,
                 cx,
             )
@@ -7206,6 +7352,106 @@ impl Sidebar {
             }
             workspace.focus_panel::<AgentPanel>(window, cx);
         });
+    }
+
+    fn create_new_sub_terminal(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        parent_id: TerminalId,
+        init_command: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace.clone(), None, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.new_sub_terminal(parent_id, init_command, window, cx);
+                });
+            }
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+    }
+
+    fn render_new_sub_terminal_button(
+        &self,
+        terminal: &TerminalEntry,
+        workspace: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let parent_id = terminal.metadata.terminal_id;
+        let menu_handle = self
+            .sub_terminal_menu_handles
+            .get(&parent_id)
+            .cloned()
+            .unwrap_or_default();
+        let color = cx.theme().colors();
+        let button = IconButton::new(
+            SharedString::from(format!("new-sub-terminal-{parent_id}")),
+            IconName::Plus,
+        )
+        .hover_background(color.element_background)
+        .active_background(color.element_active)
+        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+        .size(ButtonSize::Compact)
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Muted);
+
+        let this = cx.weak_entity();
+        PopoverMenu::new(SharedString::from(format!(
+            "new-sub-terminal-menu-{parent_id}"
+        )))
+        .with_handle(menu_handle)
+        .trigger_with_tooltip(button, Tooltip::text("New Sub Terminal"))
+        .anchor(gpui::Anchor::TopLeft)
+        .on_open(Rc::new({
+            let this = this.clone();
+            move |_window, cx| {
+                this.update(cx, |_sidebar, cx| cx.notify()).ok();
+            }
+        }))
+        .menu(move |window, cx| {
+            let this = this.clone();
+            let workspace = workspace.clone();
+            let terminal_profiles = AgentPanel::terminal_profiles(cx);
+            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                terminal_profiles.into_iter().fold(
+                    menu.header("New Sub Terminal"),
+                    |menu, (name, init_command)| {
+                        menu.item(
+                            ContextMenuEntry::new(name)
+                                .icon(IconName::Terminal)
+                                .icon_color(Color::Muted)
+                                .handler({
+                                    let this = this.clone();
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |sidebar, cx| {
+                                            sidebar.selection = None;
+                                            sidebar.create_new_sub_terminal(
+                                                &workspace,
+                                                parent_id,
+                                                init_command.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    }
+                                }),
+                        )
+                    },
+                )
+            }))
+        })
+        .into_any_element()
     }
 
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {

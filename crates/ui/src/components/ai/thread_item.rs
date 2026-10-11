@@ -63,6 +63,7 @@ pub struct ThreadItem {
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
+    secondary_action_slot: Option<AnyElement>,
     base_bg: Option<Hsla>,
 }
 
@@ -98,6 +99,7 @@ impl ThreadItem {
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
+            secondary_action_slot: None,
             base_bg: None,
         }
     }
@@ -239,6 +241,12 @@ impl ThreadItem {
 
     pub fn action_slot(mut self, element: impl IntoElement) -> Self {
         self.action_slot = Some(element.into_any_element());
+        self
+    }
+
+    /// Shown on hover at the end of the metadata row, below the action slot.
+    pub fn secondary_action_slot(mut self, element: impl IntoElement) -> Self {
+        self.secondary_action_slot = Some(element.into_any_element());
         self
     }
 
@@ -487,6 +495,7 @@ impl RenderOnce for ThreadItem {
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
+                        .relative()
                         .gap_1p5()
                         .child(icon_container()) // Icon Spacing
                         .when(self.archived, |this| {
@@ -604,6 +613,34 @@ impl RenderOnce for ThreadItem {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
+                        })
+                        .when(self.hovered, |this| {
+                            this.when_some(self.secondary_action_slot, |this, slot| {
+                                this.child(
+                                    h_flex()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right_0()
+                                        .when(opaque_window, |this| {
+                                            this.child(
+                                                GradientFade::new(base_bg, hover_bg, active_bg)
+                                                    .width(px(64.0))
+                                                    .right(px(8.))
+                                                    .gradient_stop(0.75)
+                                                    .group_name("thread-item"),
+                                            )
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .pr_1p5()
+                                                .child(slot)
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                }),
+                                        ),
+                                )
+                            })
                         }),
                 )
             })
