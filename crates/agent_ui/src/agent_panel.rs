@@ -1029,6 +1029,7 @@ struct AgentTerminal {
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
     init_command: Option<String>,
+    parent_terminal_id: Option<TerminalId>,
     created_at: DateTime<Utc>,
     has_notification: bool,
     search_bar: Option<Entity<BufferSearchBar>>,
@@ -2100,10 +2101,69 @@ impl AgentPanel {
             true,
             true,
             init_command,
+            None,
             source,
             window,
             cx,
         );
+    }
+
+    pub fn new_sub_terminal(
+        &mut self,
+        parent_id: TerminalId,
+        init_command: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        let Some(parent) = self.terminals.get(&parent_id) else {
+            return;
+        };
+        if parent.parent_terminal_id.is_some() {
+            return;
+        }
+        let working_directory = parent
+            .working_directory
+            .clone()
+            .or_else(|| self.terminal_working_directory(None, cx));
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        self.spawn_terminal(
+            TerminalId::new(),
+            working_directory,
+            None,
+            None,
+            None,
+            true,
+            true,
+            init_command,
+            Some(parent_id),
+            AgentThreadSource::Sidebar,
+            window,
+            cx,
+        );
+    }
+
+    pub fn terminal_profiles(cx: &App) -> Vec<(SharedString, Option<String>)> {
+        match &AgentSettings::get_global(cx).terminal_init_command {
+            Some(TerminalInitCommand::Profiles(profiles)) => profiles
+                .iter()
+                .filter(|profile| {
+                    !profile.name.trim().is_empty() && !profile.command.trim().is_empty()
+                })
+                .map(|profile| {
+                    (
+                        SharedString::from(profile.name.clone()),
+                        Some(profile.command.clone()),
+                    )
+                })
+                .collect(),
+            _ => vec![(
+                SharedString::from("Terminal"),
+                Self::default_terminal_init_command(cx),
+            )],
+        }
     }
 
     fn terminal_working_directory(
@@ -2154,6 +2214,7 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         init_command: Option<String>,
+        parent_terminal_id: Option<TerminalId>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2200,6 +2261,7 @@ impl AgentPanel {
                     terminal_view,
                     terminal_working_directory,
                     init_command.clone(),
+                    parent_terminal_id,
                     custom_title,
                     initial_title,
                     created_at,
@@ -2312,6 +2374,7 @@ impl AgentPanel {
         terminal_view: Entity<TerminalView>,
         working_directory: Option<PathBuf>,
         init_command: Option<String>,
+        parent_terminal_id: Option<TerminalId>,
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
@@ -2375,6 +2438,7 @@ impl AgentPanel {
             last_observed_program: None,
             working_directory,
             init_command,
+            parent_terminal_id,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
             search_bar: None,
@@ -2556,6 +2620,7 @@ impl AgentPanel {
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
             init_command: terminal.init_command.clone(),
+            parent_terminal_id: terminal.parent_terminal_id,
         })
     }
 
@@ -2590,6 +2655,7 @@ impl AgentPanel {
             metadata
                 .init_command
                 .or_else(|| Self::default_terminal_init_command(cx)),
+            metadata.parent_terminal_id,
             source,
             window,
             cx,
@@ -5353,6 +5419,7 @@ impl AgentPanel {
             true,
             false,
             Self::default_terminal_init_command(cx),
+            None,
             source,
             window,
             cx,
@@ -5377,6 +5444,7 @@ impl AgentPanel {
             true,
             false,
             Self::default_terminal_init_command(cx),
+            None,
             source,
             window,
             cx,
@@ -6081,21 +6149,7 @@ impl AgentPanel {
                                 }),
                         )
                         .when(supports_terminal, |menu| {
-                            let terminal_profiles = match &AgentSettings::get_global(cx)
-                                .terminal_init_command
-                            {
-                                Some(TerminalInitCommand::Profiles(profiles)) => profiles
-                                    .iter()
-                                    .filter(|profile| {
-                                        !profile.name.trim().is_empty()
-                                            && !profile.command.trim().is_empty()
-                                    })
-                                    .map(|profile| {
-                                        (SharedString::from(profile.name.clone()), Some(profile.command.clone()))
-                                    })
-                                    .collect_vec(),
-                                _ => vec![(SharedString::from("Terminal"), Self::default_terminal_init_command(cx))],
-                            };
+                            let terminal_profiles = Self::terminal_profiles(cx);
                             terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
                                 menu.item(
                                     ContextMenuEntry::new(name)
@@ -7290,7 +7344,40 @@ impl AgentPanel {
             focus,
             focus,
             Self::default_terminal_init_command(cx),
+            None,
             AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        )?;
+        Ok(terminal_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_test_sub_terminal(
+        &mut self,
+        parent_id: TerminalId,
+        title: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalId> {
+        let working_directory = self
+            .terminals
+            .get(&parent_id)
+            .context("parent terminal is not loaded")?
+            .working_directory
+            .clone();
+        let terminal_id = TerminalId::new();
+        self.insert_display_only_terminal(
+            terminal_id,
+            working_directory,
+            Some(SharedString::from(title.into())),
+            None,
+            None,
+            true,
+            false,
+            None,
+            Some(parent_id),
+            AgentThreadSource::Sidebar,
             window,
             cx,
         )?;
@@ -7329,6 +7416,7 @@ impl AgentPanel {
             metadata
                 .init_command
                 .or_else(|| Self::default_terminal_init_command(cx)),
+            metadata.parent_terminal_id,
             source,
             window,
             cx,
@@ -7361,6 +7449,7 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         init_command: Option<String>,
+        parent_terminal_id: Option<TerminalId>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7384,6 +7473,7 @@ impl AgentPanel {
             terminal_view,
             working_directory,
             init_command.clone(),
+            parent_terminal_id,
             custom_title,
             initial_title,
             created_at,
@@ -8153,6 +8243,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -8274,6 +8365,149 @@ mod tests {
         });
     }
 
+    fn insert_test_terminal_with_parent(
+        panel: &Entity<AgentPanel>,
+        working_directory: Option<PathBuf>,
+        parent_terminal_id: Option<TerminalId>,
+        cx: &mut VisualTestContext,
+    ) -> TerminalId {
+        let terminal_id = TerminalId::new();
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .insert_display_only_terminal(
+                    terminal_id,
+                    working_directory,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    None,
+                    parent_terminal_id,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+                .expect("test terminal should be inserted");
+        });
+        terminal_id
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_uses_parent_working_directory_and_parent_id(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_working_directory = PathBuf::from("/project/server");
+        let parent_id = insert_test_terminal_with_parent(
+            &panel,
+            Some(parent_working_directory.clone()),
+            None,
+            &mut cx,
+        );
+
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.new_sub_terminal(parent_id, Some("codex".to_string()), window, cx);
+        });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the sub terminal spawn");
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let child_id = panel
+                .active_terminal_id()
+                .expect("the sub terminal should become active");
+            assert_ne!(child_id, parent_id);
+            let child = panel
+                .terminal_metadata(child_id, cx)
+                .expect("sub terminal metadata should exist");
+            assert_eq!(child.parent_terminal_id, Some(parent_id));
+            assert_eq!(child.working_directory, Some(parent_working_directory));
+            assert_eq!(child.init_command.as_deref(), Some("codex"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_requires_loaded_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_sub_terminal(TerminalId::new(), None, window, cx);
+            assert!(
+                panel.pending_terminal_spawn.is_none(),
+                "no spawn should start for a parent that isn't loaded"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminals(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_rejects_nested_child(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_sub_terminal(child_id, None, window, cx);
+            assert!(
+                panel.pending_terminal_spawn.is_none(),
+                "a sub terminal must not get its own sub terminals"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.terminals(cx).len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_profiles(cx: &mut TestAppContext) {
+        let (_panel, mut cx) = setup_panel(cx).await;
+
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command =
+                Some(TerminalInitCommand::Command("claude".to_string()));
+            AgentSettings::override_global(settings, cx);
+            assert_eq!(
+                AgentPanel::terminal_profiles(cx),
+                vec![(SharedString::from("Terminal"), Some("claude".to_string()))]
+            );
+
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = Some(TerminalInitCommand::Profiles(vec![
+                settings::TerminalInitCommandProfile {
+                    name: "Claude".to_string(),
+                    command: "claude --resume".to_string(),
+                },
+                settings::TerminalInitCommandProfile {
+                    name: " ".to_string(),
+                    command: "unnamed".to_string(),
+                },
+                settings::TerminalInitCommandProfile {
+                    name: "Empty".to_string(),
+                    command: "".to_string(),
+                },
+            ]));
+            AgentSettings::override_global(settings, cx);
+            assert_eq!(
+                AgentPanel::terminal_profiles(cx),
+                vec![(
+                    SharedString::from("Claude"),
+                    Some("claude --resume".to_string())
+                )]
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_restored_terminal_runs_init_command_once(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -8296,6 +8530,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -8373,6 +8608,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: Some("selected-agent --resume".to_string()),
+            parent_terminal_id: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -8439,6 +8675,7 @@ mod tests {
                 true,
                 true,
                 Some("printf 'init_ran_%s\\n' 42".to_string()),
+                None,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -8523,6 +8760,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9941,6 +10179,7 @@ mod tests {
                     true,
                     true,
                     None,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -10205,6 +10444,7 @@ mod tests {
                     true,
                     true,
                     None,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -10324,6 +10564,7 @@ mod tests {
                     None,
                     true,
                     true,
+                    None,
                     None,
                     AgentThreadSource::AgentPanel,
                     window,
@@ -11014,6 +11255,7 @@ mod tests {
                     true,
                     true,
                     None,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -11643,6 +11885,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -11695,6 +11938,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

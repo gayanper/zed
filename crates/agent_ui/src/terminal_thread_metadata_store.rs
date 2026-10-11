@@ -54,6 +54,7 @@ pub struct TerminalThreadMetadata {
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
     pub init_command: Option<String>,
+    pub parent_terminal_id: Option<TerminalId>,
 }
 
 impl TerminalThreadMetadata {
@@ -261,12 +262,12 @@ impl TerminalThreadMetadataStore {
 
     pub fn path_is_referenced_by_terminal(
         &self,
-        terminal_id: Option<TerminalId>,
+        except_terminal_ids: &[TerminalId],
         path: &Path,
         remote_connection: Option<&RemoteConnectionOptions>,
     ) -> bool {
         self.entries().any(|terminal| {
-            Some(terminal.terminal_id) != terminal_id
+            !except_terminal_ids.contains(&terminal.terminal_id)
                 && same_remote_connection_identity(
                     terminal.remote_connection.as_ref(),
                     remote_connection,
@@ -502,6 +503,9 @@ impl Domain for TerminalThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_terminal_threads ADD COLUMN init_command TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN parent_terminal_id TEXT;
+        ),
     ];
 }
 
@@ -512,7 +516,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-             main_worktree_paths_order, remote_connection, init_command \
+             main_worktree_paths_order, remote_connection, init_command, parent_terminal_id \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -547,10 +551,13 @@ impl TerminalThreadMetadataDb {
             .transpose()
             .context("serialize terminal thread remote connection")?;
         let init_command = row.init_command;
+        let parent_terminal_id = row
+            .parent_terminal_id
+            .map(|terminal_id| terminal_id.to_key_string());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, parent_terminal_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -561,7 +568,8 @@ impl TerminalThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                             remote_connection = excluded.remote_connection, \
-                            init_command = excluded.init_command";
+                            init_command = excluded.init_command, \
+                            parent_terminal_id = excluded.parent_terminal_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -573,7 +581,8 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&init_command, i)?;
+            i = stmt.bind(&init_command, i)?;
+            stmt.bind(&parent_terminal_id, i)?;
             stmt.exec()
         })
         .await
@@ -610,6 +619,7 @@ impl Column for TerminalThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (init_command, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (parent_terminal_id, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -650,6 +660,10 @@ impl Column for TerminalThreadMetadata {
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
                 init_command,
+                parent_terminal_id: parent_terminal_id
+                    .as_deref()
+                    .map(TerminalId::from_key_string)
+                    .transpose()?,
             },
             next,
         ))
@@ -680,6 +694,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
+            parent_terminal_id: None,
         }
     }
 
@@ -781,6 +796,53 @@ mod tests {
                     .init_command
                     .as_deref(),
                 Some("claude --resume")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_parent_id_persists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let parent = metadata(
+            "Parent",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let mut child = metadata(
+            "Child",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        child.parent_terminal_id = Some(parent.terminal_id);
+        let parent_id = parent.terminal_id;
+        let child_id = child.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(parent, cx);
+                store.save(child, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store
+                    .entry(child_id)
+                    .expect("child terminal metadata should exist")
+                    .parent_terminal_id,
+                Some(parent_id)
+            );
+            assert_eq!(
+                store
+                    .entry(parent_id)
+                    .expect("parent terminal metadata should exist")
+                    .parent_terminal_id,
+                None
             );
         });
     }
