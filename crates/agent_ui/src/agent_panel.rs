@@ -1182,6 +1182,15 @@ impl BaseView {
     }
 }
 
+enum PendingTerminalRestore {
+    Background,
+    /// The user selected the terminal while it was still spawning.
+    SelectOnLand {
+        focus: bool,
+        selection_generation: usize,
+    },
+}
+
 pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
@@ -1200,6 +1209,10 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    pending_terminal_restores: HashMap<TerminalId, PendingTerminalRestore>,
+    /// Bumped on every view selection, so an async spawn only takes the view when
+    /// nothing was selected after it was requested: the user's last click wins.
+    view_selection_generation: usize,
     #[cfg(test)]
     test_terminal_spawn_gate: Option<futures::channel::oneshot::Receiver<()>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1643,6 +1656,8 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            pending_terminal_restores: HashMap::default(),
+            view_selection_generation: 0,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -2223,7 +2238,11 @@ impl AgentPanel {
         // the terminal lands. Marking the spawn as pending stops
         // `ensure_thread_initialized` from treating a still-uninitialized panel
         // as empty and spawning a second, "initial" terminal on activation.
-        self.pending_terminal_spawn = Some(terminal_id);
+        // Background spawns never become the base view, so they don't count.
+        let selection_generation = self.view_selection_generation;
+        if select {
+            self.pending_terminal_spawn = Some(terminal_id);
+        }
         let terminal_working_directory = working_directory.clone();
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
@@ -2239,6 +2258,7 @@ impl AgentPanel {
                         .update(cx, |workspace, cx| workspace.show_error(error, cx))
                         .log_err();
                     this.update(cx, |this, cx| {
+                        this.pending_terminal_restores.remove(&terminal_id);
                         if this.pending_terminal_spawn == Some(terminal_id) {
                             this.pending_terminal_spawn = None;
                             cx.notify();
@@ -2265,7 +2285,7 @@ impl AgentPanel {
                     custom_title,
                     initial_title,
                     created_at,
-                    select,
+                    select && this.view_selection_generation == selection_generation,
                     focus,
                     source,
                     window,
@@ -2449,6 +2469,13 @@ impl AgentPanel {
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
         }
+        let (select, focus) = match self.pending_terminal_restores.remove(&terminal_id) {
+            Some(PendingTerminalRestore::SelectOnLand {
+                focus,
+                selection_generation,
+            }) if selection_generation == self.view_selection_generation => (true, focus),
+            _ => (select, focus),
+        };
         terminal.refresh_metadata(cx);
         terminal.report_started_terminal_program(terminal_id, source, cx);
         self.terminals.insert(terminal_id, terminal);
@@ -2468,6 +2495,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.supersede_pending_selections();
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
@@ -2638,6 +2666,25 @@ impl AgentPanel {
             return;
         }
 
+        self.supersede_pending_selections();
+        if self.pending_terminal_spawn == Some(metadata.terminal_id)
+            || self
+                .pending_terminal_restores
+                .contains_key(&metadata.terminal_id)
+        {
+            // Already spawning (e.g. from the panel's startup restore or as a
+            // background sub terminal), so select it when it lands instead of
+            // spawning a second shell under the same id.
+            self.pending_terminal_restores.insert(
+                metadata.terminal_id,
+                PendingTerminalRestore::SelectOnLand {
+                    focus,
+                    selection_generation: self.view_selection_generation,
+                },
+            );
+            return;
+        }
+
         if !self.supports_terminal(cx) {
             return;
         }
@@ -2655,6 +2702,96 @@ impl AgentPanel {
             metadata
                 .init_command
                 .or_else(|| Self::default_terminal_init_command(cx)),
+            metadata.parent_terminal_id,
+            source,
+            window,
+            cx,
+        );
+    }
+
+    fn supersede_pending_selections(&mut self) {
+        self.view_selection_generation = self.view_selection_generation.wrapping_add(1);
+    }
+
+    /// Restores the persisted sub terminals of `parent_id` that aren't loaded yet,
+    /// without selecting them, so the parent stays the active terminal.
+    pub fn restore_sub_terminals(
+        &mut self,
+        parent_id: TerminalId,
+        source: AgentThreadSource,
+        workspace: Option<&Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let sub_terminals = store
+            .read(cx)
+            .entries()
+            .filter(|metadata| {
+                metadata.parent_terminal_id == Some(parent_id)
+                    && !self.has_terminal(metadata.terminal_id)
+                    && self.pending_terminal_spawn != Some(metadata.terminal_id)
+                    && !self
+                        .pending_terminal_restores
+                        .contains_key(&metadata.terminal_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for metadata in sub_terminals {
+            self.pending_terminal_restores
+                .insert(metadata.terminal_id, PendingTerminalRestore::Background);
+            self.spawn_background_restored_terminal(metadata, source, workspace, window, cx);
+        }
+    }
+
+    fn spawn_background_restored_terminal(
+        &mut self,
+        metadata: TerminalThreadMetadata,
+        source: AgentThreadSource,
+        workspace: Option<&Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
+        let initial_title = Self::terminal_restore_initial_title(&metadata);
+        let init_command = metadata
+            .init_command
+            .or_else(|| Self::default_terminal_init_command(cx));
+
+        // Unit tests have no real shell to spawn.
+        #[cfg(test)]
+        self.insert_display_only_terminal(
+            metadata.terminal_id,
+            working_directory,
+            metadata.custom_title,
+            initial_title,
+            Some(metadata.created_at),
+            false,
+            false,
+            init_command,
+            metadata.parent_terminal_id,
+            source,
+            window,
+            cx,
+        )
+        .log_err();
+
+        #[cfg(not(test))]
+        self.spawn_terminal(
+            metadata.terminal_id,
+            working_directory,
+            metadata.custom_title,
+            initial_title,
+            Some(metadata.created_at),
+            false,
+            false,
+            init_command,
             metadata.parent_terminal_id,
             source,
             window,
@@ -4510,6 +4647,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.supersede_pending_selections();
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -8362,6 +8500,437 @@ mod tests {
                 panel.pending_terminal_spawn.is_none(),
                 "the pending marker should be cleared once the terminal lands"
             );
+        });
+    }
+
+    fn save_test_sub_terminal_metadata(
+        parent_terminal_id: TerminalId,
+        title: &str,
+        created_at: DateTime<Utc>,
+        init_command: Option<&str>,
+        cx: &mut VisualTestContext,
+    ) -> TerminalId {
+        let metadata = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: SharedString::from(title.to_string()),
+            custom_title: None,
+            created_at,
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/project",
+            )])),
+            remote_connection: None,
+            working_directory: Some(PathBuf::from("/project/server")),
+            init_command: init_command.map(str::to_string),
+            parent_terminal_id: Some(parent_terminal_id),
+        };
+        let terminal_id = metadata.terminal_id;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .update(cx, |store, cx| store.save(metadata, cx));
+        });
+        terminal_id
+    }
+
+    #[gpui::test]
+    async fn test_restore_sub_terminals_keeps_parent_active(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let other_parent_id = TerminalId::new();
+        let now = Utc::now();
+        let newer_child_id =
+            save_test_sub_terminal_metadata(parent_id, "Newer", now, None, &mut cx);
+        let older_child_id = save_test_sub_terminal_metadata(
+            parent_id,
+            "Older",
+            now - chrono::Duration::minutes(1),
+            Some("codex"),
+            &mut cx,
+        );
+        let unrelated_child_id =
+            save_test_sub_terminal_metadata(other_parent_id, "Unrelated", now, None, &mut cx);
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.restore_sub_terminals(parent_id, AgentThreadSource::Sidebar, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert!(panel.has_terminal(older_child_id));
+            assert!(panel.has_terminal(newer_child_id));
+            assert!(!panel.has_terminal(unrelated_child_id));
+            assert!(panel.pending_terminal_restores.is_empty());
+
+            let older_child = panel
+                .terminal_metadata(older_child_id, cx)
+                .expect("restored sub terminal metadata should exist");
+            assert_eq!(older_child.parent_terminal_id, Some(parent_id));
+            assert_eq!(older_child.init_command.as_deref(), Some("codex"));
+            assert_eq!(
+                older_child.working_directory,
+                Some(PathBuf::from("/project/server"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restore_sub_terminals_skips_loaded_and_pending(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let loaded_child_id =
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        let pending_child_id =
+            save_test_sub_terminal_metadata(parent_id, "Pending", Utc::now(), None, &mut cx);
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .pending_terminal_restores
+                .insert(pending_child_id, PendingTerminalRestore::Background);
+            let terminal_count = panel.terminals.len();
+            panel.restore_sub_terminals(parent_id, AgentThreadSource::Sidebar, None, window, cx);
+            assert_eq!(
+                panel.terminals.len(),
+                terminal_count,
+                "loaded and in-flight sub terminals should not be spawned again"
+            );
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.has_terminal(loaded_child_id));
+            assert!(!panel.has_terminal(pending_child_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_terminal_spawn_does_not_mark_pending_base_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        let child_id = TerminalId::new();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel
+                .pending_terminal_restores
+                .insert(child_id, PendingTerminalRestore::Background);
+            panel.spawn_terminal(
+                child_id,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                Some(parent_id),
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+            assert!(
+                panel.pending_terminal_spawn.is_none(),
+                "a background spawn must not stand in for the base view"
+            );
+        });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the sub terminal spawn");
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert!(panel.has_terminal(child_id));
+            assert!(panel.pending_terminal_restores.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restoring_in_flight_sub_terminal_selects_it_when_it_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = TerminalId::new();
+        let child_metadata = child_terminal_metadata(child_id, parent_id);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .pending_terminal_restores
+                .insert(child_id, PendingTerminalRestore::Background);
+            let terminal_count = panel.terminals.len();
+            panel.restore_terminal(
+                child_metadata,
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel.terminals.len(),
+                terminal_count,
+                "an in-flight sub terminal must not be spawned a second time"
+            );
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+
+            panel
+                .insert_display_only_terminal(
+                    child_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    Some(parent_id),
+                    AgentThreadSource::Sidebar,
+                    window,
+                    cx,
+                )
+                .expect("test terminal should be inserted");
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.active_terminal_id(), Some(child_id));
+            assert!(panel.pending_terminal_restores.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_later_activation_cancels_in_flight_sub_terminal_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = TerminalId::new();
+        let child_metadata = child_terminal_metadata(child_id, parent_id);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .pending_terminal_restores
+                .insert(child_id, PendingTerminalRestore::Background);
+            let terminal_count = panel.terminals.len();
+            panel.restore_terminal(
+                child_metadata,
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel.terminals.len(),
+                terminal_count,
+                "an in-flight sub terminal must not be spawned a second time"
+            );
+            panel.activate_terminal(parent_id, true, window, cx);
+            panel
+                .insert_display_only_terminal(
+                    child_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    Some(parent_id),
+                    AgentThreadSource::Sidebar,
+                    window,
+                    cx,
+                )
+                .expect("test terminal should be inserted");
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert!(panel.has_terminal(child_id));
+        });
+    }
+
+    fn child_terminal_metadata(
+        terminal_id: TerminalId,
+        parent_terminal_id: TerminalId,
+    ) -> TerminalThreadMetadata {
+        TerminalThreadMetadata {
+            terminal_id,
+            title: "Child".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/project",
+            )])),
+            remote_connection: None,
+            working_directory: None,
+            init_command: None,
+            parent_terminal_id: Some(parent_terminal_id),
+        }
+    }
+
+    fn land_test_sub_terminal(
+        panel: &mut AgentPanel,
+        terminal_id: TerminalId,
+        parent_terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<AgentPanel>,
+    ) {
+        panel
+            .insert_display_only_terminal(
+                terminal_id,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                Some(parent_terminal_id),
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            )
+            .expect("test terminal should be inserted");
+    }
+
+    #[gpui::test]
+    async fn test_draft_activation_cancels_in_flight_sub_terminal_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = TerminalId::new();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .pending_terminal_restores
+                .insert(child_id, PendingTerminalRestore::Background);
+            panel.restore_terminal(
+                child_terminal_metadata(child_id, parent_id),
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+            land_test_sub_terminal(panel, child_id, parent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.has_terminal(child_id));
+            assert_eq!(
+                panel.active_terminal_id(),
+                None,
+                "the draft was the last selection, so it should keep the view"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_late_parent_spawn_does_not_override_later_sub_terminal_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = TerminalId::new();
+        let child_id = TerminalId::new();
+        let parent_metadata = TerminalThreadMetadata {
+            parent_terminal_id: None,
+            title: "Parent".into(),
+            ..child_terminal_metadata(parent_id, parent_id)
+        };
+
+        let (parent_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.restore_terminal(
+                parent_metadata,
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            panel
+                .pending_terminal_restores
+                .insert(child_id, PendingTerminalRestore::Background);
+            panel.restore_terminal(
+                child_terminal_metadata(child_id, parent_id),
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            land_test_sub_terminal(panel, child_id, parent_id, window, cx);
+        });
+        parent_landed
+            .send(())
+            .expect("the panel should be waiting on the parent spawn");
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.has_terminal(parent_id));
+            assert_eq!(
+                panel.active_terminal_id(),
+                Some(child_id),
+                "the sub terminal was the last selection, so the parent must not take the view"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restoring_terminal_already_spawning_does_not_spawn_twice(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = TerminalId::new();
+        let metadata = TerminalThreadMetadata {
+            parent_terminal_id: None,
+            ..child_terminal_metadata(terminal_id, terminal_id)
+        };
+
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.spawn_terminal(
+                terminal_id,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                None,
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            panel.restore_terminal(metadata, true, AgentThreadSource::Sidebar, None, window, cx);
+            assert!(
+                panel.test_terminal_spawn_gate.is_none(),
+                "the gate should only have been taken by the first spawn"
+            );
+        });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the terminal spawn");
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.terminals.len(), 1);
+            assert_eq!(panel.active_terminal_id(), Some(terminal_id));
+            assert!(panel.pending_terminal_restores.is_empty());
         });
     }
 

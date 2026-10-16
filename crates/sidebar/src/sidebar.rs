@@ -4649,15 +4649,16 @@ impl Sidebar {
         workspace: &Entity<Workspace>,
         metadata: &TerminalThreadMetadata,
         focus: bool,
+        restore_sub_terminals: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let restore_terminal = |agent_panel: Entity<AgentPanel>,
-                                metadata: &TerminalThreadMetadata,
-                                focus: bool,
-                                workspace: Option<&Workspace>,
-                                window: &mut Window,
-                                cx: &mut App| {
+        let restore_terminal = move |agent_panel: Entity<AgentPanel>,
+                                     metadata: &TerminalThreadMetadata,
+                                     focus: bool,
+                                     workspace: Option<&Workspace>,
+                                     window: &mut Window,
+                                     cx: &mut App| {
             agent_panel.update(cx, |panel, cx| {
                 panel.restore_terminal(
                     metadata.clone(),
@@ -4667,6 +4668,15 @@ impl Sidebar {
                     window,
                     cx,
                 );
+                if restore_sub_terminals && metadata.parent_terminal_id.is_none() {
+                    panel.restore_sub_terminals(
+                        metadata.terminal_id,
+                        AgentThreadSource::Sidebar,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                }
             });
         };
 
@@ -4739,7 +4749,7 @@ impl Sidebar {
             }
         });
 
-        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, window, cx);
+        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, true, window, cx);
 
         self.update_entries(cx);
     }
@@ -6151,7 +6161,9 @@ impl Sidebar {
                         workspace: workspace.clone(),
                     });
                     self.update_entries(cx);
-                    Self::load_agent_terminal_in_workspace(workspace, metadata, false, window, cx);
+                    Self::load_agent_terminal_in_workspace(
+                        workspace, metadata, false, false, window, cx,
+                    );
                 }
             }
         }
