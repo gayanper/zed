@@ -56,7 +56,7 @@ use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
     NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
     ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -81,8 +81,8 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, KeyContext,
-    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
-    pulsating_between,
+    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, canvas,
+    prelude::*, pulsating_between, relative,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -91,10 +91,10 @@ use project::{Project, ProjectPath, Worktree};
 use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-#[cfg(any(test, feature = "test-support"))]
 use terminal::terminal_settings::TerminalSettings;
 use terminal::{Content as TerminalContent, Event as TerminalEvent};
 use terminal_view::TerminalView;
+use terminal_view::terminal_element::scaled_font_size;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -115,6 +115,18 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_OVERVIEW_SUB_FRACTION: f32 = 0.25;
+/// Narrower sub terminals reflow into unreadable output, so the overview is
+/// disabled below this.
+const TERMINAL_OVERVIEW_MIN_SUB_COLUMNS: f32 = 40.;
+const TERMINAL_OVERVIEW_SUB_FONT_SCALE: f32 = 0.8;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalOverviewButtonState {
+    toggled: bool,
+    disabled: bool,
+    tooltip: &'static str,
+}
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1032,6 +1044,9 @@ struct AgentTerminal {
     parent_terminal_id: Option<TerminalId>,
     created_at: DateTime<Utc>,
     has_notification: bool,
+    /// Shows this terminal next to its sub terminals. Not persisted, so it's
+    /// off after a restart.
+    overview: bool,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
@@ -1210,6 +1225,9 @@ pub struct AgentPanel {
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     pending_terminal_restores: HashMap<TerminalId, PendingTerminalRestore>,
+    /// Width of the terminal content area from the last frame. The overview
+    /// toggle depends on it, but the toolbar renders before that area is laid out.
+    terminal_content_width: Rc<Cell<Pixels>>,
     /// Bumped on every view selection, so an async spawn only takes the view when
     /// nothing was selected after it was requested: the user's last click wins.
     view_selection_generation: usize,
@@ -1657,6 +1675,7 @@ impl AgentPanel {
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             pending_terminal_restores: HashMap::default(),
+            terminal_content_width: Rc::new(Cell::new(Pixels::ZERO)),
             view_selection_generation: 0,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
@@ -2461,6 +2480,7 @@ impl AgentPanel {
             parent_terminal_id,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
+            overview: false,
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -2553,6 +2573,12 @@ impl AgentPanel {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
             });
+        }
+        if let Some(parent_id) = terminal.parent_terminal_id
+            && !self.has_sub_terminals(parent_id, cx)
+            && let Some(parent) = self.terminals.get_mut(&parent_id)
+        {
+            parent.overview = false;
         }
         if was_active {
             self.base_view = BaseView::Uninitialized;
@@ -2748,6 +2774,122 @@ impl AgentPanel {
                 .insert(metadata.terminal_id, PendingTerminalRestore::Background);
             self.spawn_background_restored_terminal(metadata, source, workspace, window, cx);
         }
+    }
+
+    /// Oldest first, matching the sidebar order.
+    fn loaded_sub_terminal_ids(&self, parent_id: TerminalId) -> Vec<TerminalId> {
+        let mut sub_terminals = self
+            .terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.parent_terminal_id == Some(parent_id))
+            .map(|(terminal_id, terminal)| (terminal.created_at, *terminal_id))
+            .collect::<Vec<_>>();
+        sub_terminals.sort();
+        sub_terminals
+            .into_iter()
+            .map(|(_, terminal_id)| terminal_id)
+            .collect()
+    }
+
+    fn has_sub_terminals(&self, parent_id: TerminalId, cx: &App) -> bool {
+        self.terminals
+            .values()
+            .any(|terminal| terminal.parent_terminal_id == Some(parent_id))
+            || TerminalThreadMetadataStore::try_global(cx).is_some_and(|store| {
+                store
+                    .read(cx)
+                    .entries()
+                    .any(|metadata| metadata.parent_terminal_id == Some(parent_id))
+            })
+    }
+
+    fn overview_candidate_id(&self, cx: &App) -> Option<TerminalId> {
+        let terminal_id = self.active_terminal_id()?;
+        let terminal = self.terminals.get(&terminal_id)?;
+        (terminal.parent_terminal_id.is_none() && self.has_sub_terminals(terminal_id, cx))
+            .then_some(terminal_id)
+    }
+
+    fn terminal_overview_fits(&self, terminal_id: TerminalId, cx: &App) -> bool {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return false;
+        };
+        let terminal_bounds = terminal
+            .view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .last_content()
+            .terminal_bounds;
+        let cell_width = terminal_bounds.cell_width();
+        let line_height_scale = TerminalSettings::get_global(cx).line_height.value();
+        if cell_width <= Pixels::ZERO || line_height_scale <= 0. {
+            return false;
+        }
+        let font_size = terminal_bounds.line_height() / line_height_scale;
+        if font_size <= Pixels::ZERO {
+            return false;
+        }
+        let sub_cell_width = cell_width
+            * (scaled_font_size(font_size, TERMINAL_OVERVIEW_SUB_FONT_SCALE) / font_size);
+        let sub_column_width = self.terminal_content_width.get() * TERMINAL_OVERVIEW_SUB_FRACTION;
+        sub_column_width / sub_cell_width >= TERMINAL_OVERVIEW_MIN_SUB_COLUMNS
+    }
+
+    fn sync_terminal_font_scales(&self, cx: &mut App) {
+        let overview_sub_terminal_ids = self
+            .visible_overview_id(cx)
+            .map(|terminal_id| self.loaded_sub_terminal_ids(terminal_id))
+            .unwrap_or_default();
+        for (terminal_id, terminal) in &self.terminals {
+            let font_scale = overview_sub_terminal_ids
+                .contains(terminal_id)
+                .then_some(TERMINAL_OVERVIEW_SUB_FONT_SCALE);
+            terminal
+                .view
+                .update(cx, |view, cx| view.set_font_scale(font_scale, cx));
+        }
+    }
+
+    fn visible_overview_id(&self, cx: &App) -> Option<TerminalId> {
+        let terminal_id = self.overview_candidate_id(cx)?;
+        // Persisted sub terminals may still be restoring, or may have failed to,
+        // which would leave the sub terminal column empty.
+        (self.terminals.get(&terminal_id)?.overview
+            && !self.loaded_sub_terminal_ids(terminal_id).is_empty()
+            && self.terminal_overview_fits(terminal_id, cx))
+        .then_some(terminal_id)
+    }
+
+    fn toggle_terminal_overview(
+        &mut self,
+        _: &ToggleTerminalOverview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_id) = self.overview_candidate_id(cx) else {
+            return;
+        };
+        let fits = self.terminal_overview_fits(terminal_id, cx);
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        // Turning the overview off is always allowed, so it can't get stuck on
+        // while the panel is too narrow to show it.
+        if !terminal.overview && !fits {
+            return;
+        }
+        terminal.overview = !terminal.overview;
+        if terminal.overview {
+            self.restore_sub_terminals(
+                terminal_id,
+                AgentThreadSource::AgentPanel,
+                None,
+                window,
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     fn spawn_background_restored_terminal(
@@ -3192,7 +3334,7 @@ impl AgentPanel {
         if !window.is_window_active() {
             return false;
         }
-        if !self.terminal_surface_visible(terminal_id) {
+        if !self.terminal_surface_visible(terminal_id, cx) {
             return false;
         }
         let Some(workspace) = self.workspace.upgrade() else {
@@ -3207,9 +3349,18 @@ impl AgentPanel {
         AgentPanel::is_visible(&workspace, cx)
     }
 
-    fn terminal_surface_visible(&self, terminal_id: TerminalId) -> bool {
-        self.active_terminal_id() == Some(terminal_id)
-            && matches!(self.visible_surface(), VisibleSurface::Terminal(_))
+    fn terminal_surface_visible(&self, terminal_id: TerminalId, cx: &App) -> bool {
+        if !matches!(self.visible_surface(), VisibleSurface::Terminal(_)) {
+            return false;
+        }
+        if self.active_terminal_id() == Some(terminal_id) {
+            return true;
+        }
+        self.visible_overview_id(cx).is_some_and(|overview_id| {
+            self.terminals
+                .get(&terminal_id)
+                .is_some_and(|terminal| terminal.parent_terminal_id == Some(overview_id))
+        })
     }
 
     fn terminal_status_visible(&self, terminal_id: TerminalId, window: &Window, cx: &App) -> bool {
@@ -3228,12 +3379,12 @@ impl AgentPanel {
             };
 
             return multi_workspace.workspace() == &workspace
-                && self.terminal_surface_visible(terminal_id)
+                && self.terminal_surface_visible(terminal_id, cx)
                 && AgentPanel::is_visible(&workspace, cx);
         }
 
         self.workspace.upgrade().is_some_and(|workspace| {
-            self.terminal_surface_visible(terminal_id) && AgentPanel::is_visible(&workspace, cx)
+            self.terminal_surface_visible(terminal_id, cx) && AgentPanel::is_visible(&workspace, cx)
         })
     }
 
@@ -6572,6 +6723,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .children(self.render_terminal_overview_button(cx))
                         .children(self.render_terminal_comment_mode_button(cx))
                         .children(self.render_agent_comments_button(cx))
                         .when(can_create_entries, |this| this.child(new_thread_menu))
@@ -6637,6 +6789,51 @@ impl AgentPanel {
         )
     }
 
+    fn terminal_overview_button_state(&self, cx: &App) -> Option<TerminalOverviewButtonState> {
+        let terminal_id = self.overview_candidate_id(cx)?;
+        let overview = self.terminals.get(&terminal_id)?.overview;
+        let fits = self.terminal_overview_fits(terminal_id, cx);
+        let tooltip = if overview {
+            "Hide Sub Terminals"
+        } else if fits {
+            "Show Sub Terminals"
+        } else {
+            "Widen or zoom the panel to show sub terminals"
+        };
+        Some(TerminalOverviewButtonState {
+            toggled: overview,
+            disabled: !fits && !overview,
+            tooltip,
+        })
+    }
+
+    fn render_terminal_overview_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.terminal_overview_button_state(cx)?;
+        let focus_handle = self.focus_handle.clone();
+        Some(
+            IconButton::new("terminal-overview", IconName::SplitAlt)
+                .icon_size(IconSize::Small)
+                .toggle_state(state.toggled)
+                .disabled(state.disabled)
+                .tooltip(move |_window, cx| {
+                    if state.disabled {
+                        Tooltip::simple(state.tooltip, cx)
+                    } else {
+                        Tooltip::for_action_in(
+                            state.tooltip,
+                            &ToggleTerminalOverview,
+                            &focus_handle,
+                            cx,
+                        )
+                    }
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_terminal_overview(&ToggleTerminalOverview, window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_terminal_comment_mode_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !agent_comments::comments_enabled(cx) {
             return None;
@@ -6660,6 +6857,59 @@ impl AgentPanel {
                 }))
                 .into_any_element(),
         )
+    }
+
+    fn render_terminal_overview(
+        &self,
+        terminal_id: TerminalId,
+        terminal_content: impl IntoElement,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let sub_terminals = self
+            .loaded_sub_terminal_ids(terminal_id)
+            .into_iter()
+            .filter_map(|sub_terminal_id| self.terminals.get(&sub_terminal_id))
+            .enumerate()
+            .map(|(index, sub_terminal)| {
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .when(index > 0, |this| this.border_t_1())
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .px_2()
+                            .py_0p5()
+                            .bg(cx.theme().colors().tab_bar_background)
+                            .child(
+                                Label::new(sub_terminal.title(cx))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(div().flex_1().min_h_0().child(sub_terminal.view.clone()))
+            });
+
+        h_flex()
+            .size_full()
+            .child(
+                div()
+                    .h_full()
+                    .min_w_0()
+                    .flex_basis(relative(1. - TERMINAL_OVERVIEW_SUB_FRACTION))
+                    .child(terminal_content),
+            )
+            .child(
+                v_flex()
+                    .h_full()
+                    .min_w_0()
+                    .flex_basis(relative(TERMINAL_OVERVIEW_SUB_FRACTION))
+                    .border_l_1()
+                    .border_color(cx.theme().colors().border)
+                    .children(sub_terminals),
+            )
     }
 
     fn toggle_terminal_comment_mode(&mut self, cx: &mut Context<Self>) {
@@ -7208,6 +7458,10 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Set here rather than on each overview transition, since visibility also
+        // depends on the last frame's width. Sub terminals render after this, so
+        // they pick up the new scale in this frame.
+        self.sync_terminal_font_scales(cx);
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //
@@ -7259,6 +7513,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::toggle_zoom))
             .on_action(cx.listener(Self::toggle_terminal_thread_search))
+            .on_action(cx.listener(Self::toggle_terminal_overview))
             .on_action(cx.listener(|this, _: &ReauthenticateAgent, window, cx| {
                 if let Some(conversation_view) = this.active_conversation_view() {
                     conversation_view.update(cx, |conversation_view, cx| {
@@ -7306,9 +7561,35 @@ impl Render for AgentPanel {
                             })
                         })
                         .child(terminal_view.clone());
+                    let terminal_content = match self.visible_overview_id(cx) {
+                        Some(terminal_id) => self
+                            .render_terminal_overview(terminal_id, terminal_content, cx)
+                            .into_any_element(),
+                        None => terminal_content.into_any_element(),
+                    };
+                    let terminal_content_width = self.terminal_content_width.clone();
+                    let panel_id = cx.entity_id();
 
                     parent
-                        .child(terminal_content)
+                        .child(
+                            div().relative().size_full().child(terminal_content).child(
+                                canvas(
+                                    move |bounds, window, _cx| {
+                                        let width = bounds.size.width;
+                                        if terminal_content_width.replace(width) != width {
+                                            // The overview toggle reads this width, and the
+                                            // toolbar was already rendered with the old one.
+                                            // A notify during a draw doesn't schedule another
+                                            // frame, so defer it.
+                                            window.on_next_frame(move |_, cx| cx.notify(panel_id));
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            ),
+                        )
                         .child(self.render_drag_target(cx))
                 }
             })
@@ -8932,6 +9213,613 @@ mod tests {
             assert_eq!(panel.active_terminal_id(), Some(terminal_id));
             assert!(panel.pending_terminal_restores.is_empty());
         });
+    }
+
+    /// Lays the terminal out with 8px cells and a 32px line height, inside a
+    /// terminal content area of `content_width`. With the default line height
+    /// the font is about 19.8px, so the sub terminal font scale applies in full:
+    /// sub cells are 6.4px and the sub terminal column gets `content_width / 25.6`
+    /// columns.
+    fn set_test_terminal_overview_layout(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        content_width: Pixels,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update(cx, |panel, cx| {
+            panel.terminal_content_width.set(content_width);
+            let terminal = panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should be loaded")
+                .view
+                .read(cx)
+                .terminal()
+                .clone();
+            terminal.update(cx, |terminal, _| {
+                terminal.set_size(terminal::TerminalBounds::new(
+                    px(32.),
+                    px(8.),
+                    gpui::Bounds::new(gpui::Point::default(), size(content_width, px(600.))),
+                ));
+            });
+        });
+    }
+
+    fn toggle_test_terminal_overview(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_terminal_overview(&ToggleTerminalOverview, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_requires_sub_terminals_and_width(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.overview_candidate_id(cx), None);
+            assert!(!panel.terminals[&parent_id].overview);
+        });
+
+        insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.overview_candidate_id(cx), Some(parent_id));
+            assert!(!panel.terminal_overview_fits(parent_id, cx));
+            assert!(
+                !panel.terminals[&parent_id].overview,
+                "the overview should not turn on below the minimum sub terminal width"
+            );
+        });
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminals[&parent_id].overview);
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.terminals[&parent_id].overview,
+                "narrowing the panel should keep the overview on"
+            );
+            assert_eq!(panel.visible_overview_id(cx), None);
+        });
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                !panel.terminals[&parent_id].overview,
+                "the overview should turn off even when the panel is too narrow"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_restores_persisted_sub_terminals(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let now = Utc::now();
+        let newer_child_id =
+            save_test_sub_terminal_metadata(parent_id, "Newer", now, None, &mut cx);
+        let older_child_id = save_test_sub_terminal_metadata(
+            parent_id,
+            "Older",
+            now - chrono::Duration::minutes(1),
+            None,
+            &mut cx,
+        );
+        cx.run_until_parked();
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+            assert_eq!(
+                panel.loaded_sub_terminal_ids(parent_id),
+                vec![older_child_id, newer_child_id]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_returns_after_showing_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(child_id, true, window, cx);
+        });
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(child_id));
+            assert_eq!(panel.visible_overview_id(cx), None);
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_lays_out_sub_terminals_beside_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+            panel.toggle_zoom(&ToggleZoom, window, cx);
+        });
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminal_content_width.get() > Pixels::ZERO);
+            assert!(panel.terminal_overview_fits(parent_id, cx));
+        });
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        let terminal_bounds = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.terminals[&terminal_id]
+                    .view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .last_content()
+                    .terminal_bounds
+            })
+        };
+        let terminal_width = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
+            terminal_bounds(terminal_id, cx).bounds.size.width
+        };
+        let font_scale = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.terminals[&terminal_id].view.read(cx).font_scale()
+            })
+        };
+        let content_width = panel.read_with(&cx, |panel, _| panel.terminal_content_width.get());
+        assert!(terminal_width(parent_id, &mut cx) <= content_width * 0.75);
+        assert!(terminal_width(child_id, &mut cx) > Pixels::ZERO);
+        assert!(terminal_width(child_id, &mut cx) <= content_width * 0.25);
+        assert_eq!(font_scale(parent_id, &mut cx), None);
+        assert_eq!(
+            font_scale(child_id, &mut cx),
+            Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+        );
+        assert!(
+            terminal_bounds(child_id, &mut cx).cell_width()
+                < terminal_bounds(parent_id, &mut cx).cell_width()
+        );
+
+        cx.simulate_resize(size(px(1000.), px(1200.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+
+        let content_width = panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), None);
+            panel.terminal_content_width.get()
+        });
+        assert!(terminal_width(parent_id, &mut cx) > content_width * 0.75);
+        assert_eq!(font_scale(child_id, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_closing_last_sub_terminal_turns_overview_off(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let first_child_id =
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        let second_child_id =
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(first_child_id, window, cx);
+        });
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.terminals[&parent_id].overview);
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(second_child_id, window, cx);
+        });
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.terminals[&parent_id].overview);
+            assert_eq!(panel.overview_candidate_id(cx), None);
+        });
+    }
+
+    /// Opens a zoomed, wide panel showing the overview of a parent terminal with
+    /// `sub_terminal_count` sub terminals, returned in display order.
+    async fn setup_test_terminal_overview(
+        cx: &mut TestAppContext,
+        sub_terminal_count: usize,
+    ) -> (
+        Entity<AgentPanel>,
+        VisualTestContext,
+        TerminalId,
+        Vec<TerminalId>,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        for _ in 0..sub_terminal_count {
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        }
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+            panel.toggle_zoom(&ToggleZoom, window, cx);
+        });
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        cx.run_until_parked();
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        let sub_terminal_ids = panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+            panel.loaded_sub_terminal_ids(parent_id)
+        });
+        assert_eq!(sub_terminal_ids.len(), sub_terminal_count);
+        (panel, cx, parent_id, sub_terminal_ids)
+    }
+
+    fn test_terminal_view(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> Entity<TerminalView> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should be loaded")
+                .view
+                .clone()
+        })
+    }
+
+    fn test_terminal_font_scale(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> Option<f32> {
+        test_terminal_view(panel, terminal_id, cx).read_with(cx, |view, _| view.font_scale())
+    }
+
+    fn test_terminal_bounds(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> terminal::TerminalBounds {
+        test_terminal_view(panel, terminal_id, cx).read_with(cx, |view, cx| {
+            view.terminal().read(cx).last_content().terminal_bounds
+        })
+    }
+
+    fn take_test_terminal_input(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Vec<u8>> {
+        let terminal = test_terminal_view(panel, terminal_id, cx)
+            .read_with(cx, |view, _| view.terminal().clone());
+        terminal.update(cx, |terminal, _| terminal.take_input_log())
+    }
+
+    fn focus_test_terminal(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) {
+        let view = test_terminal_view(panel, terminal_id, cx);
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_fit_uses_smaller_sub_terminal_font(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+
+        // 1100px leaves the sub terminal column 275px: 42 columns of the smaller
+        // sub terminal font, but only 34 at the parent's font size.
+        set_test_terminal_overview_layout(&panel, parent_id, px(1100.), &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminal_overview_fits(parent_id, cx));
+        });
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(1000.), &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.terminal_overview_fits(parent_id, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_appears_when_panel_widens(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+
+        cx.simulate_resize(size(px(1000.), px(1200.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminals[&parent_id].overview);
+            assert_eq!(panel.visible_overview_id(cx), None);
+        });
+        assert_eq!(
+            test_terminal_font_scale(&panel, sub_terminal_id, &mut cx),
+            None
+        );
+
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+        assert_eq!(
+            test_terminal_font_scale(&panel, sub_terminal_id, &mut cx),
+            Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+        );
+        assert!(test_terminal_bounds(&panel, sub_terminal_id, &mut cx).cell_width() > Pixels::ZERO);
+    }
+
+    #[gpui::test]
+    async fn test_switching_terminal_clears_sub_terminal_font_scale(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        let other_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(other_id, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            test_terminal_font_scale(&panel, sub_terminal_id, &mut cx),
+            None
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            test_terminal_font_scale(&panel, sub_terminal_id, &mut cx),
+            Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_stacks_every_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 3).await;
+
+        let parent_bounds = test_terminal_bounds(&panel, parent_id, &mut cx);
+        let sub_terminal_bounds = sub_terminal_ids
+            .iter()
+            .map(|sub_terminal_id| {
+                assert_eq!(
+                    test_terminal_font_scale(&panel, *sub_terminal_id, &mut cx),
+                    Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+                );
+                test_terminal_bounds(&panel, *sub_terminal_id, &mut cx)
+            })
+            .collect::<Vec<_>>();
+
+        for bounds in &sub_terminal_bounds {
+            assert!(bounds.bounds.origin.x > parent_bounds.bounds.origin.x);
+            assert_eq!(
+                bounds.bounds.origin.x,
+                sub_terminal_bounds[0].bounds.origin.x
+            );
+            assert!(bounds.bounds.size.height > Pixels::ZERO);
+            assert!(bounds.cell_width() < parent_bounds.cell_width());
+        }
+        for pair in sub_terminal_bounds.windows(2) {
+            assert!(
+                pair[0].bounds.origin.y + pair[0].bounds.size.height <= pair[1].bounds.origin.y,
+                "sub terminals should stack top to bottom in display order"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_button_state(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        let button_state = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| panel.terminal_overview_button_state(cx))
+        };
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        assert_eq!(
+            button_state(&mut cx),
+            Some(TerminalOverviewButtonState {
+                toggled: false,
+                disabled: true,
+                tooltip: "Widen or zoom the panel to show sub terminals",
+            })
+        );
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        assert_eq!(
+            button_state(&mut cx),
+            Some(TerminalOverviewButtonState {
+                toggled: false,
+                disabled: false,
+                tooltip: "Show Sub Terminals",
+            })
+        );
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+        let hide = Some(TerminalOverviewButtonState {
+            toggled: true,
+            disabled: false,
+            tooltip: "Hide Sub Terminals",
+        });
+        assert_eq!(button_state(&mut cx), hide);
+
+        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        assert_eq!(
+            button_state(&mut cx),
+            hide,
+            "the overview should stay possible to turn off while the panel is too narrow"
+        );
+
+        let other_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(other_id, true, window, cx);
+        });
+        assert_eq!(button_state(&mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_search_targets_parent_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        focus_test_terminal(&panel, sub_terminal_id, &mut cx);
+
+        cx.dispatch_action(crate::ToggleSearch);
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.terminals[&parent_id].search_bar.is_some());
+            assert!(panel.terminals[&sub_terminal_id].search_bar.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_rename_targets_parent_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        focus_test_terminal(&panel, sub_terminal_id, &mut cx);
+
+        cx.dispatch_action(RenameSelectedThread);
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.terminals[&parent_id].title_editor.is_some());
+            assert!(panel.terminals[&sub_terminal_id].title_editor.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_drop_targets_parent_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        take_test_terminal_input(&panel, parent_id, &mut cx);
+        take_test_terminal_input(&panel, sub_terminal_id, &mut cx);
+
+        let dropped_path = PathBuf::from("/tmp/dropped-file.txt");
+        panel.update_in(&mut cx, |panel, window, cx| {
+            let external_paths = ExternalPaths(vec![dropped_path.clone()].into());
+            panel.handle_external_paths_drop(&external_paths, window, cx);
+        });
+
+        let parent_input = take_test_terminal_input(&panel, parent_id, &mut cx);
+        assert_eq!(
+            parent_input,
+            vec![expected_terminal_drop_text(std::slice::from_ref(&dropped_path)).into_bytes()]
+        );
+        assert!(take_test_terminal_input(&panel, sub_terminal_id, &mut cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_terminal_overview_add_selection_targets_parent_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        let workspace = panel.read_with(&cx, |panel, _| {
+            panel
+                .workspace
+                .upgrade()
+                .expect("workspace should be alive")
+        });
+        let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
+        fs.atomic_write(PathBuf::from("/project/file.txt"), "line one\n".into())
+            .await
+            .expect("test file should be written");
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_paths(
+                    vec![PathBuf::from("/project/file.txt")],
+                    workspace::OpenOptions::default(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .await;
+        cx.run_until_parked();
+        let editor = workspace.update(&mut cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .expect("opened file should be an editor")
+        });
+        cx.focus(&editor);
+        cx.run_until_parked();
+        take_test_terminal_input(&panel, parent_id, &mut cx);
+        take_test_terminal_input(&panel, sub_terminal_id, &mut cx);
+
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(AddSelectionToThread.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            take_test_terminal_input(&panel, parent_id, &mut cx),
+            vec![b"/project/file.txt:1 ".to_vec()]
+        );
+        assert!(take_test_terminal_input(&panel, sub_terminal_id, &mut cx).is_empty());
     }
 
     fn insert_test_terminal_with_parent(
