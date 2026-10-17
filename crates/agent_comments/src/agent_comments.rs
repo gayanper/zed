@@ -49,6 +49,8 @@ actions!(
         ClearPendingComments,
         /// Toggles selecting terminal text without holding shift, for commenting.
         ToggleTerminalCommentMode,
+        /// Comments for the agent on the text selected in a terminal thread.
+        CommentTerminalSelection,
     ]
 );
 
