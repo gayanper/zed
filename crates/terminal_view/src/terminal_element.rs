@@ -480,16 +480,14 @@ impl TerminalElement {
             return None;
         }
 
-        let icon_size = IconSize::Small;
-        let button_size = icon_size.square(window, cx) + px(4.);
-        let x = (dimensions.bounds.origin.x
-            + (selection.end.column + 2) as f32 * dimensions.cell_width)
-            .min(dimensions.bounds.right() - button_size);
-        let y = dimensions.bounds.origin.y
-            + row as f32 * dimensions.line_height
-            + (dimensions.line_height - button_size) / 2.
-            - scroll_top;
-        let origin = point(x, y);
+        let origin = selection_action_origin(
+            selection.end.column,
+            row as usize,
+            dimensions,
+            scroll_top,
+            window,
+            cx,
+        );
         let range = selection.point_range();
         let mut button = div()
             .occlude()
@@ -499,7 +497,7 @@ impl TerminalElement {
             })
             .child(
                 IconButton::new("terminal-selection-action", IconName::Chat)
-                    .icon_size(icon_size)
+                    .icon_size(SELECTION_ACTION_ICON_SIZE)
                     .shape(IconButtonShape::Square)
                     .style(ButtonStyle::Filled)
                     .tooltip(Tooltip::text(tooltip)),
@@ -2140,6 +2138,28 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
         // 8 bit, indexed colors
         Color::Indexed(i) => terminal::get_color_at_index(*i as usize, theme),
     }
+}
+
+const SELECTION_ACTION_ICON_SIZE: IconSize = IconSize::Small;
+
+/// The window position of the selection action button for a selection
+/// ending at `column` on viewport `row`.
+pub(crate) fn selection_action_origin(
+    column: usize,
+    row: usize,
+    dimensions: TerminalBounds,
+    scroll_top: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> GpuiPoint<Pixels> {
+    let button_size = SELECTION_ACTION_ICON_SIZE.square(window, cx) + px(4.);
+    let x = (dimensions.bounds.origin.x + (column + 2) as f32 * dimensions.cell_width)
+        .min(dimensions.bounds.right() - button_size);
+    let y = dimensions.bounds.origin.y
+        + row as f32 * dimensions.line_height
+        + (dimensions.line_height - button_size) / 2.
+        - scroll_top;
+    point(x, y)
 }
 
 #[cfg(test)]

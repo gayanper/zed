@@ -431,6 +431,43 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// The finished selection, its text and the window position of its
+    /// selection action button. When the selection's end is off screen the
+    /// position is clamped to the nearest visible row, since scrolling in vi
+    /// mode would move the vi cursor and the selection with it.
+    pub fn selection_action_target(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<(Range, String, GpuiPoint<Pixels>)> {
+        let terminal = self.terminal.read(cx);
+        if terminal.selection_started() {
+            return None;
+        }
+        let content = terminal.last_content();
+        let selection = content.selection?;
+        let text = content
+            .selection_text
+            .clone()
+            .filter(|text| !text.is_empty())?;
+        let dimensions = content.terminal_bounds;
+        let display_offset = i32::try_from(content.display_offset).ok()?;
+        let num_lines = i32::try_from(dimensions.num_lines()).ok()?;
+        if num_lines == 0 {
+            return None;
+        }
+        let row = (selection.end.line + display_offset).clamp(0, num_lines - 1);
+        let origin = terminal_element::selection_action_origin(
+            selection.end.column,
+            row as usize,
+            dimensions,
+            self.scroll_top,
+            window,
+            cx,
+        );
+        Some((selection.point_range(), text, origin))
+    }
+
     /// Marks ranges of grid lines with a bar in the gutter left of the text.
     /// `markers` runs on every paint, with the content being painted, so the
     /// marks follow the terminal's output.
@@ -2732,6 +2769,64 @@ mod tests {
         cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn selection_action_target_keeps_an_off_screen_vi_selection(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let output = (0..200)
+            .map(|line| format!("line {line}\r\n"))
+            .collect::<String>();
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(output.as_bytes(), cx);
+                terminal.scroll_to_top();
+                terminal.sync(window, cx);
+                terminal.toggle_vi_mode();
+                terminal.select_all();
+                terminal.sync(window, cx);
+            });
+        });
+        let content = |cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| {
+                let content = &terminal.last_content;
+                (
+                    content.selection.map(|selection| selection.point_range()),
+                    content.display_offset,
+                )
+            })
+        };
+        let (selection_before, display_offset_before) = content(&mut cx);
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
+        let end_row = selection_before
+            .as_ref()
+            .map(|range| range.end().line + display_offset_before as i32)
+            .expect("terminal should have a selection");
+        assert!(
+            end_row >= bounds.num_lines() as i32,
+            "the selection's end should start out below the viewport"
+        );
+
+        let target = terminal_view.update_in(&mut cx, |terminal_view, window, cx| {
+            terminal_view.selection_action_target(window, cx)
+        });
+        cx.update(|window, cx| terminal.update(cx, |terminal, cx| terminal.sync(window, cx)));
+
+        let (range, text, origin) = target.expect("the selection should have a target");
+        assert!(text.contains("line 199"));
+        assert_eq!(Some(range), selection_before);
+        assert!(
+            bounds.bounds.contains(&origin),
+            "the position should be on screen"
+        );
+        assert_eq!(
+            content(&mut cx),
+            (selection_before, display_offset_before),
+            "the terminal shouldn't scroll or change its selection"
+        );
     }
 
     #[gpui::test]

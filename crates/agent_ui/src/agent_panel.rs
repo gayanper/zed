@@ -15,7 +15,8 @@ use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_comments::{
     AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, ClearPendingComments,
-    CommentPopover, InsertPendingComments, TerminalComment, ToggleTerminalCommentMode,
+    CommentPopover, CommentTerminalSelection, InsertPendingComments, TerminalComment,
+    ToggleTerminalCommentMode,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -6926,6 +6927,34 @@ impl AgentPanel {
         cx.notify();
     }
 
+    /// Checks vi mode itself, because the key context isn't consulted when
+    /// the action comes from the command palette.
+    fn comment_terminal_selection(
+        &mut self,
+        _: &CommentTerminalSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !agent_comments::comments_enabled(cx) {
+            return;
+        }
+        let Some(terminal_id) = self.active_terminal_id() else {
+            return;
+        };
+        let Some(terminal_view) = self.visible_terminal_view().cloned() else {
+            return;
+        };
+        let Some((range, text, position)) = terminal_view.update(cx, |terminal_view, cx| {
+            if !terminal_view.terminal().read(cx).vi_mode_enabled() {
+                return None;
+            }
+            terminal_view.selection_action_target(window, cx)
+        }) else {
+            return;
+        };
+        self.open_terminal_comment(terminal_id, range, text, position, window, cx);
+    }
+
     /// Turns terminal comments on or off for every terminal thread, and
     /// closes the comment input once its comment is gone.
     fn refresh_terminal_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7492,6 +7521,7 @@ impl Render for AgentPanel {
                     this.toggle_terminal_comment_mode(cx);
                 }),
             )
+            .on_action(cx.listener(Self::comment_terminal_selection))
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
@@ -7544,6 +7574,7 @@ impl Render for AgentPanel {
                         .and_then(|terminal_id| self.terminals.get(&terminal_id))
                         .and_then(|terminal| terminal.search_bar.clone());
                     let terminal_content = v_flex()
+                        .key_context("AgentTerminalThread")
                         .size_full()
                         .when_some(search_bar, |this, search_bar| {
                             this.when(!search_bar.read(cx).is_dismissed(), |this| {
@@ -12481,6 +12512,130 @@ mod tests {
         store.read_with(&cx, |store, _| assert!(store.is_empty()));
         assert!(panel.read_with(&cx, |panel, _| panel.terminal_comment.is_none()));
         assert!(!terminal_has_selection(&terminal, &mut cx));
+    }
+
+    fn bind_comment_terminal_selection(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-alt-m",
+                CommentTerminalSelection,
+                Some("AgentTerminalThread > Terminal && vi_mode && selection"),
+            )])
+        });
+    }
+
+    fn focus_terminal(
+        panel: &Entity<AgentPanel>,
+        terminal_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            let view = panel.terminals[&terminal_id].view.clone();
+            window.focus(&view.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn toggle_vi_mode(terminal: &Entity<terminal::Terminal>, cx: &mut VisualTestContext) {
+        terminal.update(cx, |terminal, _| terminal.toggle_vi_mode());
+        cx.run_until_parked();
+    }
+
+    fn terminal_comment_open(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) -> bool {
+        panel.read_with(cx, |panel, _| panel.terminal_comment.is_some())
+    }
+
+    #[gpui::test]
+    async fn test_comment_terminal_selection_key_opens_the_comment_input(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_comment_terminal_selection(&mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        toggle_vi_mode(&terminal, &mut cx);
+        select_all_in_terminal(&terminal, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-alt-m");
+        assert!(terminal_comment_open(&panel, &mut cx));
+
+        cx.simulate_input("Fix this.");
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| assert_eq!(store.len(), 1));
+        assert!(!terminal_has_selection(&terminal, &mut cx));
+        assert!(
+            terminal.read_with(&cx, |terminal, _| terminal.vi_mode_enabled()),
+            "vi mode should stay on after commenting"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_comment_terminal_selection_key_needs_vi_mode_and_a_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_comment_terminal_selection(&mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        select_all_in_terminal(&terminal, &mut cx);
+        cx.simulate_keystrokes("ctrl-alt-m");
+        assert!(
+            !terminal_comment_open(&panel, &mut cx),
+            "the key should do nothing outside vi mode"
+        );
+
+        toggle_vi_mode(&terminal, &mut cx);
+        terminal.update(&mut cx, |terminal, _| terminal.clear_selection());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-alt-m");
+        assert!(
+            !terminal_comment_open(&panel, &mut cx),
+            "the key should do nothing without a selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_comment_terminal_selection_key_ignores_sub_terminals(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_comment_terminal_selection(&mut cx);
+        // The overview needs room for its sub terminal column.
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().default_width =
+                        Some(settings::PixelSetting(3000.));
+                });
+            });
+        });
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        let (parent_id, _) = open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        let sub_terminal_id =
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        assert_eq!(
+            panel.read_with(&cx, |panel, cx| panel.visible_overview_id(cx)),
+            Some(parent_id)
+        );
+
+        let sub_terminal_view = panel.read_with(&cx, |panel, _| {
+            panel.terminals[&sub_terminal_id].view.clone()
+        });
+        let sub_terminal = sub_terminal_view.read_with(&cx, |view, _| view.terminal().clone());
+        write_terminal_output(&sub_terminal, "beta\r\n", &mut cx);
+        toggle_vi_mode(&sub_terminal, &mut cx);
+        select_all_in_terminal(&sub_terminal, &mut cx);
+        focus_terminal(&panel, sub_terminal_id, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-alt-m");
+        assert!(!terminal_comment_open(&panel, &mut cx));
     }
 
     fn terminal_comment_mode_button_shown(

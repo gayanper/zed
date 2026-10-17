@@ -1698,6 +1698,12 @@
     },
   },
   {
+    "context": "AgentTerminalThread > Terminal && vi_mode && selection",
+    "bindings": {
+      "ctrl-alt-m": "agent_comments::CommentTerminalSelection",
+    },
+  },
+  {
     "context": "AgentCommentInput",
     "bindings": {
       "tab": "agent_comments::FocusNext",
