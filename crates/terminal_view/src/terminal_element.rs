@@ -99,6 +99,15 @@ impl LayoutPoint {
     }
 }
 
+/// Smallest font size a scaled terminal is drawn at, to keep it readable
+/// when the configured font is already small.
+pub const MIN_SCALED_FONT_SIZE: Pixels = px(10.);
+
+/// The font size a terminal with `font_scale` is drawn at.
+pub fn scaled_font_size(font_size: Pixels, font_scale: f32) -> Pixels {
+    (font_size * font_scale).max(font_size.min(MIN_SCALED_FONT_SIZE))
+}
+
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug)]
 pub struct BatchedTextRun {
@@ -1281,6 +1290,10 @@ impl Element for TerminalElement {
                             theme_settings::adjusted_font_size(size, cx)
                         }),
                 };
+                let font_size = match self.terminal_view.read(cx).font_scale {
+                    Some(font_scale) => scaled_font_size(font_size, font_scale),
+                    None => font_size,
+                };
 
                 let theme = cx.theme().clone();
 
@@ -2134,6 +2147,15 @@ mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, TestAppContext, font};
     use ui::utils::apca_contrast;
+
+    #[test]
+    fn test_scaled_font_size_stops_at_minimum() {
+        assert_eq!(scaled_font_size(px(20.), 0.8), px(16.));
+        assert_eq!(scaled_font_size(px(12.), 0.8), MIN_SCALED_FONT_SIZE);
+        assert_eq!(scaled_font_size(px(10.), 0.8), MIN_SCALED_FONT_SIZE);
+        assert_eq!(scaled_font_size(px(9.), 0.8), px(9.));
+        assert_eq!(scaled_font_size(px(20.), 1.), px(20.));
+    }
 
     #[gpui::test]
     async fn terminal_input_handler_respects_read_only_mode(cx: &mut TestAppContext) {

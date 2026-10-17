@@ -159,6 +159,7 @@ pub struct TerminalView {
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
     show_workspace_actions: Option<bool>,
+    font_scale: Option<f32>,
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
@@ -314,6 +315,7 @@ impl TerminalView {
             read_only: false,
             local_selection: false,
             show_workspace_actions: None,
+            font_scale: None,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -383,6 +385,19 @@ impl TerminalView {
         } else {
             MouseInputMode::ReportToTerminal
         }
+    }
+
+    /// Scales the terminal's font size, for hosts that show the terminal as a
+    /// compact preview. `None` uses the configured font size.
+    pub fn set_font_scale(&mut self, font_scale: Option<f32>, cx: &mut Context<Self>) {
+        if self.font_scale != font_scale {
+            self.font_scale = font_scale;
+            cx.notify();
+        }
+    }
+
+    pub fn font_scale(&self) -> Option<f32> {
+        self.font_scale
     }
 
     /// Explicitly override whether workspace-specific context menu actions (e.g. creating or
@@ -2351,7 +2366,7 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
     use remote::RemoteClient;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
@@ -2398,6 +2413,40 @@ mod tests {
 
     // CSI `1;2A` = cursor-up with the xterm Shift modifier (`1 + 1` for Shift).
     const SHIFT_UP_ESCAPE: &[u8] = b"\x1b[1;2A";
+
+    #[gpui::test]
+    async fn test_set_font_scale_notifies_only_on_change(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, _terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, true, cx);
+        let notifications = Rc::new(Cell::new(0));
+        let _subscription = cx.update({
+            let notifications = notifications.clone();
+            |cx| {
+                cx.observe(&terminal_view, move |_, _| {
+                    notifications.set(notifications.get() + 1);
+                })
+            }
+        });
+        let set_font_scale = |font_scale: Option<f32>, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                terminal_view.update(cx, |view, cx| view.set_font_scale(font_scale, cx));
+            });
+        };
+
+        set_font_scale(Some(0.8), cx);
+        assert_eq!(notifications.get(), 1);
+        set_font_scale(Some(0.8), cx);
+        assert_eq!(notifications.get(), 1);
+        set_font_scale(None, cx);
+        assert_eq!(notifications.get(), 2);
+        set_font_scale(None, cx);
+        assert_eq!(notifications.get(), 2);
+        assert_eq!(
+            terminal_view.read_with(cx, |view, _| view.font_scale()),
+            None
+        );
+    }
 
     #[gpui::test]
     async fn replacing_output_resets_view_scrolling_hover_and_search(cx: &mut TestAppContext) {

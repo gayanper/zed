@@ -325,6 +325,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Toggles the overview of a terminal thread and its sub terminals.
+        ToggleTerminalOverview,
     ]
 );
 
