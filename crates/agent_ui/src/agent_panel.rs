@@ -7026,7 +7026,7 @@ impl AgentPanel {
     fn render_terminal_overview_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.terminal_overview_button_state(cx)?;
         let focus_handle = self.focus_handle.clone();
-        let toggle_button = IconButton::new("terminal-overview", IconName::SplitAlt)
+        let toggle_button = IconButton::new("terminal-overview", IconName::TerminalThreadOverview)
             .icon_size(IconSize::Small)
             .toggle_state(state.toggled)
             .disabled(state.disabled)

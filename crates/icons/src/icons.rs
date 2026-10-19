@@ -255,6 +255,7 @@ pub enum IconName {
     Table,
     Terminal,
     TerminalAlt,
+    TerminalThreadOverview,
     TextSnippet,
     TextWrap,
     TextUnwrap,
