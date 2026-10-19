@@ -4668,7 +4668,12 @@ impl Sidebar {
                     window,
                     cx,
                 );
-                if restore_sub_terminals && metadata.parent_terminal_id.is_none() {
+                // A parent with its overview on restores only the sub terminals
+                // selected for it once it lands.
+                if restore_sub_terminals
+                    && metadata.parent_terminal_id.is_none()
+                    && !metadata.overview_enabled
+                {
                     panel.restore_sub_terminals(
                         metadata.terminal_id,
                         AgentThreadSource::Sidebar,
