@@ -1191,10 +1191,9 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
-    // Width of the sub terminal column in the terminal overview. When null, the
-    // column is wide enough for 40 characters of the sub terminal font. Smaller
-    // values are raised to that.
-    "terminal_overview_width": null,
+    // Width of the sub terminal column in the terminal overview. Values narrower
+    // than 40 characters of the sub terminal font are raised to that.
+    "terminal_overview_width": 300,
     // The default model to use when creating new threads.
     "default_model": {
       // The provider to use.

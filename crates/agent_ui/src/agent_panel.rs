@@ -3052,7 +3052,7 @@ impl AgentPanel {
         let min_width = sub_cell_width * TERMINAL_OVERVIEW_MIN_COLUMNS;
         AgentSettings::get_global(cx)
             .terminal_overview_width
-            .map_or(min_width, |width| width.max(min_width))
+            .max(min_width)
     }
 
     fn terminal_overview_fits(&self, terminal_id: TerminalId, cx: &App) -> bool {
@@ -9548,7 +9548,7 @@ mod tests {
     /// terminal content area of `content_width`. With the default line height
     /// the font is about 19.8px, so the sub terminal font scale applies in full:
     /// sub cells are 6.4px. With the default setting the sub terminal column is
-    /// 256px wide, and the overview fits from 576px, which leaves the parent 40
+    /// 300px wide, and the overview fits from 620px, which leaves the parent 40
     /// columns.
     fn set_test_terminal_overview_layout(
         panel: &Entity<AgentPanel>,
@@ -10241,11 +10241,10 @@ mod tests {
             panel.read_with(cx, |panel, cx| panel.terminal_overview_fits(parent_id, cx))
         };
 
-        // 40 columns of the 6.4px sub terminal cells.
-        set_test_terminal_overview_layout(&panel, parent_id, px(576.), &mut cx);
-        assert_eq!(sub_width(&mut cx), Some(px(256.)));
+        set_test_terminal_overview_layout(&panel, parent_id, px(620.), &mut cx);
+        assert_eq!(sub_width(&mut cx), Some(px(300.)));
         assert!(fits(&mut cx));
-        set_test_terminal_overview_layout(&panel, parent_id, px(575.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(619.), &mut cx);
         assert!(!fits(&mut cx));
 
         set_width(Some(400.), &mut cx);

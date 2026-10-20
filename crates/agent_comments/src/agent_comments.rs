@@ -815,8 +815,7 @@ fn comment_at_cursor(
     let selection = editor.selections.newest_anchor().range();
     let (snapshot, range) =
         multi_buffer_snapshot.anchor_range_to_buffer_anchor_range(selection.clone())?;
-    let (snapshot, range) = match removed_lines_in_range(editor, &selection, snapshot, &range, cx)
-    {
+    let (snapshot, range) = match removed_lines_in_range(editor, &selection, snapshot, &range, cx) {
         Some(removed_lines) => (removed_lines.base.read(cx).snapshot(), removed_lines.range),
         None => (
             snapshot.clone(),
@@ -1067,13 +1066,9 @@ fn toggle_editor_comment(
     else {
         return;
     };
-    if let Some(removed_lines) = removed_lines_in_range(
-        editor,
-        &selection_range,
-        buffer_snapshot,
-        &range,
-        cx,
-    ) {
+    if let Some(removed_lines) =
+        removed_lines_in_range(editor, &selection_range, buffer_snapshot, &range, cx)
+    {
         comment_on_removed_lines(editor, removed_lines, open_input, window, cx);
         return;
     }
@@ -1244,9 +1239,7 @@ fn edit_comment_at_cursor(
         return;
     };
     let block_anchor = match &comment.diff_base_of {
-        Some(main) => {
-            removed_lines_block_anchor(editor, &comment.buffer, &comment.range, main, cx)
-        }
+        Some(main) => removed_lines_block_anchor(editor, &comment.buffer, &comment.range, main, cx),
         None => block_anchor_after_line(editor, comment.range.end, cx),
     };
     let Some(block_anchor) = block_anchor else {
@@ -2636,11 +2629,7 @@ mod tests {
             editor.update_in(cx, |editor, window, cx| {
                 let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
                 let diff = cx.new(|cx| {
-                    BufferDiff::new_with_base_text(
-                        head_text,
-                        &buffer.read(cx).text_snapshot(),
-                        cx,
-                    )
+                    BufferDiff::new_with_base_text(head_text, &buffer.read(cx).text_snapshot(), cx)
                 });
                 editor
                     .buffer()
@@ -2728,7 +2717,10 @@ mod tests {
 
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
-            assert!(!editor_focused(&editor, cx), "the comment opens for editing");
+            assert!(
+                !editor_focused(&editor, cx),
+                "the comment opens for editing"
+            );
             cx.simulate_input(" Still needed.");
             cx.dispatch_action(Submit);
             cx.run_until_parked();

@@ -218,7 +218,7 @@ pub struct AgentSettings {
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
-    pub terminal_overview_width: Option<Pixels>,
+    pub terminal_overview_width: Pixels,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
@@ -796,7 +796,7 @@ impl Settings for AgentSettings {
             } else {
                 None
             },
-            terminal_overview_width: agent.terminal_overview_width.map(|width| width.into_gpui()),
+            terminal_overview_width: agent.terminal_overview_width.unwrap().into_gpui(),
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
@@ -1134,12 +1134,15 @@ mod tests {
         AgentSettings::register(cx);
 
         for (content, expected_width) in [
-            (r#"{}"#, None),
+            (r#"{}"#, px(300.)),
             (
                 r#"{ "agent": { "terminal_overview_width": 360 } }"#,
-                Some(px(360.)),
+                px(360.),
             ),
-            (r#"{ "agent": { "terminal_overview_width": null } }"#, None),
+            (
+                r#"{ "agent": { "terminal_overview_width": null } }"#,
+                px(300.),
+            ),
         ] {
             SettingsStore::update_global(cx, |store, cx| {
                 store

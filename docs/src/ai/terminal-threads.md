@@ -83,7 +83,7 @@ Unlike agent threads, Terminal Threads are closed rather than archived. They do 
 
 ## Terminal Overview Width {#terminal-overview-width}
 
-The terminal overview shows a terminal thread's sub terminals in a column beside it. By default the column is wide enough for 40 columns at the sub terminals' smaller font. To make it wider, set `agent.terminal_overview_width` in pixels:
+The terminal overview shows a terminal thread's sub terminals in a column beside it. The column is 300 pixels wide by default, and never narrower than 40 characters of the sub terminal font. To change it, set `agent.terminal_overview_width` in pixels:
 
 ```json [settings]
 {
@@ -93,7 +93,7 @@ The terminal overview shows a terminal thread's sub terminals in a column beside
 }
 ```
 
-Values narrower than 40 sub terminal columns are raised to that width. The overview is hidden while the panel can't also give the parent terminal 40 columns.
+The overview is hidden while the panel can't also give the parent terminal 40 columns.
 
 ## CLI/TUI Setup Notes {#cli-setup}
 

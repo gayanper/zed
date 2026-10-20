@@ -7010,7 +7010,7 @@ fn panels_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Terminal Overview Width",
-                description: "Width in pixels of the sub terminal column in the terminal overview. When unset, the column is wide enough for 40 characters of the sub terminal font. Smaller values are raised to that.",
+                description: "Width in pixels of the sub terminal column in the terminal overview. Values narrower than 40 characters of the sub terminal font are raised to that.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("agent.terminal_overview_width"),
