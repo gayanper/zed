@@ -6873,7 +6873,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn agent_panel_section() -> [SettingsPageItem; 7] {
+    fn agent_panel_section() -> [SettingsPageItem; 8] {
         [
             SettingsPageItem::SectionHeader("Agent Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -7007,6 +7007,29 @@ fn panels_page() -> SettingsPage {
                         metadata: None,
                     }],
                 ],
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Terminal Overview Width",
+                description: "Width in pixels of the sub terminal column in the terminal overview. When unset, the column is wide enough for 40 characters of the sub terminal font. Smaller values are raised to that.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.terminal_overview_width"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .terminal_overview_width
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .terminal_overview_width = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
             }),
         ]
     }

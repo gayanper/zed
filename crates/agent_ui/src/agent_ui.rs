@@ -978,6 +978,7 @@ mod tests {
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
+            terminal_overview_width: None,
             default_model: None,
             subagent_model: None,
             inline_assistant_model: None,

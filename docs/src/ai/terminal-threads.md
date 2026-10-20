@@ -81,6 +81,20 @@ The same `agent.notify_when_agent_waiting` and `agent.play_sound_when_agent_done
 
 Unlike agent threads, Terminal Threads are closed rather than archived. They do not go to Thread History. To close one, hover over it in the Threads Sidebar and click the **×** button, or select it and press {#kb agent::ArchiveSelectedThread}.
 
+## Terminal Overview Width {#terminal-overview-width}
+
+The terminal overview shows a terminal thread's sub terminals in a column beside it. By default the column is wide enough for 40 columns at the sub terminals' smaller font. To make it wider, set `agent.terminal_overview_width` in pixels:
+
+```json [settings]
+{
+  "agent": {
+    "terminal_overview_width": 400
+  }
+}
+```
+
+Values narrower than 40 sub terminal columns are raised to that width. The overview is hidden while the panel can't also give the parent terminal 40 columns.
+
 ## CLI/TUI Setup Notes {#cli-setup}
 
 Some agent CLIs and TUIs can send terminal signals, such as bell notifications or title updates, that Zed uses to show useful context in the sidebar.

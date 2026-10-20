@@ -293,6 +293,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 850
     pub max_content_width: Option<crate::PixelSetting>,
+    /// Width in pixels of the sub terminal column in the terminal overview.
+    /// When null, the column is wide enough for 40 characters of the sub
+    /// terminal font. Smaller values are raised to that.
+    ///
+    /// Default: null
+    pub terminal_overview_width: Option<crate::PixelSetting>,
     /// The default model to use when creating new chats and for other features when a specific model is not specified.
     pub default_model: Option<LanguageModelSelection>,
     /// The model to use for subagents spawned via the `spawn_agent` tool. Defaults to the parent agent's model when not specified.

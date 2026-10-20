@@ -218,6 +218,7 @@ pub struct AgentSettings {
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
+    pub terminal_overview_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
@@ -795,6 +796,7 @@ impl Settings for AgentSettings {
             } else {
                 None
             },
+            terminal_overview_width: agent.terminal_overview_width.map(|width| width.into_gpui()),
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
@@ -1119,6 +1121,34 @@ mod tests {
             assert_eq!(
                 AgentSettings::get_global(cx).prevent_idle_sleep,
                 expected,
+                "{content}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_terminal_overview_width_setting(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        for (content, expected_width) in [
+            (r#"{}"#, None),
+            (
+                r#"{ "agent": { "terminal_overview_width": 360 } }"#,
+                Some(px(360.)),
+            ),
+            (r#"{ "agent": { "terminal_overview_width": null } }"#, None),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(content, cx)
+                    .expect("user settings load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).terminal_overview_width,
+                expected_width,
                 "{content}"
             );
         }

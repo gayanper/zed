@@ -83,7 +83,7 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, KeyContext,
     Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, canvas,
-    prelude::*, pulsating_between, relative,
+    prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -117,10 +117,9 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_OVERVIEW_SUB_FRACTION: f32 = 0.25;
-/// Narrower sub terminals reflow into unreadable output, so the overview is
-/// disabled below this.
-const TERMINAL_OVERVIEW_MIN_SUB_COLUMNS: f32 = 40.;
+/// Narrower terminals reflow into unreadable output, so neither overview column
+/// gets fewer columns than this.
+const TERMINAL_OVERVIEW_MIN_COLUMNS: f32 = 40.;
 const TERMINAL_OVERVIEW_SUB_FONT_SCALE: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3015,10 +3014,14 @@ impl AgentPanel {
             .then_some(terminal_id)
     }
 
-    fn terminal_overview_fits(&self, terminal_id: TerminalId, cx: &App) -> bool {
-        let Some(terminal) = self.terminals.get(&terminal_id) else {
-            return false;
-        };
+    /// Returns the cell widths of the parent terminal and of its sub terminals,
+    /// which use a smaller font.
+    fn terminal_overview_cell_widths(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<(Pixels, Pixels)> {
+        let terminal = self.terminals.get(&terminal_id)?;
         let terminal_bounds = terminal
             .view
             .read(cx)
@@ -3029,16 +3032,37 @@ impl AgentPanel {
         let cell_width = terminal_bounds.cell_width();
         let line_height_scale = TerminalSettings::get_global(cx).line_height.value();
         if cell_width <= Pixels::ZERO || line_height_scale <= 0. {
-            return false;
+            return None;
         }
         let font_size = terminal_bounds.line_height() / line_height_scale;
         if font_size <= Pixels::ZERO {
-            return false;
+            return None;
         }
         let sub_cell_width = cell_width
             * (scaled_font_size(font_size, TERMINAL_OVERVIEW_SUB_FONT_SCALE) / font_size);
-        let sub_column_width = self.terminal_content_width.get() * TERMINAL_OVERVIEW_SUB_FRACTION;
-        sub_column_width / sub_cell_width >= TERMINAL_OVERVIEW_MIN_SUB_COLUMNS
+        Some((cell_width, sub_cell_width))
+    }
+
+    fn terminal_overview_sub_width(&self, terminal_id: TerminalId, cx: &App) -> Option<Pixels> {
+        let (_, sub_cell_width) = self.terminal_overview_cell_widths(terminal_id, cx)?;
+        Some(Self::terminal_overview_sub_width_for(sub_cell_width, cx))
+    }
+
+    fn terminal_overview_sub_width_for(sub_cell_width: Pixels, cx: &App) -> Pixels {
+        let min_width = sub_cell_width * TERMINAL_OVERVIEW_MIN_COLUMNS;
+        AgentSettings::get_global(cx)
+            .terminal_overview_width
+            .map_or(min_width, |width| width.max(min_width))
+    }
+
+    fn terminal_overview_fits(&self, terminal_id: TerminalId, cx: &App) -> bool {
+        let Some((cell_width, sub_cell_width)) =
+            self.terminal_overview_cell_widths(terminal_id, cx)
+        else {
+            return false;
+        };
+        let sub_width = Self::terminal_overview_sub_width_for(sub_cell_width, cx);
+        self.terminal_content_width.get() - sub_width >= cell_width * TERMINAL_OVERVIEW_MIN_COLUMNS
     }
 
     fn sync_terminal_font_scales(&self, cx: &mut App) {
@@ -7139,6 +7163,7 @@ impl AgentPanel {
         terminal_content: impl IntoElement,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let sub_width = self.terminal_overview_sub_width(terminal_id, cx);
         let sub_terminals = self
             .visible_overview_sub_terminal_ids(terminal_id)
             .into_iter()
@@ -7168,18 +7193,12 @@ impl AgentPanel {
 
         h_flex()
             .size_full()
-            .child(
-                div()
-                    .h_full()
-                    .min_w_0()
-                    .flex_basis(relative(1. - TERMINAL_OVERVIEW_SUB_FRACTION))
-                    .child(terminal_content),
-            )
+            .child(div().h_full().min_w_0().flex_1().child(terminal_content))
             .child(
                 v_flex()
                     .h_full()
-                    .min_w_0()
-                    .flex_basis(relative(TERMINAL_OVERVIEW_SUB_FRACTION))
+                    .flex_none()
+                    .when_some(sub_width, |this, sub_width| this.w(sub_width))
                     .border_l_1()
                     .border_color(cx.theme().colors().border)
                     .children(sub_terminals),
@@ -9528,7 +9547,8 @@ mod tests {
     /// Lays the terminal out with 8px cells and a 32px line height, inside a
     /// terminal content area of `content_width`. With the default line height
     /// the font is about 19.8px, so the sub terminal font scale applies in full:
-    /// sub cells are 6.4px and the sub terminal column gets `content_width / 25.6`
+    /// sub cells are 6.4px. With the default setting the sub terminal column is
+    /// 256px wide, and the overview fits from 576px, which leaves the parent 40
     /// columns.
     fn set_test_terminal_overview_layout(
         panel: &Entity<AgentPanel>,
@@ -9579,7 +9599,7 @@ mod tests {
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.activate_terminal(parent_id, true, window, cx);
         });
-        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
 
         toggle_test_terminal_overview(&panel, &mut cx);
         panel.read_with(&cx, |panel, cx| {
@@ -9598,7 +9618,7 @@ mod tests {
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
         });
 
-        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
         panel.read_with(&cx, |panel, cx| {
             assert!(
                 panel.terminals[&parent_id].overview,
@@ -9612,7 +9632,7 @@ mod tests {
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
         });
 
-        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
         toggle_test_terminal_overview(&panel, &mut cx);
         panel.read_with(&cx, |panel, _| {
             assert!(
@@ -9717,10 +9737,17 @@ mod tests {
                 panel.terminals[&terminal_id].view.read(cx).font_scale()
             })
         };
-        let content_width = panel.read_with(&cx, |panel, _| panel.terminal_content_width.get());
-        assert!(terminal_width(parent_id, &mut cx) <= content_width * 0.75);
+        let (content_width, sub_width) = panel.read_with(&cx, |panel, cx| {
+            (
+                panel.terminal_content_width.get(),
+                panel
+                    .terminal_overview_sub_width(parent_id, cx)
+                    .expect("sub terminal width should be known"),
+            )
+        });
+        assert!(terminal_width(parent_id, &mut cx) <= content_width - sub_width);
         assert!(terminal_width(child_id, &mut cx) > Pixels::ZERO);
-        assert!(terminal_width(child_id, &mut cx) <= content_width * 0.25);
+        assert!(terminal_width(child_id, &mut cx) <= sub_width);
         assert_eq!(font_scale(parent_id, &mut cx), None);
         assert_eq!(
             font_scale(child_id, &mut cx),
@@ -9731,7 +9758,7 @@ mod tests {
                 < terminal_bounds(parent_id, &mut cx).cell_width()
         );
 
-        cx.simulate_resize(size(px(1000.), px(1200.)));
+        cx.simulate_resize(size(px(500.), px(1200.)));
         cx.run_until_parked();
         cx.update(|window, cx| window.simulate_next_frame(cx));
         cx.run_until_parked();
@@ -9740,7 +9767,7 @@ mod tests {
             assert_eq!(panel.visible_overview_id(cx), None);
             panel.terminal_content_width.get()
         });
-        assert!(terminal_width(parent_id, &mut cx) > content_width * 0.75);
+        assert!(terminal_width(parent_id, &mut cx) > content_width - sub_width);
         assert_eq!(font_scale(child_id, &mut cx), None);
     }
 
@@ -10186,25 +10213,54 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_terminal_overview_fit_uses_smaller_sub_terminal_font(cx: &mut TestAppContext) {
+    async fn test_terminal_overview_sub_width_setting(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
         insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.activate_terminal(parent_id, true, window, cx);
         });
+        let set_width = |width: Option<f32>, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .agent
+                            .get_or_insert_default()
+                            .terminal_overview_width = width.map(settings::PixelSetting);
+                    });
+                });
+            });
+        };
+        let sub_width = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.terminal_overview_sub_width(parent_id, cx)
+            })
+        };
+        let fits = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| panel.terminal_overview_fits(parent_id, cx))
+        };
 
-        // 1100px leaves the sub terminal column 275px: 42 columns of the smaller
-        // sub terminal font, but only 34 at the parent's font size.
-        set_test_terminal_overview_layout(&panel, parent_id, px(1100.), &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(panel.terminal_overview_fits(parent_id, cx));
-        });
+        // 40 columns of the 6.4px sub terminal cells.
+        set_test_terminal_overview_layout(&panel, parent_id, px(576.), &mut cx);
+        assert_eq!(sub_width(&mut cx), Some(px(256.)));
+        assert!(fits(&mut cx));
+        set_test_terminal_overview_layout(&panel, parent_id, px(575.), &mut cx);
+        assert!(!fits(&mut cx));
 
-        set_test_terminal_overview_layout(&panel, parent_id, px(1000.), &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.terminal_overview_fits(parent_id, cx));
-        });
+        set_width(Some(400.), &mut cx);
+        assert_eq!(sub_width(&mut cx), Some(px(400.)));
+        set_test_terminal_overview_layout(&panel, parent_id, px(720.), &mut cx);
+        assert!(fits(&mut cx));
+        set_test_terminal_overview_layout(&panel, parent_id, px(719.), &mut cx);
+        assert!(!fits(&mut cx));
+
+        set_width(Some(100.), &mut cx);
+        assert_eq!(
+            sub_width(&mut cx),
+            Some(px(256.)),
+            "the width should not go below 40 sub terminal columns"
+        );
     }
 
     #[gpui::test]
@@ -10213,7 +10269,7 @@ mod tests {
             setup_test_terminal_overview(cx, 1).await;
         let sub_terminal_id = sub_terminal_ids[0];
 
-        cx.simulate_resize(size(px(1000.), px(1200.)));
+        cx.simulate_resize(size(px(500.), px(1200.)));
         cx.run_until_parked();
         cx.update(|window, cx| window.simulate_next_frame(cx));
         cx.run_until_parked();
@@ -10312,7 +10368,7 @@ mod tests {
             panel.read_with(cx, |panel, cx| panel.terminal_overview_button_state(cx))
         };
 
-        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
         assert_eq!(
             button_state(&mut cx),
             Some(TerminalOverviewButtonState {
@@ -10343,7 +10399,7 @@ mod tests {
         });
         assert_eq!(button_state(&mut cx), hide);
 
-        set_test_terminal_overview_layout(&panel, parent_id, px(800.), &mut cx);
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
         assert_eq!(
             button_state(&mut cx),
             hide,
