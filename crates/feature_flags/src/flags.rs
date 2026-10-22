@@ -81,8 +81,8 @@ register_feature_flag!(RenameToolFeatureFlag);
 /// Controls how agent thread worktree chips are labeled in the sidebar.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, EnumFeatureFlag)]
 pub enum AgentThreadWorktreeLabel {
-    #[default]
     Both,
+    #[default]
     Worktree,
     Branch,
 }

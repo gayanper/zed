@@ -62,6 +62,9 @@ pub const GRAPH_CHUNK_SIZE: usize = 1000;
 /// Default value for the `git.worktree_directory` setting.
 pub const DEFAULT_WORKTREE_DIRECTORY: &str = "../worktrees";
 
+/// Label shown for a repository's main worktree in worktree pickers and sidebar chips.
+pub const MAIN_WORKTREE_LABEL: &str = "main";
+
 /// Given the git common directory (from `commondir()`), derive the original
 /// repository's working directory.
 ///
@@ -352,7 +355,7 @@ impl Worktree {
 
     pub fn directory_name(&self, name_anchor_path: Option<&Path>) -> String {
         if self.is_main {
-            return "main worktree".to_string();
+            return MAIN_WORKTREE_LABEL.to_string();
         }
 
         let dir_name = self

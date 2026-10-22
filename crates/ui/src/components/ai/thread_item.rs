@@ -58,6 +58,7 @@ pub struct ThreadItem {
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    show_main_worktree: bool,
     is_remote: bool,
     archived: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -94,6 +95,7 @@ impl ThreadItem {
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            show_main_worktree: false,
             is_remote: false,
             archived: false,
             on_click: None,
@@ -198,6 +200,13 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    /// Shows chips for main worktree entries too; by default only linked
+    /// worktrees get a chip.
+    pub fn show_main_worktree(mut self, show: bool) -> Self {
+        self.show_main_worktree = show;
         self
     }
 
@@ -413,14 +422,15 @@ impl RenderOnce for ThreadItem {
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
         );
 
-        let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
+        let show_main_worktree = self.show_main_worktree;
+        let visible_worktrees: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
             .into_iter()
-            .filter(|wt| wt.kind == WorktreeKind::Linked)
+            .filter(|wt| wt.kind == WorktreeKind::Linked || show_main_worktree)
             .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
             .collect();
 
-        let has_worktree = !linked_worktrees.is_empty();
+        let has_worktree = !visible_worktrees.is_empty();
 
         let has_metadata = has_project_name
             || has_project_paths
@@ -528,7 +538,7 @@ impl RenderOnce for ThreadItem {
                                     this.child(dot_separator())
                                 })
                                 .children(
-                                    linked_worktrees.into_iter().map(|wt| {
+                                    visible_worktrees.into_iter().map(|wt| {
                                         let worktree_label = wt.worktree_name.clone().map(|name| {
                                             if wt.highlight_positions.is_empty() {
                                                 Label::new(name)

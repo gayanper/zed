@@ -16222,3 +16222,58 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
         u32::from(Rgba::from(color))
     })
 }
+
+#[test]
+fn test_apply_worktree_label_mode() {
+    let worktree = |kind: WorktreeKind, name: &str, branch: Option<&str>| ThreadItemWorktreeInfo {
+        worktree_name: Some(SharedString::from(name.to_string())),
+        branch_name: branch.map(|branch| SharedString::from(branch.to_string())),
+        full_path: SharedString::default(),
+        highlight_positions: vec![0, 1],
+        kind,
+    };
+    let worktrees = vec![
+        worktree(WorktreeKind::Main, "zed", Some("main")),
+        worktree(WorktreeKind::Main, "notes", None),
+        worktree(WorktreeKind::Linked, "jade-glen", Some("fix")),
+        worktree(WorktreeKind::Linked, "fawn-otter", None),
+    ];
+    let labels = |mode| {
+        apply_worktree_label_mode(worktrees.clone(), mode)
+            .into_iter()
+            .map(|wt| {
+                (
+                    wt.worktree_name.map(|name| name.to_string()),
+                    wt.branch_name.map(|branch| branch.to_string()),
+                    wt.highlight_positions,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let some = |text: &str| Some(text.to_string());
+
+    assert_eq!(
+        labels(AgentThreadWorktreeLabel::Both),
+        vec![
+            (some("main"), some("main"), vec![]),
+            (some("jade-glen"), some("fix"), vec![0, 1]),
+            (some("fawn-otter"), None, vec![0, 1]),
+        ]
+    );
+    assert_eq!(
+        labels(AgentThreadWorktreeLabel::Worktree),
+        vec![
+            (some("main"), None, vec![]),
+            (some("jade-glen"), None, vec![0, 1]),
+            (some("fawn-otter"), None, vec![0, 1]),
+        ]
+    );
+    assert_eq!(
+        labels(AgentThreadWorktreeLabel::Branch),
+        vec![
+            (None, some("main"), vec![]),
+            (None, some("fix"), vec![0, 1]),
+            (some("fawn-otter"), None, vec![0, 1]),
+        ]
+    );
+}

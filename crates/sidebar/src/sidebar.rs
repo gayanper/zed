@@ -60,7 +60,7 @@ use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    WorktreeKind, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -706,23 +706,33 @@ fn apply_worktree_label_mode(
     mut worktrees: Vec<ThreadItemWorktreeInfo>,
     mode: AgentThreadWorktreeLabel,
 ) -> Vec<ThreadItemWorktreeInfo> {
-    match mode {
-        AgentThreadWorktreeLabel::Both => {}
-        AgentThreadWorktreeLabel::Worktree => {
-            for wt in &mut worktrees {
-                wt.branch_name = None;
+    worktrees.retain_mut(|wt| {
+        if wt.kind == WorktreeKind::Main {
+            // Folders outside any git repository also produce Main entries, so
+            // a known branch is the signal that this is a git main worktree.
+            // Main worktrees on a detached HEAD, opened from a subdirectory of
+            // the repository, or whose workspace is closed have no branch here
+            // and are hidden too.
+            if wt.branch_name.is_none() {
+                return false;
             }
+            wt.worktree_name = Some(git::repository::MAIN_WORKTREE_LABEL.into());
+            // Search highlights were computed against the folder name.
+            wt.highlight_positions.clear();
         }
-        AgentThreadWorktreeLabel::Branch => {
-            for wt in &mut worktrees {
-                // Fall back to showing the worktree name when no branch is
-                // known; an empty chip would be worse than a mismatched icon.
+        match mode {
+            AgentThreadWorktreeLabel::Both => {}
+            AgentThreadWorktreeLabel::Worktree => wt.branch_name = None,
+            // Fall back to showing the worktree name when no branch is known;
+            // an empty chip would be worse than a mismatched icon.
+            AgentThreadWorktreeLabel::Branch => {
                 if wt.branch_name.is_some() {
                     wt.worktree_name = None;
                 }
             }
         }
-    }
+        true
+    });
     worktrees
 }
 
@@ -6453,6 +6463,7 @@ impl Sidebar {
                 this.custom_icon_from_external_svg(svg)
             })
             .worktrees(worktrees)
+            .show_main_worktree(true)
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
@@ -6784,6 +6795,7 @@ impl Sidebar {
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
             .worktrees(worktrees)
+            .show_main_worktree(true)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
