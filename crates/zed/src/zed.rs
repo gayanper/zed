@@ -5908,6 +5908,7 @@ mod tests {
                 "action",
                 "activity_indicator",
                 "agent",
+                "agent_comments",
                 "agents_sidebar",
                 "app_menu",
                 "assistant",
