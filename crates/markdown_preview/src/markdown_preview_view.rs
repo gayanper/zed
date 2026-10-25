@@ -48,7 +48,9 @@ use workspace::path_link::{PathMatching, resolve_open_target};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
-use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, delete_unloaded_items};
+use workspace::{
+    ItemId, ItemNavHistory, Pane, SaveIntent, Workspace, WorkspaceId, delete_unloaded_items,
+};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
@@ -88,6 +90,7 @@ pub struct MarkdownPreviewView {
     _theme_subscription: Subscription,
     #[cfg(test)]
     applied_agent_comment_background: Option<gpui::Hsla>,
+    nav_history: Option<ItemNavHistory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -452,6 +455,7 @@ impl MarkdownPreviewView {
                 }),
                 #[cfg(test)]
                 applied_agent_comment_background: None,
+                nav_history: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -1617,7 +1621,7 @@ fn resolve_preview_image(
     let path = if let (Some(stripped), Some(root)) = (workspace_relative_path, workspace_directory)
     {
         client_path_style.join_path(root, stripped).ok()?
-    } else if client_path_style.is_absolute(&decoded) {
+    } else if client_path_style.has_root(Path::new(&decoded)) {
         PathBuf::from(decoded)
     } else {
         client_path_style.join_path(base_directory?, decoded).ok()?
@@ -1639,7 +1643,7 @@ fn resolve_project_path_for_preview_image(
         .worktree_for_id(source_project_path.worktree_id, cx)?;
     let path_style = worktree.read(cx).path_style();
 
-    if workspace_relative_path.is_none() && path_style.is_absolute(decoded_path) {
+    if workspace_relative_path.is_none() && path_style.is_absolute(Path::new(decoded_path)) {
         return project
             .read(cx)
             .project_path_for_absolute_path(Path::new(decoded_path), cx);
@@ -1874,6 +1878,21 @@ impl Item for MarkdownPreviewView {
             window,
             cx,
         )))
+    }
+
+    fn set_nav_history(
+        &mut self,
+        history: ItemNavHistory,
+        _window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.nav_history = Some(history);
+    }
+
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav_history) = self.nav_history.as_mut() {
+            nav_history.push::<()>(None, None, cx);
+        }
     }
 }
 
@@ -3552,6 +3571,40 @@ mod tests {
                     .and_then(|item| item.downcast::<MarkdownPreviewView>())
                     .is_some(),
                 "splitting a preview should clone it into a new pane"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn go_back_returns_to_preview_after_opening_another_file(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({ "note.md": "# Note\n", "other.txt": "Other File\n" }),
+            false,
+        )
+        .await;
+
+        open_project_file(cx, &project, &multi_workspace, "note.md", None, true).await;
+        let preview = open_preview_for_active_editor(cx, &multi_workspace);
+        open_project_file(cx, &project, &multi_workspace, "other.txt", None, true).await;
+
+        let go_back = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let pane = workspace.active_pane().downgrade();
+                    workspace.go_back(pane, window, cx)
+                })
+            })
+            .unwrap();
+
+        go_back.await.unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item_as::<MarkdownPreviewView>(cx),
+                Some(preview.clone()),
+                "going back should return to the preview"
             );
         });
     }
