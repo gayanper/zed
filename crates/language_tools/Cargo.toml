@@ -12,6 +12,10 @@ workspace = true
 path = "src/language_tools.rs"
 doctest = false
 
+[features]
+default = ["copilot"]
+copilot = ["edit_prediction/copilot"]
+
 [dependencies]
 anyhow.workspace = true
 client.workspace = true

@@ -13,7 +13,11 @@ path = "src/settings_ui.rs"
 doctest = false
 
 [features]
-default = []
+default = ["agent-threads", "copilot", "hosted-llms", "zed-cloud"]
+agent-threads = []
+copilot = ["dep:copilot", "dep:copilot_ui", "edit_prediction_ui/copilot"]
+hosted-llms = ["dep:codestral", "edit_prediction_ui/hosted-llms"]
+zed-cloud = ["edit_prediction_ui/zed-cloud"]
 test-support = []
 
 [dependencies]
@@ -25,11 +29,11 @@ audio.workspace = true
 client.workspace = true
 cloud_api_types.workspace = true
 component.workspace = true
-codestral.workspace = true
+codestral = { workspace = true, optional = true }
 collections.workspace = true
 context_server.workspace = true
-copilot.workspace = true
-copilot_ui.workspace = true
+copilot = { workspace = true, optional = true }
+copilot_ui = { workspace = true, optional = true }
 cpal.workspace = true
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
@@ -79,7 +83,7 @@ zed_credentials_provider.workspace = true
 fs = { workspace = true, features = ["test-support"] }
 futures.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
-language_models = { workspace = true, features = ["test-support"] }
+language_models = { workspace = true, features = ["test-support", "zed-cloud"] }
 paths.workspace = true
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }

@@ -5,23 +5,35 @@ use http_client::http::{HeaderName, HeaderValue};
 pub mod anthropic;
 pub mod anthropic_compatible;
 pub mod api_compatible;
+#[cfg(feature = "hosted-llms")]
 pub mod bedrock;
+#[cfg(feature = "zed-cloud")]
 pub mod cloud;
+#[cfg(feature = "copilot")]
 pub mod copilot_chat;
+#[cfg(feature = "hosted-llms")]
 pub mod deepseek;
+#[cfg(feature = "hosted-llms")]
 pub mod google;
 pub mod llama_cpp;
 pub mod lmstudio;
+#[cfg(feature = "hosted-llms")]
 pub mod mistral;
 pub mod ollama;
 pub mod open_ai;
 pub mod open_ai_compatible;
+#[cfg(feature = "hosted-llms")]
 pub mod open_router;
+#[cfg(feature = "hosted-llms")]
 pub mod openai_subscribed;
+#[cfg(feature = "hosted-llms")]
 pub mod opencode;
 
+#[cfg(feature = "hosted-llms")]
 pub mod vercel_ai_gateway;
+#[cfg(feature = "hosted-llms")]
 pub mod x_ai;
+#[cfg(feature = "hosted-llms")]
 pub mod x_ai_subscribed;
 
 const COMMON_RESERVED_HEADER_NAMES: &[&str] = &["Authorization", "Content-Type", "Accept"];

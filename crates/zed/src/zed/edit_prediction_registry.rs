@@ -1,6 +1,8 @@
 use client::{Client, UserStore};
+#[cfg(feature = "hosted-llms")]
 use codestral::{CodestralEditPredictionDelegate, load_codestral_api_key};
 use collections::HashMap;
+#[cfg(feature = "copilot")]
 use copilot::CopilotEditPredictionDelegate;
 use edit_prediction::{EditPredictionModel, ZedEditPredictionDelegate, fim};
 use editor::{EditPredictionRequestTrigger, Editor};
@@ -113,11 +115,16 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
     let provider = settings.provider;
     match provider {
         EditPredictionProvider::None => None,
+        #[cfg(feature = "copilot")]
         EditPredictionProvider::Copilot => Some(EditPredictionProviderConfig::Copilot),
-        EditPredictionProvider::Zed => {
-            Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
-        }
+        #[cfg(not(feature = "copilot"))]
+        EditPredictionProvider::Copilot => None,
+        EditPredictionProvider::Zed => cfg!(feature = "zed-cloud")
+            .then_some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta)),
+        #[cfg(feature = "hosted-llms")]
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
+        #[cfg(not(feature = "hosted-llms"))]
+        EditPredictionProvider::Codestral => None,
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
             let custom_settings = if provider == EditPredictionProvider::Ollama {
                 settings.ollama.as_ref()?
@@ -136,7 +143,8 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
             }
 
             if matches!(format, EditPredictionPromptFormat::Zeta(_)) {
-                Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
+                cfg!(feature = "zed-cloud")
+                    .then_some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
             } else if format == EditPredictionPromptFormat::Sweep {
                 Some(EditPredictionProviderConfig::Zed(
                     EditPredictionModel::SweepPrompt,
@@ -148,15 +156,17 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
             }
         }
 
-        EditPredictionProvider::Mercury => Some(EditPredictionProviderConfig::Zed(
-            EditPredictionModel::Mercury,
-        )),
+        EditPredictionProvider::Mercury => cfg!(feature = "hosted-llms").then_some(
+            EditPredictionProviderConfig::Zed(EditPredictionModel::Mercury),
+        ),
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EditPredictionProviderConfig {
+    #[cfg(feature = "copilot")]
     Copilot,
+    #[cfg(feature = "hosted-llms")]
     Codestral,
     Zed(EditPredictionModel),
 }
@@ -164,7 +174,9 @@ enum EditPredictionProviderConfig {
 impl EditPredictionProviderConfig {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "copilot")]
             EditPredictionProviderConfig::Copilot => "Copilot",
+            #[cfg(feature = "hosted-llms")]
             EditPredictionProviderConfig::Codestral => "Codestral",
             EditPredictionProviderConfig::Zed(model) => match model {
                 EditPredictionModel::Zeta => "Zeta",
@@ -190,6 +202,7 @@ fn assign_edit_prediction_providers(
     user_store: Entity<UserStore>,
     cx: &mut App,
 ) {
+    #[cfg(feature = "hosted-llms")]
     if provider_config == Some(EditPredictionProviderConfig::Codestral) {
         load_codestral_api_key(cx).detach();
     }
@@ -228,6 +241,7 @@ fn assign_edit_prediction_provider(
                 None, trigger, window, cx,
             );
         }
+        #[cfg(feature = "copilot")]
         Some(EditPredictionProviderConfig::Copilot) => {
             let ep_store = edit_prediction::EditPredictionStore::global(client, &user_store, cx);
             let Some(project) = editor.project().cloned() else {
@@ -246,6 +260,7 @@ fn assign_edit_prediction_provider(
                 editor.set_edit_prediction_provider(Some(provider), trigger, window, cx);
             }
         }
+        #[cfg(feature = "hosted-llms")]
         Some(EditPredictionProviderConfig::Codestral) => {
             let http_client = client.http_client();
             let provider = cx.new(|_| CodestralEditPredictionDelegate::new(http_client));

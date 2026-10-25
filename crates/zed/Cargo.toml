@@ -12,6 +12,52 @@ default-run = "zed"
 workspace = true
 
 [features]
+default = [
+    "collab",
+    "auto-update-ui",
+    "copilot",
+    "hosted-llms",
+    "zed-cloud",
+    "agent-threads",
+]
+collab = [
+    "dep:call",
+    "dep:channel",
+    "dep:collab_ui",
+    "git_ui/call",
+    "title_bar/collab",
+    "file_finder/collab",
+    "notifications/collab",
+]
+auto-update-ui = ["dep:auto_update_ui"]
+agent-threads = [
+    "agent_ui/agent-threads",
+    "onboarding/agent-threads",
+    "settings_ui/agent-threads",
+]
+copilot = [
+    "dep:copilot",
+    "dep:copilot_chat",
+    "dep:copilot_ui",
+    "edit_prediction/copilot",
+    "edit_prediction_ui/copilot",
+    "language_models/copilot",
+    "language_tools/copilot",
+    "settings_ui/copilot",
+]
+hosted-llms = [
+    "dep:codestral",
+    "edit_prediction_ui/hosted-llms",
+    "language_models/hosted-llms",
+    "settings_ui/hosted-llms",
+]
+zed-cloud = [
+    "agent_ui/zed-cloud",
+    "edit_prediction/zed-cloud",
+    "edit_prediction_ui/zed-cloud",
+    "language_models/zed-cloud",
+    "settings_ui/zed-cloud",
+]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
@@ -80,24 +126,24 @@ askpass.workspace = true
 assets.workspace = true
 audio.workspace = true
 auto_update = { workspace = true, features = ["disable-auto-update"] }
-auto_update_ui.workspace = true
+auto_update_ui = { workspace = true, optional = true }
 breadcrumbs.workspace = true
-call.workspace = true
+call = { workspace = true, optional = true }
 call_hierarchy.workspace = true
-channel.workspace = true
+channel = { workspace = true, optional = true }
 chrono.workspace = true
 clap.workspace = true
 cli.workspace = true
 client.workspace = true
 clock = { workspace = true, optional = true }
-codestral.workspace = true
-collab_ui.workspace = true
+codestral = { workspace = true, optional = true }
+collab_ui = { workspace = true, optional = true }
 collections.workspace = true
 command_palette.workspace = true
 component_preview.workspace = true
-copilot.workspace = true
-copilot_chat.workspace = true
-copilot_ui.workspace = true
+copilot = { workspace = true, optional = true }
+copilot_chat = { workspace = true, optional = true }
+copilot_ui = { workspace = true, optional = true }
 crashes.workspace = true
 dap_adapters.workspace = true
 db.workspace = true
@@ -119,7 +165,7 @@ fs.workspace = true
 futures.workspace = true
 git.workspace = true
 git_hosting_providers.workspace = true
-git_ui = { workspace = true, features = ["call"] }
+git_ui.workspace = true
 git_ui_core.workspace = true
 go_to_line.workspace = true
 gpui = { workspace = true, features = ["profiler", "stacker"] }

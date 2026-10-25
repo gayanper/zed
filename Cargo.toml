@@ -290,7 +290,7 @@ agent_comments = { path = "crates/agent_comments" }
 agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
 agent_skills = { path = "crates/agent_skills" }
-agent_ui = { path = "crates/agent_ui" }
+agent_ui = { path = "crates/agent_ui", default-features = false }
 ai_onboarding = { path = "crates/ai_onboarding" }
 anthropic = { path = "crates/anthropic" }
 askpass = { path = "crates/askpass" }
@@ -337,11 +337,11 @@ deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
-edit_prediction = { path = "crates/edit_prediction" }
+edit_prediction = { path = "crates/edit_prediction", default-features = false }
 edit_prediction_context = { path = "crates/edit_prediction_context" }
 edit_prediction_metrics = { path = "crates/edit_prediction_metrics", features = ["tree-sitter"] }
 edit_prediction_types = { path = "crates/edit_prediction_types" }
-edit_prediction_ui = { path = "crates/edit_prediction_ui" }
+edit_prediction_ui = { path = "crates/edit_prediction_ui", default-features = false }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
@@ -355,7 +355,7 @@ feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
 file_content = { path = "crates/file_content" }
-file_finder = { path = "crates/file_finder" }
+file_finder = { path = "crates/file_finder", default-features = false }
 file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
@@ -398,11 +398,11 @@ language_detection = { path = "crates/language_detection" }
 language_extension = { path = "crates/language_extension" }
 language_model = { path = "crates/language_model" }
 language_model_core = { path = "crates/language_model_core" }
-language_models = { path = "crates/language_models" }
+language_models = { path = "crates/language_models", default-features = false }
 language_models_cloud = { path = "crates/language_models_cloud" }
 language_onboarding = { path = "crates/language_onboarding" }
 language_selector = { path = "crates/language_selector" }
-language_tools = { path = "crates/language_tools" }
+language_tools = { path = "crates/language_tools", default-features = false }
 languages = { path = "crates/languages" }
 line_ending_selector = { path = "crates/line_ending_selector" }
 livekit_api = { path = "crates/livekit_api" }
@@ -422,10 +422,10 @@ mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
 net = { path = "crates/net" }
 node_runtime = { path = "crates/node_runtime" }
-notifications = { path = "crates/notifications" }
+notifications = { path = "crates/notifications", default-features = false }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 ollama = { path = "crates/ollama" }
-onboarding = { path = "crates/onboarding" }
+onboarding = { path = "crates/onboarding", default-features = false }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
@@ -466,7 +466,7 @@ settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json", default-features = false }
 settings_macros = { path = "crates/settings_macros" }
 settings_profile_selector = { path = "crates/settings_profile_selector" }
-settings_ui = { path = "crates/settings_ui" }
+settings_ui = { path = "crates/settings_ui", default-features = false }
 shell_command_parser = { path = "crates/shell_command_parser" }
 sidebar = { path = "crates/sidebar" }
 snippet = { path = "crates/snippet" }
@@ -493,7 +493,7 @@ theme_extension = { path = "crates/theme_extension" }
 theme_selector = { path = "crates/theme_selector" }
 theme_settings = { path = "crates/theme_settings" }
 time_format = { path = "crates/time_format" }
-title_bar = { path = "crates/title_bar" }
+title_bar = { path = "crates/title_bar", default-features = false }
 toolchain_selector = { path = "crates/toolchain_selector" }
 ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }

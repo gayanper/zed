@@ -14,8 +14,10 @@ doctest = false
 test = false
 
 [features]
+default = ["collab"]
+collab = ["dep:channel"]
 test-support = [
-    "channel/test-support",
+    "channel?/test-support",
 
     "gpui/test-support",
     "rpc/test-support",
@@ -23,7 +25,7 @@ test-support = [
 
 [dependencies]
 anyhow.workspace = true
-channel.workspace = true
+channel = { workspace = true, optional = true }
 client.workspace = true
 futures-lite.workspace = true
 component.workspace = true

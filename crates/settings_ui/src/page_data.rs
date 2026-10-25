@@ -9411,16 +9411,25 @@ fn ai_page(cx: &App) -> SettingsPage {
         })]
     }
 
+    let mut items = concat_sections!(
+        @vec,
+        general_section(),
+        agent_configuration_section(cx),
+        edit_prediction_language_settings_section(),
+        edit_prediction_display_sub_section(),
+    );
+    if !cfg!(feature = "agent-threads") {
+        items.retain(|item| {
+            !matches!(
+                item,
+                SettingsPageItem::SubPageLink(link) if link.json_path == Some("agent_servers")
+            )
+        });
+    }
+
     SettingsPage {
         title: "AI",
-        items: concat_sections!(
-            @vec,
-            general_section(),
-            agent_configuration_section(cx),
-            edit_prediction_language_settings_section(),
-            edit_prediction_display_sub_section(),
-        )
-        .into(),
+        items: items.into(),
     }
 }
 

@@ -1,4 +1,5 @@
 mod agent_notification;
+#[cfg(feature = "zed-cloud")]
 mod end_trial_upsell;
 mod mention_crease;
 mod model_selector_components;
@@ -8,6 +9,7 @@ mod terminal_tool_header;
 mod undo_reject_toast;
 
 pub use agent_notification::*;
+#[cfg(feature = "zed-cloud")]
 pub use end_trial_upsell::*;
 pub use mention_crease::*;
 pub use model_selector_components::*;

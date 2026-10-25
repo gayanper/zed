@@ -92,7 +92,7 @@ dap_adapters = { workspace = true, features = ["test-support"] }
 debugger_ui = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 extension.workspace = true
-file_finder.workspace = true
+file_finder = { workspace = true, features = ["collab"] }
 fs = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
 git_hosting_providers.workspace = true
@@ -109,7 +109,7 @@ lsp = { workspace = true, features = ["test-support"] }
 menu.workspace = true
 multi_buffer = { workspace = true, features = ["test-support"] }
 node_runtime.workspace = true
-notifications = { workspace = true, features = ["test-support"] }
+notifications = { workspace = true, features = ["collab", "test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 rand.workspace = true
@@ -126,7 +126,7 @@ sqlx.workspace = true
 task.workspace = true
 theme.workspace = true
 theme_settings = { workspace = true, features = ["test-support"] }
-title_bar = { workspace = true, features = ["test-support"] }
+title_bar = { workspace = true, features = ["collab", "test-support"] }
 
 unindent.workspace = true
 util.workspace = true

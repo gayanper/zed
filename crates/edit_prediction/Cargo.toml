@@ -13,10 +13,13 @@ path = "src/edit_prediction.rs"
 doctest = false
 
 [features]
+default = ["copilot", "zed-cloud"]
 cli-support = []
+copilot = ["dep:copilot", "dep:copilot_ui"]
+zed-cloud = ["dep:ai_onboarding"]
 
 [dependencies]
-ai_onboarding.workspace = true
+ai_onboarding = { workspace = true, optional = true }
 anyhow.workspace = true
 heapless.workspace = true
 buffer_diff.workspace = true
@@ -26,8 +29,8 @@ cloud_api_client.workspace = true
 cloud_api_types.workspace = true
 cloud_llm_client = { workspace = true, features = ["predict-edits"] }
 collections.workspace = true
-copilot.workspace = true
-copilot_ui.workspace = true
+copilot = { workspace = true, optional = true }
+copilot_ui = { workspace = true, optional = true }
 credentials_provider.workspace = true
 db.workspace = true
 edit_prediction_types.workspace = true

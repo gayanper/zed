@@ -333,11 +333,22 @@ fn draft_display_label_for_thread_metadata(
     Some((placeholder, DraftKind::Empty))
 }
 
+fn new_thread_tooltip() -> &'static str {
+    if agent_ui::agent_threads_enabled() {
+        "Start New Agent Thread"
+    } else {
+        "Start New Terminal Thread"
+    }
+}
+
 fn thread_metadata_would_render_sidebar_row(
     metadata: &ThreadMetadata,
     workspace: &ThreadEntryWorkspace,
     cx: &App,
 ) -> bool {
+    if !agent_ui::agent_threads_enabled() {
+        return false;
+    }
     if !metadata.is_draft() {
         return true;
     }
@@ -1639,7 +1650,7 @@ impl Sidebar {
             let mut waiting_thread_count: usize = 0;
             let group_host = group_key.host();
 
-            if should_load_threads {
+            if should_load_threads && agent_ui::agent_threads_enabled() {
                 let thread_store = ThreadMetadataStore::global(cx);
 
                 let make_thread_entry =
@@ -2630,7 +2641,7 @@ impl Sidebar {
             let key = key.clone();
             return button
                 .tooltip(move |_, cx| {
-                    Tooltip::for_action_in("Start New Agent Thread", &NewThread, &focus_handle, cx)
+                    Tooltip::for_action_in(new_thread_tooltip(), &NewThread, &focus_handle, cx)
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_group_expanded(&key, true, cx);
@@ -2657,7 +2668,7 @@ impl Sidebar {
         )))
         .with_handle(menu_handle)
         .trigger_with_tooltip(button, move |_, cx| {
-            Tooltip::for_action_in("Start New Agent Thread", &NewThread, &focus_handle, cx)
+            Tooltip::for_action_in(new_thread_tooltip(), &NewThread, &focus_handle, cx)
         })
         .anchor(gpui::Anchor::TopLeft)
         .on_open(Rc::new({
@@ -7871,6 +7882,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !agent_ui::agent_threads_enabled() {
+            return;
+        }
         telemetry::event!(
             "Agent Threads Import Clicked",
             source = source,
@@ -7925,7 +7939,9 @@ impl Sidebar {
             })
             .unwrap_or(false);
 
-        has_external_agents && !AcpThreadImportOnboarding::dismissed(cx)
+        agent_ui::agent_threads_enabled()
+            && has_external_agents
+            && !AcpThreadImportOnboarding::dismissed(cx)
     }
 
     fn render_acp_import_onboarding(

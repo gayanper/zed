@@ -283,6 +283,12 @@ impl AgentThreadSource {
     }
 }
 
+/// Whether native and external (ACP) agent threads are offered. When disabled, the agent
+/// panel and sidebar only offer terminal threads.
+pub fn agent_threads_enabled() -> bool {
+    cfg!(feature = "agent-threads")
+}
+
 pub(crate) fn agent_sidebar_side(cx: &App) -> &'static str {
     match AgentSettings::get_global(cx).sidebar_side() {
         SidebarSide::Left => "left",
@@ -723,6 +729,10 @@ pub fn init(
                   _: &zed_actions::AcpRegistry,
                   window: &mut Window,
                   cx: &mut Context<Workspace>| {
+                // The registry store is not initialized when agent threads are disabled.
+                if !agent_threads_enabled() {
+                    return;
+                }
                 let existing = workspace
                     .active_pane()
                     .read(cx)
@@ -756,6 +766,9 @@ pub fn init(
              _: &ImportThreadsFromOtherChannels,
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
+                if !agent_threads_enabled() {
+                    return;
+                }
                 import_threads_from_other_channels(workspace, cx);
             },
         );
@@ -969,6 +982,18 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.show_action_types(skill_creator_actions.iter());
         } else {
             filter.hide_action_types(&skill_creator_actions);
+        }
+
+        if !agent_threads_enabled() {
+            filter.hide_action_types(&[
+                TypeId::of::<NewExternalAgentThread>(),
+                TypeId::of::<NewNativeAgentThreadFromSummary>(),
+                TypeId::of::<LoadThreadFromClipboard>(),
+                TypeId::of::<CopyThreadToClipboard>(),
+                TypeId::of::<OpenActiveThreadAsMarkdown>(),
+                TypeId::of::<ImportThreadsFromOtherChannels>(),
+                TypeId::of::<zed_actions::AcpRegistry>(),
+            ]);
         }
     });
 }

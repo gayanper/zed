@@ -21,6 +21,7 @@ use cloud_llm_client::{
     ZED_VERSION_HEADER_NAME,
 };
 use collections::{HashMap, HashSet};
+#[cfg(feature = "copilot")]
 use copilot::{Copilot, Reinstall};
 use credentials_provider::CredentialsProvider;
 use db::kvp::{Dismissable, KeyValueStore};
@@ -77,6 +78,7 @@ use thiserror::Error;
 use util::{ResultExt as _, rel_path::RelPath};
 
 pub mod cursor_excerpt;
+#[cfg_attr(not(feature = "zed-cloud"), allow(dead_code))]
 pub mod data_collection;
 pub mod example_spec;
 pub mod fim;
@@ -84,6 +86,7 @@ mod license_detection;
 pub mod mercury;
 pub mod metrics;
 pub mod ollama;
+#[cfg(feature = "zed-cloud")]
 mod onboarding_modal;
 pub mod open_ai_response;
 mod prediction;
@@ -93,17 +96,19 @@ pub mod udiff;
 
 pub mod open_ai_compatible;
 mod zed_edit_prediction_delegate;
+#[cfg_attr(not(feature = "zed-cloud"), allow(dead_code))]
 pub mod zeta;
 
 #[cfg(test)]
 mod edit_prediction_tests;
 
 use crate::cursor_excerpt::expand_context_syntactically_then_linewise;
-use crate::data_collection::{CapturedPredictionContext, capture_prediction_context};
+use crate::data_collection::CapturedPredictionContext;
 use crate::example_spec::RecentFile;
 use crate::license_detection::LicenseDetectionWatcher;
 use crate::mercury::Mercury;
 pub use crate::metrics::{KeptRateResult, compute_kept_rate};
+#[cfg(feature = "zed-cloud")]
 use crate::onboarding_modal::ZedPredictModal;
 use crate::prediction::EditPredictionResult;
 pub use crate::prediction::{EditPrediction, EditPredictionId, EditPredictionInputs};
@@ -378,6 +383,7 @@ struct ProjectState {
     context: Entity<RelatedExcerptStore>,
     license_detection_watchers: HashMap<WorktreeId, Rc<LicenseDetectionWatcher>>,
     _subscriptions: [gpui::Subscription; 2],
+    #[cfg(feature = "copilot")]
     copilot: Option<Entity<Copilot>>,
 }
 
@@ -1051,7 +1057,11 @@ impl EditPredictionStore {
             _fetch_experiments_task: fetch_experiments_task,
             _user_store_subscription: user_store_subscription,
             update_required: false,
+            #[cfg(feature = "zed-cloud")]
             edit_prediction_model: EditPredictionModel::Zeta,
+            // Placeholder only: the registry always sets the model before requesting predictions.
+            #[cfg(not(feature = "zed-cloud"))]
+            edit_prediction_model: EditPredictionModel::SweepPrompt,
             zeta2_raw_config: Self::zeta2_raw_config_from_env(),
             request_backoff_until: None,
             preferred_experiment: None,
@@ -1275,12 +1285,14 @@ impl EditPredictionStore {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "copilot")]
     pub fn copilot_for_project(&self, project: &Entity<Project>) -> Option<Entity<Copilot>> {
         self.projects
             .get(&project.entity_id())
             .and_then(|project| project.copilot.clone())
     }
 
+    #[cfg(feature = "copilot")]
     pub fn start_copilot_for_project(
         &mut self,
         project: &Entity<Project>,
@@ -1455,6 +1467,7 @@ impl EditPredictionStore {
                         cx.notify();
                     }),
                 ],
+                #[cfg(feature = "copilot")]
                 copilot: None,
             })
     }
@@ -1888,10 +1901,12 @@ impl EditPredictionStore {
                 );
             }
             EditPredictionModel::Zeta => {
+                #[cfg(feature = "zed-cloud")]
                 let is_cloud = !matches!(
                     all_language_settings(None, cx).edit_predictions.provider,
                     EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi
                 );
+                #[cfg(feature = "zed-cloud")]
                 if is_cloud {
                     zeta::edit_prediction_accepted(self, current_prediction, cx)
                 }
@@ -2814,6 +2829,7 @@ impl EditPredictionStore {
         }
 
         self.get_or_init_project(&project, cx);
+        #[cfg_attr(not(feature = "zed-cloud"), allow(unused_variables))]
         let (stored_events, prompt_history_boundary, debug_tx) = {
             let project_state = self.projects.get(&project.entity_id()).unwrap();
             (
@@ -2851,6 +2867,7 @@ impl EditPredictionStore {
         };
 
         let buffer_id = active_buffer.read(cx).remote_id();
+        #[cfg_attr(not(feature = "zed-cloud"), allow(unused_variables))]
         let (repository_url, revision) = project
             .read(cx)
             .git_store()
@@ -2902,7 +2919,10 @@ impl EditPredictionStore {
             snapshot,
             position,
             events,
+            #[cfg(feature = "zed-cloud")]
             stored_events: stored_events.clone(),
+            #[cfg(not(feature = "zed-cloud"))]
+            stored_events,
             related_files,
             editable_context,
             mode,
@@ -2915,6 +2935,9 @@ impl EditPredictionStore {
         };
 
         let task = match self.edit_prediction_model {
+            #[cfg(not(feature = "zed-cloud"))]
+            EditPredictionModel::Zeta => Task::ready(Ok(None)),
+            #[cfg(feature = "zed-cloud")]
             EditPredictionModel::Zeta => {
                 let context_task = can_collect_data
                     .then(|| {
@@ -2926,7 +2949,7 @@ impl EditPredictionStore {
                             vec![ContextSource::CurrentFile, ContextSource::EditHistory],
                             cx,
                         );
-                        capture_prediction_context(
+                        data_collection::capture_prediction_context(
                             inputs.project.clone(),
                             inputs.buffer.clone(),
                             inputs.position,
@@ -3638,6 +3661,7 @@ fn show_free_plan_edit_predictions_ended_notice_once(user_store: &Entity<UserSto
 
 pub fn init(cx: &mut App) {
     cx.observe_new(move |workspace: &mut Workspace, _, _cx| {
+        #[cfg(feature = "zed-cloud")]
         workspace.register_action(
             move |workspace, _: &zed_actions::OpenZedPredictOnboarding, window, cx| {
                 ZedPredictModal::toggle(
@@ -3660,12 +3684,14 @@ pub fn init(cx: &mut App) {
                     .provider = Some(EditPredictionProvider::None)
             });
         });
+        #[cfg(feature = "copilot")]
         fn copilot_for_project(project: &Entity<Project>, cx: &mut App) -> Option<Entity<Copilot>> {
             EditPredictionStore::try_global(cx).and_then(|store| {
                 store.update(cx, |this, cx| this.start_copilot_for_project(project, cx))
             })
         }
 
+        #[cfg(feature = "copilot")]
         workspace.register_action(|workspace, _: &Reinstall, window, cx| {
             if let Some(copilot) = copilot_for_project(workspace.project(), cx) {
                 copilot_ui::reinstall_and_sign_in(copilot, window, cx);

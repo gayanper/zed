@@ -1,7 +1,9 @@
 use anyhow::Result;
 use client::{Client, UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
+#[cfg(feature = "hosted-llms")]
 use codestral::{self, CodestralEditPredictionDelegate};
+#[cfg(feature = "copilot")]
 use copilot::Status;
 use edit_prediction::EditPredictionStore;
 use edit_prediction_types::EditPredictionDelegateHandle;
@@ -35,8 +37,7 @@ use ui::{
 use util::ResultExt as _;
 
 use workspace::{
-    HideStatusItem, StatusItemView, Toast, Workspace, create_and_open_local_file, item::ItemHandle,
-    notifications::NotificationId,
+    HideStatusItem, StatusItemView, Workspace, create_and_open_local_file, item::ItemHandle,
 };
 use zed_actions::{OpenBrowser, OpenSettingsAt};
 
@@ -50,10 +51,13 @@ actions!(
     ]
 );
 
+#[cfg(feature = "copilot")]
 const COPILOT_SETTINGS_PATH: &str = "/settings/copilot";
+#[cfg(feature = "copilot")]
 const COPILOT_SETTINGS_URL: &str = concat!("https://github.com", "/settings/copilot");
 const PRIVACY_DOCS: &str = "https://zed.dev/docs/ai/privacy-and-security";
 
+#[cfg(feature = "copilot")]
 struct CopilotErrorToast;
 
 pub struct EditPredictionButton {
@@ -80,6 +84,7 @@ impl Render for EditPredictionButton {
         let language_settings = all_language_settings(None, cx);
 
         match language_settings.edit_predictions.provider {
+            #[cfg(feature = "copilot")]
             EditPredictionProvider::Copilot => {
                 let Some(copilot) = EditPredictionStore::try_global(cx)
                     .and_then(|store| store.read(cx).copilot_for_project(&self.project.upgrade()?))
@@ -113,8 +118,10 @@ impl Render for EditPredictionButton {
                                     workspace.update(cx, |workspace, cx| {
                                         let copilot = copilot.clone();
                                         workspace.show_toast(
-                                            Toast::new(
-                                                NotificationId::unique::<CopilotErrorToast>(),
+                                            workspace::Toast::new(
+                                                workspace::notifications::NotificationId::unique::<
+                                                    CopilotErrorToast,
+                                                >(),
                                                 format!(
                                                     "Copilot Edit Predictions can't be started: {}",
                                                     e
@@ -193,6 +200,7 @@ impl Render for EditPredictionButton {
                         .with_handle(self.popover_menu_handle.clone()),
                 )
             }
+            #[cfg(feature = "hosted-llms")]
             EditPredictionProvider::Codestral => {
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let has_api_key = codestral::codestral_api_key(cx).is_some();
@@ -343,6 +351,13 @@ impl Render for EditPredictionButton {
                 )
             }
             provider @ (EditPredictionProvider::Zed | EditPredictionProvider::Mercury) => {
+                // The registry assigns no predictor for these providers when their features are off.
+                if (provider == EditPredictionProvider::Zed && !cfg!(feature = "zed-cloud"))
+                    || (provider == EditPredictionProvider::Mercury
+                        && !cfg!(feature = "hosted-llms"))
+                {
+                    return div().hidden();
+                }
                 if edit_prediction::zed_edit_predictions_off_for_plan(self.user_store.read(cx), cx)
                 {
                     return div().hidden();
@@ -555,6 +570,10 @@ impl Render for EditPredictionButton {
                 div().child(popover_menu.into_any_element())
             }
 
+            #[cfg(not(feature = "copilot"))]
+            EditPredictionProvider::Copilot => div().hidden(),
+            #[cfg(not(feature = "hosted-llms"))]
+            EditPredictionProvider::Codestral => div().hidden(),
             EditPredictionProvider::None => div().hidden(),
         }
     }
@@ -568,9 +587,11 @@ impl EditPredictionButton {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(feature = "copilot")]
         let copilot = EditPredictionStore::try_global(cx).and_then(|store| {
             store.update(cx, |this, cx| this.start_copilot_for_project(&project, cx))
         });
+        #[cfg(feature = "copilot")]
         if let Some(copilot) = copilot {
             cx.observe(&copilot, |_, _, cx| cx.notify()).detach()
         }
@@ -596,6 +617,7 @@ impl EditPredictionButton {
         })
         .detach();
 
+        #[cfg(feature = "hosted-llms")]
         CodestralEditPredictionDelegate::ensure_api_key_loaded(cx);
 
         Self {
@@ -699,6 +721,7 @@ impl EditPredictionButton {
         )
     }
 
+    #[cfg(feature = "copilot")]
     pub fn build_copilot_start_menu(
         &mut self,
         window: &mut Window,
@@ -1073,6 +1096,7 @@ impl EditPredictionButton {
         menu
     }
 
+    #[cfg(feature = "copilot")]
     fn build_copilot_context_menu(
         &self,
         window: &mut Window,
@@ -1132,6 +1156,7 @@ impl EditPredictionButton {
         })
     }
 
+    #[cfg(feature = "hosted-llms")]
     fn build_codestral_context_menu(
         &self,
         window: &mut Window,
@@ -1579,15 +1604,19 @@ pub fn set_completion_provider(fs: Arc<dyn Fs>, cx: &mut App, provider: EditPred
 pub fn get_available_providers(cx: &mut App) -> Vec<EditPredictionProvider> {
     let mut providers = Vec::new();
 
+    #[cfg(feature = "zed-cloud")]
     providers.push(EditPredictionProvider::Zed);
 
+    #[cfg(feature = "copilot")]
     let app_state = workspace::AppState::global(cx);
+    #[cfg(feature = "copilot")]
     if copilot::GlobalCopilotAuth::try_get_or_init(app_state, cx)
         .is_some_and(|copilot| copilot.0.read(cx).is_authenticated())
     {
         providers.push(EditPredictionProvider::Copilot);
     };
 
+    #[cfg(feature = "hosted-llms")]
     if codestral::codestral_api_key(cx).is_some() {
         providers.push(EditPredictionProvider::Codestral);
     }
@@ -1637,6 +1666,7 @@ fn toggle_show_edit_predictions_for_language(
     });
 }
 
+#[cfg(feature = "copilot")]
 fn hide_copilot(fs: Arc<dyn Fs>, cx: &mut App) {
     update_settings_file(fs, cx, move |settings, _| {
         settings
@@ -1767,6 +1797,7 @@ fn emit_edit_prediction_menu_opened(
     );
 }
 
+#[cfg(feature = "copilot")]
 fn copilot_settings_url(enterprise_uri: Option<&str>) -> Arc<str> {
     match enterprise_uri {
         Some(uri) => format!("{}{}", uri.trim_end_matches('/'), COPILOT_SETTINGS_PATH).into(),

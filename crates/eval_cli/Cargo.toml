@@ -16,7 +16,7 @@ path = "src/main.rs"
 acp_thread.workspace = true
 agent.workspace = true
 agent-client-protocol.workspace = true
-agent_ui.workspace = true
+agent_ui = { workspace = true, features = ["agent-threads", "zed-cloud"] }
 anyhow.workspace = true
 clap.workspace = true
 client.workspace = true
@@ -34,7 +34,7 @@ gpui_tokio.workspace = true
 language.workspace = true
 language_extension.workspace = true
 language_model.workspace = true
-language_models.workspace = true
+language_models = { workspace = true, features = ["copilot", "hosted-llms", "zed-cloud"] }
 languages = { workspace = true, features = ["load-grammars"] }
 node_runtime.workspace = true
 paths.workspace = true

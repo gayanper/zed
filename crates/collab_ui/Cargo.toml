@@ -41,7 +41,7 @@ fuzzy.workspace = true
 gpui.workspace = true
 livekit_client.workspace = true
 menu.workspace = true
-notifications.workspace = true
+notifications = { workspace = true, features = ["collab"] }
 picker.workspace = true
 project.workspace = true
 release_channel.workspace = true
@@ -54,7 +54,7 @@ smol.workspace = true
 telemetry.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
-title_bar.workspace = true
+title_bar = { workspace = true, features = ["collab"] }
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true

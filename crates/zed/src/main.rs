@@ -20,6 +20,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
+#[cfg(feature = "collab")]
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
 use crashes::InitCrashHandler;
@@ -27,7 +28,7 @@ use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use editor::Editor;
 use extension::ExtensionHostProxy;
 use fs::{Fs, RealFs};
-use futures::{FutureExt, StreamExt, channel::oneshot, future};
+use futures::{FutureExt, StreamExt, channel::oneshot};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
@@ -68,9 +69,7 @@ use util::{ResultExt, maybe};
 use uuid::Uuid;
 use workspace::{
     AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
-    WorkspaceSettings, WorkspaceStore,
-    notifications::{NotificationId, NotifyResultExt},
-    restore_multiworkspace,
+    WorkspaceSettings, WorkspaceStore, notifications::NotificationId, restore_multiworkspace,
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
@@ -657,6 +656,7 @@ fn main() {
         watcher_debug::init(app_state.clone(), cx);
         auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
+        #[cfg(feature = "auto-update-ui")]
         auto_update_ui::init(cx);
         reliability::init(client.clone(), app_state.workspace_store.clone(), cx);
         extension_host::init(
@@ -675,20 +675,23 @@ fn main() {
             cx.background_executor().clone(),
         );
         command_palette::init(cx);
-        let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
-            enterprise_uri: settings::CopilotSettings::get_global(cx)
-                .enterprise_uri
-                .clone(),
-        };
-        let credentials_provider = zed_credentials_provider::global(cx);
-        copilot_chat::init(
-            app_state.client.http_client(),
-            credentials_provider,
-            copilot_chat_configuration,
-            cx,
-        );
+        #[cfg(feature = "copilot")]
+        {
+            let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
+                enterprise_uri: settings::CopilotSettings::get_global(cx)
+                    .enterprise_uri
+                    .clone(),
+            };
+            let credentials_provider = zed_credentials_provider::global(cx);
+            copilot_chat::init(
+                app_state.client.http_client(),
+                credentials_provider,
+                copilot_chat_configuration,
+                cx,
+            );
 
-        copilot_ui::init(&app_state, cx);
+            copilot_ui::init(&app_state, cx);
+        }
         language_model::init(cx);
         RefreshLlmTokenListener::register(
             app_state.client.clone(),
@@ -705,11 +708,13 @@ fn main() {
         snippet_provider::init(cx);
         edit_prediction_registry::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
-        project::AgentRegistryStore::init_global(
-            cx,
-            app_state.fs.clone(),
-            app_state.client.http_client(),
-        );
+        if agent_ui::agent_threads_enabled() {
+            project::AgentRegistryStore::init_global(
+                cx,
+                app_state.fs.clone(),
+                app_state.client.http_client(),
+            );
+        }
         agent_ui::init(
             app_state.fs.clone(),
             prompt_builder,
@@ -748,6 +753,7 @@ fn main() {
         outline_panel::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
+        #[cfg(feature = "collab")]
         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
         search::init(cx);
         lsp_locations::init(cx);
@@ -771,9 +777,12 @@ fn main() {
         theme_selector::init(cx);
         settings_profile_selector::init(cx);
         language_tools::init(cx);
-        call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        collab_ui::init(&app_state, cx);
+        #[cfg(feature = "collab")]
+        {
+            call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+            notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+            collab_ui::init(&app_state, cx);
+        }
         git_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
@@ -1317,6 +1326,14 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 // show a visible error message.
                 client.connect(true, cx).await.into_response().log_err();
 
+                // Joining a channel requires the active call, which only exists with collab.
+                #[cfg(not(feature = "collab"))]
+                if request.join_channel.is_some() || !request.open_channel_notes.is_empty() {
+                    log::warn!(
+                        "ignoring channel link: collaboration is not included in this build"
+                    );
+                }
+                #[cfg(feature = "collab")]
                 if let Some(channel_id) = request.join_channel {
                     cx.update(|cx| {
                         workspace::join_channel(
@@ -1330,26 +1347,36 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     .await?;
                 }
 
+                #[cfg_attr(not(feature = "collab"), allow(unused_variables))]
                 let workspace_window =
                     workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
 
-                let workspace = workspace_window.read_with(cx, |mw, _| mw.workspace().clone())?;
-                let weak_workspace = workspace.downgrade();
+                #[cfg(feature = "collab")]
+                {
+                    use workspace::notifications::NotifyResultExt as _;
 
-                let mut promises = Vec::new();
-                for (channel_id, heading) in request.open_channel_notes {
-                    promises.push(cx.update_window(workspace_window.into(), |_, window, cx| {
-                        ChannelView::open(
-                            client::ChannelId(channel_id),
-                            heading,
-                            workspace.clone(),
-                            window,
-                            cx,
-                        )
-                    })?)
-                }
-                for result in future::join_all(promises).await {
-                    result.notify_workspace_async_err(weak_workspace.clone(), cx);
+                    let workspace =
+                        workspace_window.read_with(cx, |mw, _| mw.workspace().clone())?;
+                    let weak_workspace = workspace.downgrade();
+
+                    let mut promises = Vec::new();
+                    for (channel_id, heading) in request.open_channel_notes {
+                        promises.push(cx.update_window(
+                            workspace_window.into(),
+                            |_, window, cx| {
+                                ChannelView::open(
+                                    client::ChannelId(channel_id),
+                                    heading,
+                                    workspace.clone(),
+                                    window,
+                                    cx,
+                                )
+                            },
+                        )?)
+                    }
+                    for result in futures::future::join_all(promises).await {
+                        result.notify_workspace_async_err(weak_workspace.clone(), cx);
+                    }
                 }
                 anyhow::Ok(())
             })

@@ -13,6 +13,7 @@ path = "src/agent_ui.rs"
 doctest = false
 
 [features]
+default = ["agent-threads", "zed-cloud"]
 test-support = [
     "acp_thread/test-support",
     "eval_utils",
@@ -22,7 +23,9 @@ test-support = [
     "workspace/test-support",
     "agent/test-support",
 ]
+agent-threads = []
 audio = ["dep:audio"]
+zed-cloud = ["dep:ai_onboarding", "language_models/zed-cloud"]
 unit-eval = []
 
 [dependencies]
@@ -35,7 +38,7 @@ async-channel.workspace = true
 agent_servers.workspace = true
 agent_settings.workspace = true
 agent_skills.workspace = true
-ai_onboarding.workspace = true
+ai_onboarding = { workspace = true, optional = true }
 anyhow.workspace = true
 heapless.workspace = true
 audio = { workspace = true, optional = true }

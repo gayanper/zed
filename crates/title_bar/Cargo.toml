@@ -13,10 +13,11 @@ path = "src/title_bar.rs"
 doctest = false
 
 [features]
-default = []
+default = ["collab"]
+collab = ["dep:call", "dep:channel", "dep:livekit_client"]
 
 test-support = [
-    "call/test-support",
+    "call?/test-support",
     "client/test-support",
 
     "gpui/test-support",
@@ -34,8 +35,8 @@ anyhow.workspace = true
 auto_update.workspace = true
 fs.workspace = true
 platform_title_bar.workspace = true
-call.workspace = true
-channel.workspace = true
+call = { workspace = true, optional = true }
+channel = { workspace = true, optional = true }
 chrono.workspace = true
 client.workspace = true
 cloud_api_types.workspace = true
@@ -45,7 +46,7 @@ db.workspace = true
 git_ui_core.workspace = true
 gpui = { workspace = true, features = ["screen-capture"] }
 icons.workspace = true
-livekit_client.workspace = true
+livekit_client = { workspace = true, optional = true }
 project.workspace = true
 recent_projects.workspace = true
 remote.workspace = true

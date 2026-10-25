@@ -14,7 +14,8 @@ test = false
 doctest = false
 
 [features]
-default = []
+default = ["agent-threads"]
+agent-threads = []
 
 [dependencies]
 anyhow.workspace = true

@@ -1,4 +1,5 @@
 mod application_menu;
+#[cfg(feature = "collab")]
 pub mod collab;
 mod onboarding_banner;
 mod plan_chip;
@@ -22,6 +23,7 @@ use crate::application_menu::{
 };
 
 use auto_update::AutoUpdateStatus;
+#[cfg(feature = "collab")]
 use call::ActiveCall;
 use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
@@ -29,7 +31,7 @@ use command_palette_hooks::CommandPaletteFilter;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div,
     pulsating_between,
 };
 use onboarding_banner::OnboardingBanner;
@@ -48,7 +50,7 @@ use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
-    PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use update_version::UpdateVersion;
 use util::ResultExt;
@@ -218,7 +220,8 @@ pub struct TitleBar {
     _subscriptions: Vec<Subscription>,
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
-    screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
+    #[cfg(feature = "collab")]
+    screen_share_popover_handle: ui::PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
 
@@ -460,6 +463,7 @@ impl TitleBar {
         let git_store = project.read(cx).git_store().clone();
         let user_store = workspace.app_state().user_store.clone();
         let client = workspace.app_state().client.clone();
+        #[cfg(feature = "collab")]
         let active_call = ActiveCall::global(cx);
 
         let platform_style = PlatformStyle::platform();
@@ -483,6 +487,7 @@ impl TitleBar {
             }),
         );
 
+        #[cfg(feature = "collab")]
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(
             cx.subscribe(&git_store, move |_, _, event, cx| match event {
@@ -522,6 +527,7 @@ impl TitleBar {
 
         let banner = None;
 
+        #[cfg_attr(not(feature = "collab"), allow(unused_mut))]
         let mut this = Self {
             platform_titlebar,
             application_menu,
@@ -533,10 +539,12 @@ impl TitleBar {
             _subscriptions: subscriptions,
             banner,
             update_version,
-            screen_share_popover_handle: PopoverMenuHandle::default(),
+            #[cfg(feature = "collab")]
+            screen_share_popover_handle: ui::PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
         };
 
+        #[cfg(feature = "collab")]
         this.observe_diagnostics(cx);
 
         this
@@ -1114,11 +1122,13 @@ impl TitleBar {
         )
     }
 
+    #[cfg(feature = "collab")]
     fn active_call_changed(&mut self, cx: &mut Context<Self>) {
         self.observe_diagnostics(cx);
         cx.notify();
     }
 
+    #[cfg(feature = "collab")]
     fn observe_diagnostics(&mut self, cx: &mut Context<Self>) {
         let diagnostics = ActiveCall::global(cx)
             .read(cx)
@@ -1132,7 +1142,10 @@ impl TitleBar {
         }
     }
 
+    #[cfg(feature = "collab")]
     fn share_project(&mut self, cx: &mut Context<Self>) {
+        use gpui::TaskExt as _;
+
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
         active_call
@@ -1140,12 +1153,23 @@ impl TitleBar {
             .detach_and_log_err(cx);
     }
 
+    #[cfg(feature = "collab")]
     fn unshare_project(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
         active_call
             .update(cx, |call, cx| call.unshare_project(project, cx))
             .log_err();
+    }
+
+    #[cfg(not(feature = "collab"))]
+    fn render_collaborator_list(&self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+
+    #[cfg(not(feature = "collab"))]
+    fn render_call_controls(&self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
+        gpui::Empty.into_any_element()
     }
 
     fn render_connection_status(

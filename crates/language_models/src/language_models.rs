@@ -6,6 +6,7 @@ use collections::{HashMap, HashSet};
 use credentials_provider::CredentialsProvider;
 use gpui::{App, Context, Entity};
 use language_model::{LanguageModelProviderId, LanguageModelRegistry};
+#[cfg(feature = "hosted-llms")]
 use provider::deepseek::DeepSeekLanguageModelProvider;
 
 pub mod extension;
@@ -14,23 +15,36 @@ mod settings;
 
 pub use crate::extension::init_proxy as init_extension_proxy;
 
+#[cfg(feature = "hosted-llms")]
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::bedrock::BedrockLanguageModelProvider;
+#[cfg(feature = "zed-cloud")]
 use crate::provider::cloud::CloudLanguageModelProvider;
+#[cfg(feature = "copilot")]
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::google::GoogleLanguageModelProvider;
 use crate::provider::llama_cpp::LlamaCppLanguageModelProvider;
 use crate::provider::lmstudio::LmStudioLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 pub use crate::provider::mistral::MistralLanguageModelProvider;
 use crate::provider::ollama::OllamaLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::open_ai::OpenAiLanguageModelProvider;
 use crate::provider::open_ai_compatible::OpenAiCompatibleLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::open_router::OpenRouterLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::openai_subscribed::OpenAiSubscribedProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::opencode::OpenCodeLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::vercel_ai_gateway::VercelAiGatewayLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::x_ai::XAiLanguageModelProvider;
+#[cfg(feature = "hosted-llms")]
 use crate::provider::x_ai_subscribed::XAiSubscribedProvider;
 pub use crate::settings::*;
 
@@ -214,6 +228,7 @@ fn register_compatible_providers(
     }
 }
 
+#[cfg_attr(not(feature = "zed-cloud"), allow(unused_variables))]
 fn register_language_model_providers(
     registry: &mut LanguageModelRegistry,
     user_store: Entity<UserStore>,
@@ -221,6 +236,7 @@ fn register_language_model_providers(
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &mut Context<LanguageModelRegistry>,
 ) {
+    #[cfg(feature = "zed-cloud")]
     registry.register_provider(
         Arc::new(CloudLanguageModelProvider::new(
             user_store,
@@ -229,6 +245,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
             client.http_client(),
@@ -237,6 +254,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(OpenAiLanguageModelProvider::new(
             client.http_client(),
@@ -269,6 +287,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(DeepSeekLanguageModelProvider::new(
             client.http_client(),
@@ -277,6 +296,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(GoogleLanguageModelProvider::new(
             client.http_client(),
@@ -285,6 +305,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         MistralLanguageModelProvider::global(
             client.http_client(),
@@ -293,6 +314,7 @@ fn register_language_model_providers(
         ),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(BedrockLanguageModelProvider::new(
             client.http_client(),
@@ -301,6 +323,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(OpenRouterLanguageModelProvider::new(
             client.http_client(),
@@ -309,6 +332,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(VercelAiGatewayLanguageModelProvider::new(
             client.http_client(),
@@ -317,6 +341,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(XAiLanguageModelProvider::new(
             client.http_client(),
@@ -325,6 +350,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(XAiSubscribedProvider::new(
             client.http_client(),
@@ -333,6 +359,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(OpenCodeLanguageModelProvider::new(
             client.http_client(),
@@ -341,7 +368,9 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "copilot")]
     registry.register_provider(Arc::new(CopilotChatLanguageModelProvider::new(cx)), cx);
+    #[cfg(feature = "hosted-llms")]
     registry.register_provider(
         Arc::new(OpenAiSubscribedProvider::new(
             client.http_client(),

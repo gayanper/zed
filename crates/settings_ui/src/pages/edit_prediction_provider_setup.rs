@@ -1,7 +1,7 @@
+#[cfg(feature = "hosted-llms")]
 use codestral::{CODESTRAL_API_URL, codestral_api_key_state, codestral_api_url};
 use edit_prediction::{
     ApiKeyState,
-    mercury::{MERCURY_CREDENTIALS_URL, mercury_api_token},
     open_ai_compatible::{open_ai_compatible_api_token, open_ai_compatible_api_url},
 };
 use edit_prediction_ui::{get_available_providers, set_completion_provider};
@@ -10,7 +10,6 @@ use language::language_settings::AllLanguageSettings;
 
 use settings::Settings as _;
 use ui::{ButtonLink, ConfiguredApiCard, ContextMenu, DropdownMenu, DropdownStyle, prelude::*};
-use workspace::AppState;
 
 const OLLAMA_API_URL_PLACEHOLDER: &str = "http://localhost:11434";
 const OLLAMA_MODEL_PLACEHOLDER: &str = "qwen2.5-coder:3b-base";
@@ -31,57 +30,11 @@ pub(crate) fn render_edit_prediction_setup_page(
 ) -> AnyElement {
     let providers = [
         Some(render_provider_dropdown(window, cx)),
-        Some(render_zed_provider(settings_window, window, cx).into_any_element()),
+        zed_provider_section(settings_window, window, cx),
         render_github_copilot_provider(settings_window, window, cx)
             .map(IntoElement::into_any_element),
-        Some(
-            render_api_key_provider(
-                IconName::Inception,
-                "Mercury",
-                ApiKeyDocs::Link {
-                    dashboard_url: "https://platform.inceptionlabs.ai/dashboard/api-keys".into(),
-                },
-                mercury_api_token(cx),
-                |_cx| MERCURY_CREDENTIALS_URL,
-                Some(
-                    settings_window
-                        .render_sub_page_items_section(
-                            mercury_settings().iter().enumerate(),
-                            true,
-                            window,
-                            cx,
-                        )
-                        .into_any_element(),
-                ),
-                window,
-                cx,
-            )
-            .into_any_element(),
-        ),
-        Some(
-            render_api_key_provider(
-                IconName::AiMistral,
-                "Codestral",
-                ApiKeyDocs::Link {
-                    dashboard_url: "https://console.mistral.ai/codestral".into(),
-                },
-                codestral_api_key_state(cx),
-                |cx| codestral_api_url(cx),
-                Some(
-                    settings_window
-                        .render_sub_page_items_section(
-                            codestral_settings().iter().enumerate(),
-                            true,
-                            window,
-                            cx,
-                        )
-                        .into_any_element(),
-                ),
-                window,
-                cx,
-            )
-            .into_any_element(),
-        ),
+        render_mercury_provider(settings_window, window, cx),
+        render_codestral_provider(settings_window, window, cx),
         Some(render_ollama_provider(settings_window, window, cx).into_any_element()),
         Some(
             render_api_key_provider(
@@ -123,6 +76,115 @@ pub(crate) fn render_edit_prediction_setup_page(
                 .children(providers.into_iter().flatten()),
         )
         .into_any_element()
+}
+
+#[cfg(feature = "zed-cloud")]
+fn zed_provider_section(
+    settings_window: &SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    Some(render_zed_provider(settings_window, window, cx).into_any_element())
+}
+
+#[cfg(not(feature = "zed-cloud"))]
+fn zed_provider_section(
+    _: &SettingsWindow,
+    _: &mut Window,
+    _: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    None
+}
+
+#[cfg(not(feature = "copilot"))]
+fn render_github_copilot_provider(
+    _: &SettingsWindow,
+    _: &mut Window,
+    _: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    None
+}
+
+#[cfg(feature = "hosted-llms")]
+fn render_mercury_provider(
+    settings_window: &SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    Some(
+        render_api_key_provider(
+            IconName::Inception,
+            "Mercury",
+            ApiKeyDocs::Link {
+                dashboard_url: "https://platform.inceptionlabs.ai/dashboard/api-keys".into(),
+            },
+            edit_prediction::mercury::mercury_api_token(cx),
+            |_cx| edit_prediction::mercury::MERCURY_CREDENTIALS_URL,
+            Some(
+                settings_window
+                    .render_sub_page_items_section(
+                        mercury_settings().iter().enumerate(),
+                        true,
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+            ),
+            window,
+            cx,
+        )
+        .into_any_element(),
+    )
+}
+
+#[cfg(not(feature = "hosted-llms"))]
+fn render_mercury_provider(
+    _: &SettingsWindow,
+    _: &mut Window,
+    _: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    None
+}
+
+#[cfg(feature = "hosted-llms")]
+fn render_codestral_provider(
+    settings_window: &SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    Some(
+        render_api_key_provider(
+            IconName::AiMistral,
+            "Codestral",
+            ApiKeyDocs::Link {
+                dashboard_url: "https://console.mistral.ai/codestral".into(),
+            },
+            codestral_api_key_state(cx),
+            |cx| codestral_api_url(cx),
+            Some(
+                settings_window
+                    .render_sub_page_items_section(
+                        codestral_settings().iter().enumerate(),
+                        true,
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+            ),
+            window,
+            cx,
+        )
+        .into_any_element(),
+    )
+}
+
+#[cfg(not(feature = "hosted-llms"))]
+fn render_codestral_provider(
+    _: &SettingsWindow,
+    _: &mut Window,
+    _: &mut Context<SettingsWindow>,
+) -> Option<AnyElement> {
+    None
 }
 
 fn render_provider_dropdown(window: &mut Window, cx: &mut App) -> AnyElement {
@@ -184,8 +246,13 @@ fn render_provider_dropdown(window: &mut Window, cx: &mut App) -> AnyElement {
 }
 
 enum ApiKeyDocs {
-    Link { dashboard_url: SharedString },
-    Custom { message: SharedString },
+    #[cfg_attr(not(feature = "hosted-llms"), allow(dead_code))]
+    Link {
+        dashboard_url: SharedString,
+    },
+    Custom {
+        message: SharedString,
+    },
 }
 
 fn render_api_key_provider(
@@ -706,6 +773,7 @@ fn open_ai_compatible_settings() -> Box<[SettingsPageItem]> {
     ])
 }
 
+#[cfg(feature = "hosted-llms")]
 fn codestral_settings() -> Box<[SettingsPageItem]> {
     Box::new([
         SettingsPageItem::SettingItem(SettingItem {
@@ -841,6 +909,7 @@ fn codestral_settings() -> Box<[SettingsPageItem]> {
     ])
 }
 
+#[cfg(feature = "hosted-llms")]
 fn mercury_settings() -> Box<[SettingsPageItem]> {
     Box::new([SettingsPageItem::SettingItem(SettingItem {
         title: "Prediction Debounce",
@@ -875,6 +944,7 @@ fn mercury_settings() -> Box<[SettingsPageItem]> {
     })])
 }
 
+#[cfg(feature = "zed-cloud")]
 fn zed_settings() -> Box<[SettingsPageItem]> {
     Box::new([SettingsPageItem::SettingItem(SettingItem {
         title: "Prediction Debounce",
@@ -909,6 +979,7 @@ fn zed_settings() -> Box<[SettingsPageItem]> {
     })])
 }
 
+#[cfg(feature = "zed-cloud")]
 fn render_zed_provider(
     settings_window: &SettingsWindow,
     window: &mut Window,
@@ -932,6 +1003,7 @@ fn render_zed_provider(
         .child(div().px_neg_8().child(additional_fields))
 }
 
+#[cfg(feature = "copilot")]
 fn copilot_settings() -> Box<[SettingsPageItem]> {
     Box::new([SettingsPageItem::SettingItem(SettingItem {
         title: "Prediction Debounce",
@@ -966,6 +1038,7 @@ fn copilot_settings() -> Box<[SettingsPageItem]> {
     })])
 }
 
+#[cfg(feature = "copilot")]
 fn render_github_copilot_provider(
     settings_window: &SettingsWindow,
     window: &mut Window,
@@ -974,7 +1047,7 @@ fn render_github_copilot_provider(
     let configuration_view = window.use_state(cx, |_, cx| {
         copilot_ui::ConfigurationView::new(
             move |cx| {
-                let app_state = AppState::global(cx);
+                let app_state = workspace::AppState::global(cx);
                 copilot::GlobalCopilotAuth::try_get_or_init(app_state, cx)
                     .is_some_and(|copilot| copilot.0.read(cx).is_authenticated())
             },

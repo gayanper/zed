@@ -61,16 +61,16 @@ use crate::{
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
-    ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
+    ui::{AgentNotification, AgentNotificationEvent},
 };
 use agent_settings::AgentSettings;
+#[cfg(feature = "zed-cloud")]
 use ai_onboarding::AgentPanelOnboarding;
 use anyhow::{Context as _, Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
 use client::UserStore;
-use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -1235,6 +1235,7 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
+    #[cfg_attr(not(feature = "zed-cloud"), allow(dead_code))]
     user_store: Entity<UserStore>,
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -1265,6 +1266,7 @@ pub struct AgentPanel {
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
     persist_selected_agent_task: Task<()>,
+    #[cfg(feature = "zed-cloud")]
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
@@ -1594,6 +1596,7 @@ impl AgentPanel {
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
         let language_registry = project.read(cx).languages().clone();
+        #[cfg(feature = "zed-cloud")]
         let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
         let workspace = workspace.weak_handle();
@@ -1621,21 +1624,24 @@ impl AgentPanel {
 
         let base_view = BaseView::Uninitialized;
 
-        let weak_panel = cx.entity().downgrade();
-        let onboarding = cx.new(|cx| {
-            AgentPanelOnboarding::new(
-                user_store.clone(),
-                client,
-                move |_window, cx| {
-                    weak_panel
-                        .update(cx, |panel, cx| {
-                            panel.dismiss_ai_onboarding(cx);
-                        })
-                        .ok();
-                },
-                cx,
-            )
-        });
+        #[cfg(feature = "zed-cloud")]
+        let onboarding = {
+            let weak_panel = cx.entity().downgrade();
+            cx.new(|cx| {
+                AgentPanelOnboarding::new(
+                    user_store.clone(),
+                    client,
+                    move |_window, cx| {
+                        weak_panel
+                            .update(cx, |panel, cx| {
+                                panel.dismiss_ai_onboarding(cx);
+                            })
+                            .ok();
+                    },
+                    cx,
+                )
+            })
+        };
 
         // Subscribe to extension events to sync agent servers when extensions change
         let extension_subscription = ExtensionStore::try_global(cx).map(|store| {
@@ -1711,6 +1717,7 @@ impl AgentPanel {
             _project_subscription,
             zoomed: false,
             pending_serialization: None,
+            #[cfg(feature = "zed-cloud")]
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
@@ -1822,6 +1829,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         // Share links / clipboard imports enter with only a session id. If
         // this machine already has a metadata row for the session, route
         // through the normal thread-id path.
@@ -1932,6 +1942,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if !self.has_open_project(cx) {
             return;
         }
@@ -2017,6 +2030,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if !self.has_open_project(cx) {
             return;
         }
@@ -2081,6 +2097,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if !self.has_open_project(cx) {
             return;
         }
@@ -2243,7 +2262,8 @@ impl AgentPanel {
     }
 
     pub fn should_create_terminal_for_new_entry(&self, cx: &App) -> bool {
-        self.last_created_entry_kind == AgentPanelEntryKind::Terminal
+        (self.last_created_entry_kind == AgentPanelEntryKind::Terminal
+            || !crate::agent_threads_enabled())
             && self.project.read(cx).supports_terminal(cx)
     }
 
@@ -3713,6 +3733,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if !self.has_open_project(cx) {
             return;
         }
@@ -4228,6 +4251,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         let session_id = action.from_session_id.clone();
 
         let Some(content) = Self::initial_content_for_thread_summary(session_id.clone(), cx) else {
@@ -4281,6 +4307,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if resume_thread_id.is_none() && !self.has_open_project(cx) {
             return;
         }
@@ -4585,6 +4614,9 @@ impl AgentPanel {
     }
 
     fn load_thread_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if !self.has_open_project(cx) {
             Self::show_deferred_toast(&self.workspace, "Open a project to load a thread", cx);
             return;
@@ -5245,6 +5277,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         self.external_thread(
             None,
             None,
@@ -5269,6 +5304,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !crate::agent_threads_enabled() {
+            return;
+        }
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
@@ -6108,6 +6146,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !crate::agent_threads_enabled() {
+            return false;
+        }
         if !self.has_open_project(cx) {
             return false;
         }
@@ -6687,7 +6728,8 @@ impl AgentPanel {
             Rc::new(move |window, cx| {
                 Some(ContextMenu::build(window, cx, |menu, _window, cx| {
                     menu.context(focus_handle.clone())
-                        .item(
+                        .when(crate::agent_threads_enabled(), |menu| {
+                            menu.item(
                             ContextMenuEntry::new("Zed Agent")
                                 .when(
                                     !showing_terminal && is_agent_selected(Agent::NativeAgent),
@@ -6717,7 +6759,8 @@ impl AgentPanel {
                                         }
                                     }
                                 }),
-                        )
+                            )
+                        })
                         .when(supports_terminal, |menu| {
                             let terminal_profiles = Self::terminal_profiles(cx);
                             terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
@@ -6753,6 +6796,9 @@ impl AgentPanel {
                             })
                         })
                         .map(|mut menu| {
+                            if !crate::agent_threads_enabled() {
+                                return menu;
+                            }
                             let agent_server_store = agent_server_store.read(cx);
                             let registry_store = project::AgentRegistryStore::try_global(cx);
                             let registry_store_ref = registry_store.as_ref().map(|s| s.read(cx));
@@ -6841,8 +6887,8 @@ impl AgentPanel {
 
                             menu
                         })
-                        .separator()
-                        .item(
+                        .when(crate::agent_threads_enabled(), |menu| {
+                            menu.separator().item(
                             ContextMenuEntry::new("Add More Agents")
                                 .icon(IconName::Plus)
                                 .icon_color(Color::Muted)
@@ -6852,7 +6898,8 @@ impl AgentPanel {
                                             .dispatch_action(Box::new(zed_actions::AcpRegistry), cx)
                                     }
                                 }),
-                        )
+                            )
+                        })
                 }))
             })
         };
@@ -7542,6 +7589,7 @@ impl AgentPanel {
         }
     }
 
+    #[cfg(feature = "zed-cloud")]
     fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
         if TrialEndUpsell::dismissed(cx) {
             return false;
@@ -7565,9 +7613,10 @@ impl AgentPanel {
         let plan = self.user_store.read(cx).plan();
         let has_previous_trial = self.user_store.read(cx).trial_started_at().is_some();
 
-        plan.is_some_and(|plan| plan == Plan::ZedFree) && has_previous_trial
+        plan.is_some_and(|plan| plan == cloud_api_types::Plan::ZedFree) && has_previous_trial
     }
 
+    #[cfg(feature = "zed-cloud")]
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
         self.new_user_onboarding_upsell_dismissed
             .store(true, Ordering::Release);
@@ -7575,6 +7624,7 @@ impl AgentPanel {
         cx.notify();
     }
 
+    #[cfg(feature = "zed-cloud")]
     fn should_render_new_user_onboarding(&mut self, cx: &mut Context<Self>) -> bool {
         if self
             .new_user_onboarding_upsell_dismissed
@@ -7585,7 +7635,9 @@ impl AgentPanel {
 
         let user_store = self.user_store.read(cx);
 
-        if user_store.plan().is_some_and(|plan| plan == Plan::ZedPro)
+        if user_store
+            .plan()
+            .is_some_and(|plan| plan == cloud_api_types::Plan::ZedPro)
             && user_store
                 .subscription_period()
                 .and_then(|period| period.0.checked_add_days(chrono::Days::new(1)))
@@ -7621,6 +7673,7 @@ impl AgentPanel {
         }
     }
 
+    #[cfg(feature = "zed-cloud")]
     fn render_new_user_onboarding(
         &mut self,
         _window: &mut Window,
@@ -7637,6 +7690,7 @@ impl AgentPanel {
         )
     }
 
+    #[cfg(feature = "zed-cloud")]
     fn render_trial_end_upsell(
         &self,
         _window: &mut Window,
@@ -7654,7 +7708,7 @@ impl AgentPanel {
                 .bg(cx.theme().colors().panel_background)
                 .opacity(0.85)
                 .block_mouse_except_scroll()
-                .child(EndTrialUpsell::new(Arc::new({
+                .child(crate::ui::EndTrialUpsell::new(Arc::new({
                     let this = cx.entity();
                     move |_, cx| {
                         this.update(cx, |_this, cx| {
@@ -7664,6 +7718,24 @@ impl AgentPanel {
                     }
                 }))),
         )
+    }
+
+    #[cfg(not(feature = "zed-cloud"))]
+    fn render_new_user_onboarding(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    #[cfg(not(feature = "zed-cloud"))]
+    fn render_trial_end_upsell(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        None
     }
 
     fn render_drag_target(&self, cx: &Context<Self>) -> Div {
