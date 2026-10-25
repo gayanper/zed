@@ -102,7 +102,11 @@ else
 fi
 
 echo "Compiling zed binaries (${channel}, ${target_triple})"
-cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --target "$target_triple"
+# zed is built without its default features to produce the slim build (no collab,
+# auto-update UI, Copilot, hosted LLMs, Zed cloud AI or agent threads). It is a
+# separate invocation because --no-default-features would also strip cli's defaults.
+cargo --config .cargo/bundle-config.toml build --release --package zed --no-default-features --target "$target_triple"
+cargo --config .cargo/bundle-config.toml build --release --package cli --target "$target_triple"
 
 echo "Creating application bundle"
 manifest="crates/zed/Cargo.toml"
