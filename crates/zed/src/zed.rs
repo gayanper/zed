@@ -9,6 +9,7 @@ mod open_listener;
 mod open_url_modal;
 mod quick_action_bar;
 pub mod remote_debug;
+mod slim_keymap;
 pub mod telemetry_log;
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
 pub mod visual_tests;
@@ -2360,32 +2361,29 @@ pub fn load_default_keymap(cx: &mut App) {
     }
 
     cx.bind_keys(filter_disabled_ai_bindings(
-        KeymapFile::load_asset(DEFAULT_KEYMAP_PATH, Some(KeybindSource::Default), cx).unwrap(),
+        slim_keymap::load_builtin_keymap(DEFAULT_KEYMAP_PATH, KeybindSource::Default, cx),
         cx,
     ));
 
     if let Some(asset_path) = base_keymap.asset_path() {
         cx.bind_keys(filter_disabled_ai_bindings(
-            KeymapFile::load_asset(asset_path, Some(KeybindSource::Base), cx).unwrap(),
+            slim_keymap::load_builtin_keymap(asset_path, KeybindSource::Base, cx),
             cx,
         ));
     }
 
     if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
         cx.bind_keys(filter_disabled_ai_bindings(
-            KeymapFile::load_asset(VIM_KEYMAP_PATH, Some(KeybindSource::Vim), cx).unwrap(),
+            slim_keymap::load_builtin_keymap(VIM_KEYMAP_PATH, KeybindSource::Vim, cx),
             cx,
         ));
     }
 
-    cx.bind_keys(
-        KeymapFile::load_asset(
-            SPECIFIC_OVERRIDES_KEYMAP_PATH,
-            Some(KeybindSource::Default),
-            cx,
-        )
-        .unwrap(),
-    );
+    cx.bind_keys(slim_keymap::load_builtin_keymap(
+        SPECIFIC_OVERRIDES_KEYMAP_PATH,
+        KeybindSource::Default,
+        cx,
+    ));
 }
 
 /// Namespaces of actions that are part of an AI feature. When the user opts out
