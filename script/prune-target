@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Trim target/ without forcing a full rebuild.
+#
+#   script/prune-target [--days N] [--keep N] [--dry-run]
+#
+# 1. incremental/: rustc never deletes caches for old crate hashes (feature
+#    sets, profiles, toolchains). Per crate name keep the --keep most recently
+#    used caches and drop the rest, plus any cache unused for --days.
+# 2. deps/, build/, .fingerprint/: drop artifacts not read for --days. rustc
+#    reads every dependency's rlib/rmeta when building, so access time is a
+#    reliable "still in use" signal (APFS updates atime on read).
+
+set -euo pipefail
+
+days=14
+keep=2
+dry_run=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --days) days="$2"; shift 2 ;;
+        --keep) keep="$2"; shift 2 ;;
+        --dry-run) dry_run=1; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+target_dir="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target}"
+
+if pgrep -qx cargo || pgrep -qx rustc; then
+    echo "cargo/rustc is running; refusing to prune" >&2
+    exit 1
+fi
+
+freed_kb=0
+remove() {
+    local size
+    size=$(du -sk "$1" | cut -f1)
+    freed_kb=$((freed_kb + size))
+    if [[ $dry_run -eq 1 ]]; then
+        echo "would remove $1"
+    else
+        rm -rf "$1"
+    fi
+}
+
+for profile_dir in "$target_dir"/*/; do
+    profile_dir="${profile_dir%/}"
+    [[ -d "$profile_dir/deps" ]] || continue
+
+    if [[ -d "$profile_dir/incremental" ]]; then
+        # Newest first, so the first $keep entries per crate name survive.
+        while IFS= read -r path; do
+            remove "$path"
+        done < <(
+            ls -1td "$profile_dir"/incremental/*/ 2>/dev/null \
+                | sed 's#/$##' \
+                | awk -F/ -v keep="$keep" '{
+                    name = $NF; sub(/-[^-]+$/, "", name)
+                    if (++seen[name] > keep) print
+                }'
+        )
+        while IFS= read -r path; do
+            remove "$path"
+        done < <(find "$profile_dir/incremental" -mindepth 1 -maxdepth 1 -type d -atime +"$days" 2>/dev/null)
+    fi
+
+    while IFS= read -r path; do
+        remove "$path"
+    done < <(find "$profile_dir/deps" -maxdepth 1 -type f -atime +"$days")
+
+    for dir in build .fingerprint; do
+        [[ -d "$profile_dir/$dir" ]] || continue
+        while IFS= read -r path; do
+            # A directory counts as used if any file inside was read recently.
+            if [[ -z "$(find "$path" -type f -atime -"$days" -print -quit)" ]]; then
+                remove "$path"
+            fi
+        done < <(find "$profile_dir/$dir" -mindepth 1 -maxdepth 1 -type d)
+    done
+done
+
+label=$([[ $dry_run -eq 1 ]] && echo "Would free" || echo "Freed")
+echo "$label $((freed_kb / 1024)) MB from $target_dir"
