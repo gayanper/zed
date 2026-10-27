@@ -95,6 +95,12 @@ The terminal overview shows a terminal thread's sub terminals in a column beside
 
 The overview is hidden while the panel can't also give the parent terminal 40 columns.
 
+## Navigating the Terminal Overview {#terminal-overview-navigation}
+
+While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb agent::FocusPreviousOverviewTerminal} move focus between the parent terminal and its sub terminals.
+
+{#kb agent::ToggleZoomOverviewTerminal} zooms the focused sub terminal: it swaps places with the parent, which moves into the sub terminal column with a highlighted header. Search and comments then act on the zoomed sub terminal. Press the same keys again, or select a thread in the sidebar, to undo the zoom.
+
 ## CLI/TUI Setup Notes {#cli-setup}
 
 Some agent CLIs and TUIs can send terminal signals, such as bell notifications or title updates, that Zed uses to show useful context in the sidebar.

@@ -1413,6 +1413,9 @@
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {
+      "cmd-k cmd-]": "agent::FocusNextOverviewTerminal",
+      "cmd-k cmd-[": "agent::FocusPreviousOverviewTerminal",
+      "cmd-k cmd-m": "agent::ToggleZoomOverviewTerminal",
       "cmd-f": "agent::ToggleSearch",
       "cmd-n": "agent::NewThread",
     },

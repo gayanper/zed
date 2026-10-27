@@ -54,10 +54,11 @@ use crate::{
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
-    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
-    ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview,
+    AgentDiffPane, ConversationView, CopyThreadToClipboard, FocusNextOverviewTerminal,
+    FocusPreviousOverviewTerminal, Follow, LoadThreadFromClipboard, NewTerminalThread, NewThread,
+    OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread, ResetFastModeWarnings,
+    ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
+    ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview, ToggleZoomOverviewTerminal,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -1254,6 +1255,9 @@ pub struct AgentPanel {
     /// Width of the terminal content area from the last frame. The overview
     /// toggle depends on it, but the toolbar renders before that area is laid out.
     terminal_content_width: Rc<Cell<Pixels>>,
+    /// Sub terminal swapped with its parent in the overview. Read it through
+    /// `zoomed_overview_terminal_id`, since the sub terminal may no longer be shown.
+    zoomed_overview_terminal: Option<TerminalId>,
     /// Bumped on every view selection, so an async spawn only takes the view when
     /// nothing was selected after it was requested: the user's last click wins.
     view_selection_generation: usize,
@@ -1707,6 +1711,7 @@ impl AgentPanel {
             pending_terminal_spawn: None,
             pending_terminal_restores: HashMap::default(),
             terminal_content_width: Rc::new(Cell::new(Pixels::ZERO)),
+            zoomed_overview_terminal: None,
             view_selection_generation: 0,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
@@ -2976,6 +2981,9 @@ impl AgentPanel {
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
+        if !overview {
+            self.zoomed_overview_terminal = None;
+        }
         if terminal.overview != overview {
             terminal.overview = overview;
             self.persist_terminal_metadata(terminal_id, cx);
@@ -2988,6 +2996,9 @@ impl AgentPanel {
         shown_in_overview: bool,
         cx: &mut Context<Self>,
     ) {
+        if !shown_in_overview && self.zoomed_overview_terminal == Some(terminal_id) {
+            self.zoomed_overview_terminal = None;
+        }
         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
             if terminal.shown_in_overview != shown_in_overview {
                 terminal.shown_in_overview = shown_in_overview;
@@ -3103,12 +3114,13 @@ impl AgentPanel {
     }
 
     fn sync_terminal_font_scales(&self, cx: &mut App) {
-        let overview_sub_terminal_ids = self
-            .visible_overview_id(cx)
-            .map(|terminal_id| self.visible_overview_sub_terminal_ids(terminal_id))
-            .unwrap_or_default();
+        let overview_column_ids = self
+            .overview_terminal_order(cx)
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>();
         for (terminal_id, terminal) in &self.terminals {
-            let font_scale = overview_sub_terminal_ids
+            let font_scale = overview_column_ids
                 .contains(terminal_id)
                 .then_some(TERMINAL_OVERVIEW_SUB_FONT_SCALE);
             terminal
@@ -3127,6 +3139,122 @@ impl AgentPanel {
                 .is_empty()
             && self.terminal_overview_fits(terminal_id, cx))
         .then_some(terminal_id)
+    }
+
+    fn zoomed_overview_terminal_id(&self, cx: &App) -> Option<TerminalId> {
+        let zoomed_id = self.zoomed_overview_terminal?;
+        let parent_id = self.visible_overview_id(cx)?;
+        self.visible_overview_sub_terminal_ids(parent_id)
+            .contains(&zoomed_id)
+            .then_some(zoomed_id)
+    }
+
+    /// The overview's terminals in display order: the main slot, then the sub
+    /// terminal column from top to bottom, where a zoomed sub terminal's parent
+    /// takes its place.
+    fn overview_terminal_order(&self, cx: &App) -> Vec<TerminalId> {
+        let Some(parent_id) = self.visible_overview_id(cx) else {
+            return Vec::new();
+        };
+        let zoomed_id = self.zoomed_overview_terminal_id(cx);
+        let mut order = vec![zoomed_id.unwrap_or(parent_id)];
+        order.extend(
+            self.visible_overview_sub_terminal_ids(parent_id)
+                .into_iter()
+                .map(|terminal_id| {
+                    if Some(terminal_id) == zoomed_id {
+                        parent_id
+                    } else {
+                        terminal_id
+                    }
+                }),
+        );
+        order
+    }
+
+    fn focused_overview_terminal_id(&self, window: &Window, cx: &App) -> Option<TerminalId> {
+        self.overview_terminal_order(cx)
+            .into_iter()
+            .find(|terminal_id| {
+                self.terminals.get(terminal_id).is_some_and(|terminal| {
+                    terminal.view.focus_handle(cx).contains_focused(window, cx)
+                })
+            })
+    }
+
+    /// The terminal that terminal actions like search and comments act on.
+    fn target_terminal_id(&self, cx: &App) -> Option<TerminalId> {
+        self.zoomed_overview_terminal_id(cx)
+            .or_else(|| self.active_terminal_id())
+    }
+
+    fn target_terminal_view(&self, cx: &App) -> Option<&Entity<TerminalView>> {
+        self.terminals
+            .get(&self.target_terminal_id(cx)?)
+            .map(|terminal| &terminal.view)
+    }
+
+    fn focus_overview_terminal(
+        &mut self,
+        offset: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.overview_terminal_order(cx);
+        let current_index = self
+            .focused_overview_terminal_id(window, cx)
+            .and_then(|terminal_id| order.iter().position(|id| *id == terminal_id));
+        let next_index = match current_index {
+            Some(index) => (index as isize + offset).rem_euclid(order.len() as isize) as usize,
+            None => 0,
+        };
+        if let Some(terminal) = order
+            .get(next_index)
+            .and_then(|terminal_id| self.terminals.get(terminal_id))
+        {
+            window.focus(&terminal.view.focus_handle(cx), cx);
+        }
+    }
+
+    fn focus_next_overview_terminal(
+        &mut self,
+        _: &FocusNextOverviewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_overview_terminal(1, window, cx);
+    }
+
+    fn focus_previous_overview_terminal(
+        &mut self,
+        _: &FocusPreviousOverviewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_overview_terminal(-1, window, cx);
+    }
+
+    fn toggle_zoom_overview_terminal(
+        &mut self,
+        _: &ToggleZoomOverviewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoomed_overview_terminal_id(cx).is_some() {
+            self.zoomed_overview_terminal = None;
+        } else {
+            let Some(parent_id) = self.visible_overview_id(cx) else {
+                return;
+            };
+            let Some(focused_id) = self.focused_overview_terminal_id(window, cx) else {
+                return;
+            };
+            if focused_id == parent_id {
+                return;
+            }
+            self.zoomed_overview_terminal = Some(focused_id);
+        }
+        cx.notify();
     }
 
     fn toggle_terminal_overview(
@@ -4833,7 +4961,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(terminal) = self
-            .active_terminal_id()
+            .target_terminal_id(cx)
             .and_then(|terminal_id| self.terminals.get_mut(&terminal_id))
         else {
             cx.propagate();
@@ -5112,6 +5240,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.supersede_pending_selections();
+        self.zoomed_overview_terminal = None;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -6210,7 +6339,7 @@ impl AgentPanel {
                 .root_thread_view()
                 .is_some_and(|view| view.read(cx).title_editor.read(cx).is_focused(window)),
             VisibleSurface::Terminal(_) => self
-                .active_terminal_id()
+                .target_terminal_id(cx)
                 .and_then(|id| self.terminals.get(&id))
                 .and_then(|terminal| terminal.title_editor.as_ref())
                 .is_some_and(|editor| editor.read(cx).is_focused(window)),
@@ -6324,7 +6453,7 @@ impl AgentPanel {
             }
             VisibleSurface::Terminal(_) => {
                 if let Some((terminal_id, title_editor, title)) =
-                    self.active_terminal_id().and_then(|terminal_id| {
+                    self.target_terminal_id(cx).and_then(|terminal_id| {
                         self.terminals.get(&terminal_id).map(|terminal| {
                             (
                                 terminal_id,
@@ -7225,7 +7354,7 @@ impl AgentPanel {
         if !agent_comments::comments_enabled(cx) {
             return None;
         }
-        let terminal_view = self.visible_terminal_view()?;
+        let terminal_view = self.target_terminal_view(cx)?;
         let focus_handle = self.focus_handle.clone();
         Some(
             IconButton::new("agent-comments-terminal-mode", IconName::CursorIBeam)
@@ -7253,12 +7382,18 @@ impl AgentPanel {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let sub_width = self.terminal_overview_sub_width(terminal_id, cx);
+        let zoomed = self.zoomed_overview_terminal_id(cx).is_some();
         let sub_terminals = self
-            .visible_overview_sub_terminal_ids(terminal_id)
+            .overview_terminal_order(cx)
             .into_iter()
-            .filter_map(|sub_terminal_id| self.terminals.get(&sub_terminal_id))
+            .skip(1)
+            .filter_map(|column_terminal_id| {
+                let sub_terminal = self.terminals.get(&column_terminal_id)?;
+                // The highlighted parent header shows that a sub terminal is zoomed.
+                Some((sub_terminal, zoomed && column_terminal_id == terminal_id))
+            })
             .enumerate()
-            .map(|(index, sub_terminal)| {
+            .map(|(index, (sub_terminal, is_zoomed_parent))| {
                 v_flex()
                     .flex_1()
                     .min_h_0()
@@ -7269,11 +7404,19 @@ impl AgentPanel {
                             .flex_none()
                             .px_2()
                             .py_0p5()
-                            .bg(cx.theme().colors().tab_bar_background)
+                            .bg(if is_zoomed_parent {
+                                cx.theme().colors().element_selected
+                            } else {
+                                cx.theme().colors().tab_bar_background
+                            })
                             .child(
                                 Label::new(sub_terminal.title(cx))
                                     .size(LabelSize::Small)
-                                    .color(Color::Muted)
+                                    .color(if is_zoomed_parent {
+                                        Color::Accent
+                                    } else {
+                                        Color::Muted
+                                    })
                                     .truncate(),
                             ),
                     )
@@ -7298,7 +7441,7 @@ impl AgentPanel {
         if !agent_comments::comments_enabled(cx) {
             return;
         }
-        let Some(terminal_view) = self.visible_terminal_view().cloned() else {
+        let Some(terminal_view) = self.target_terminal_view(cx).cloned() else {
             return;
         };
         terminal_view.update(cx, |terminal_view, cx| {
@@ -7319,10 +7462,10 @@ impl AgentPanel {
         if !agent_comments::comments_enabled(cx) {
             return;
         }
-        let Some(terminal_id) = self.active_terminal_id() else {
+        let Some(terminal_id) = self.target_terminal_id(cx) else {
             return;
         };
-        let Some(terminal_view) = self.visible_terminal_view().cloned() else {
+        let Some(terminal_view) = self.target_terminal_view(cx).cloned() else {
             return;
         };
         let Some((range, text, position)) = terminal_view.update(cx, |terminal_view, cx| {
@@ -8004,7 +8147,7 @@ impl Render for AgentPanel {
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
             }))
             .on_action(cx.listener(|this, _: &RenameSelectedThread, window, cx| {
-                let Some(terminal_id) = this.active_terminal_id() else {
+                let Some(terminal_id) = this.target_terminal_id(cx) else {
                     return;
                 };
                 this.edit_terminal_title(terminal_id, window, cx);
@@ -8021,6 +8164,9 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::toggle_zoom))
             .on_action(cx.listener(Self::toggle_terminal_thread_search))
             .on_action(cx.listener(Self::toggle_terminal_overview))
+            .on_action(cx.listener(Self::focus_next_overview_terminal))
+            .on_action(cx.listener(Self::focus_previous_overview_terminal))
+            .on_action(cx.listener(Self::toggle_zoom_overview_terminal))
             .on_action(cx.listener(|this, _: &ReauthenticateAgent, window, cx| {
                 if let Some(conversation_view) = this.active_conversation_view() {
                     conversation_view.update(cx, |conversation_view, cx| {
@@ -8046,10 +8192,11 @@ impl Render for AgentPanel {
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
                 VisibleSurface::Terminal(terminal_view) => {
-                    let search_bar = self
-                        .active_terminal_id()
-                        .and_then(|terminal_id| self.terminals.get(&terminal_id))
-                        .and_then(|terminal| terminal.search_bar.clone());
+                    let terminal = self
+                        .target_terminal_id(cx)
+                        .and_then(|terminal_id| self.terminals.get(&terminal_id));
+                    let search_bar = terminal.and_then(|terminal| terminal.search_bar.clone());
+                    let terminal_view = terminal.map_or(terminal_view, |terminal| &terminal.view);
                     let terminal_content = v_flex()
                         .key_context("AgentTerminalThread")
                         .size_full()
@@ -10076,6 +10223,253 @@ mod tests {
             );
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
         });
+    }
+
+    /// Renders the panel, since focus checks need the views in the rendered tree.
+    async fn setup_visible_test_overview(
+        cx: &mut TestAppContext,
+        sub_terminal_count: usize,
+    ) -> (
+        Entity<AgentPanel>,
+        VisualTestContext,
+        TerminalId,
+        Vec<TerminalId>,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let sub_terminal_ids = (0..sub_terminal_count)
+            .map(|_| insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx))
+            .collect::<Vec<_>>();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+            panel.toggle_zoom(&ToggleZoom, window, cx);
+        });
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        cx.run_until_parked();
+        (panel, cx, parent_id, sub_terminal_ids)
+    }
+
+    fn focused_test_overview_terminal(
+        panel: &Entity<AgentPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Option<TerminalId> {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.focused_overview_terminal_id(window, cx)
+        })
+    }
+
+    fn dispatch_test_overview_action(
+        panel: &Entity<AgentPanel>,
+        action: &dyn Action,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            if action.as_any().is::<FocusNextOverviewTerminal>() {
+                panel.focus_next_overview_terminal(&FocusNextOverviewTerminal, window, cx);
+            } else if action.as_any().is::<FocusPreviousOverviewTerminal>() {
+                panel.focus_previous_overview_terminal(&FocusPreviousOverviewTerminal, window, cx);
+            } else {
+                panel.toggle_zoom_overview_terminal(&ToggleZoomOverviewTerminal, window, cx);
+            }
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_overview_navigation_cycles_focus(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 3).await;
+        let [first_id, second_id, hidden_id] = sub_terminal_ids[..] else {
+            panic!("expected three sub terminals");
+        };
+
+        dispatch_test_overview_action(&panel, &FocusNextOverviewTerminal, &mut cx);
+        assert_eq!(
+            focused_test_overview_terminal(&panel, &mut cx),
+            None,
+            "navigation should do nothing while the overview is off"
+        );
+
+        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_overview_sub_terminal(&panel, parent_id, hidden_id, &mut cx);
+        focus_test_terminal(&panel, parent_id, &mut cx);
+
+        for expected_id in [first_id, second_id, parent_id] {
+            dispatch_test_overview_action(&panel, &FocusNextOverviewTerminal, &mut cx);
+            assert_eq!(
+                focused_test_overview_terminal(&panel, &mut cx),
+                Some(expected_id)
+            );
+        }
+        for expected_id in [second_id, first_id, parent_id] {
+            dispatch_test_overview_action(&panel, &FocusPreviousOverviewTerminal, &mut cx);
+            assert_eq!(
+                focused_test_overview_terminal(&panel, &mut cx),
+                Some(expected_id)
+            );
+        }
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_overview_zoom_swaps_sub_terminal_with_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 2).await;
+        let [first_id, second_id] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+
+        focus_test_terminal(&panel, parent_id, &mut cx);
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.zoomed_overview_terminal_id(cx),
+                None,
+                "the parent can't be zoomed"
+            );
+        });
+
+        focus_test_terminal(&panel, second_id, &mut cx);
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            assert_eq!(panel.zoomed_overview_terminal_id(cx), Some(second_id));
+            assert_eq!(
+                panel.overview_terminal_order(cx),
+                vec![second_id, first_id, parent_id]
+            );
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert_eq!(panel.target_terminal_id(cx), Some(second_id));
+            panel.sync_terminal_font_scales(cx);
+            assert_eq!(panel.terminals[&second_id].view.read(cx).font_scale(), None);
+            assert_eq!(
+                panel.terminals[&parent_id].view.read(cx).font_scale(),
+                Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+            );
+        });
+        assert_eq!(
+            focused_test_overview_terminal(&panel, &mut cx),
+            Some(second_id)
+        );
+
+        dispatch_test_overview_action(&panel, &FocusNextOverviewTerminal, &mut cx);
+        assert_eq!(
+            focused_test_overview_terminal(&panel, &mut cx),
+            Some(first_id),
+            "navigation should follow the swapped layout"
+        );
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.zoomed_overview_terminal_id(cx), Some(second_id));
+        });
+
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.zoomed_overview_terminal_id(cx), None);
+            assert_eq!(
+                panel.overview_terminal_order(cx),
+                vec![parent_id, first_id, second_id]
+            );
+            assert_eq!(panel.target_terminal_id(cx), Some(parent_id));
+        });
+        assert_eq!(
+            focused_test_overview_terminal(&panel, &mut cx),
+            Some(first_id),
+            "resetting the zoom should keep focus"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_overview_zoom_targets_search_at_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, _parent_id, sub_terminal_ids) =
+            setup_visible_test_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        toggle_test_terminal_overview(&panel, &mut cx);
+        focus_test_terminal(&panel, sub_terminal_id, &mut cx);
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_terminal_thread_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.terminals[&sub_terminal_id].search_bar.is_some());
+            assert!(
+                panel
+                    .terminals
+                    .iter()
+                    .filter(|(terminal_id, _)| **terminal_id != sub_terminal_id)
+                    .all(|(_, terminal)| terminal.search_bar.is_none())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_overview_zoom_renames_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        toggle_test_terminal_overview(&panel, &mut cx);
+        focus_test_terminal(&panel, sub_terminal_id, &mut cx);
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            let terminal_id = panel
+                .target_terminal_id(cx)
+                .expect("a terminal should be targeted");
+            assert_eq!(terminal_id, sub_terminal_id);
+            panel.edit_terminal_title(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.terminals[&sub_terminal_id].title_editor.is_some());
+            assert!(panel.terminals[&parent_id].title_editor.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_overview_zoom_resets(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 2).await;
+        let [first_id, second_id] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        let zoom = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
+            focus_test_terminal(&panel, terminal_id, cx);
+            dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, cx);
+            panel.read_with(cx, |panel, cx| {
+                assert_eq!(panel.zoomed_overview_terminal_id(cx), Some(terminal_id));
+            });
+        };
+        let assert_not_zoomed = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                assert_eq!(panel.zoomed_overview_terminal_id(cx), None);
+            });
+        };
+
+        zoom(first_id, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        assert_not_zoomed(&mut cx);
+
+        zoom(first_id, &mut cx);
+        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
+        assert_not_zoomed(&mut cx);
+        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
+        assert_not_zoomed(&mut cx);
+
+        zoom(second_id, &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        assert_not_zoomed(&mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        assert_not_zoomed(&mut cx);
+
+        zoom(second_id, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(second_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert_not_zoomed(&mut cx);
     }
 
     #[gpui::test]

@@ -414,6 +414,13 @@ actions!(
         NewTerminalThread,
         /// Toggles the overview of a terminal thread and its sub terminals.
         ToggleTerminalOverview,
+        /// Moves focus to the next terminal in the terminal overview.
+        FocusNextOverviewTerminal,
+        /// Moves focus to the previous terminal in the terminal overview.
+        FocusPreviousOverviewTerminal,
+        /// Swaps the focused sub terminal with its parent in the terminal overview,
+        /// or swaps them back.
+        ToggleZoomOverviewTerminal,
     ]
 );
 
