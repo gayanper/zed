@@ -57,6 +57,7 @@ impl VsCodeThemeConverter {
             appearance,
             style: ThemeStyleContent {
                 window_background_appearance: Some(WindowBackgroundContent::Opaque),
+                layout: None,
                 accents: Vec::new(), //TODO can we read this from the theme?
                 colors: theme_colors,
                 status: status_colors,

@@ -294,6 +294,12 @@ impl Theme {
         self.styles.window_background_appearance
     }
 
+    /// Returns the [`LayoutStyles`] for the theme.
+    #[inline(always)]
+    pub fn layout(&self) -> &LayoutStyles {
+        &self.styles.layout
+    }
+
     /// Darkens the color by reducing its lightness.
     /// The resulting lightness is clamped to ensure it doesn't go below 0.0.
     ///

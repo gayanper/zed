@@ -16,7 +16,7 @@ use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
 use gpui_util::ResultExt;
 use theme::{
     AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
-    GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors, SyntaxTheme,
+    GlobalTheme, LayoutStyles, LoadThemes, PlayerColor, PlayerColors, StatusColors, SyntaxTheme,
     SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
     ThemeSettingsProvider, ThemeStyles, default_color_scales, try_parse_color,
 };
@@ -355,6 +355,11 @@ pub fn refine_theme(theme: &ThemeContent) -> Theme {
         .map(|w| w.into_gpui())
         .unwrap_or_default();
 
+    let mut layout = LayoutStyles::default();
+    if let Some(layout_content) = &theme.style.layout {
+        apply_layout_content(&mut layout, layout_content);
+    }
+
     Theme {
         id: uuid::Uuid::new_v4().to_string(),
         name: theme.name.clone().into(),
@@ -362,12 +367,23 @@ pub fn refine_theme(theme: &ThemeContent) -> Theme {
         styles: ThemeStyles {
             system: SystemColors::default(),
             window_background_appearance,
+            layout,
             accents: refined_accent_colors,
             colors: refined_theme_colors,
             status: refined_status_colors,
             player: refined_player_colors,
             syntax: syntax_theme,
         },
+    }
+}
+
+/// Applies the values set in a theme's `layout` to the given [`LayoutStyles`].
+pub fn apply_layout_content(layout: &mut LayoutStyles, content: &::settings::LayoutContent) {
+    if let Some(pane_gap) = content.pane_gap {
+        layout.pane_gap = px(pane_gap.max(0.));
+    }
+    if let Some(pane_radius) = content.pane_radius {
+        layout.pane_radius = px(pane_radius.max(0.));
     }
 }
 

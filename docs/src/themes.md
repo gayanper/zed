@@ -111,6 +111,27 @@ To see a comprehensive list of captures (like `comment` and `comment.doc`) see [
 To see a list of available theme attributes look at the JSON file for your theme.
 For example, [assets/themes/one/one.json](https://github.com/zed-industries/zed/blob/main/assets/themes/one/one.json) for the default One Dark and One Light themes.
 
+## Tiled Layout
+
+A theme (or a theme override) can separate the docks and the center into tiles with `layout`:
+
+- `pane_gap`: gap in pixels between the open docks and the center, and around the workspace edge. Defaults to `0`.
+- `pane_radius`: corner radius in pixels of the dock panels. Defaults to `0`.
+
+The gaps show the theme's `background` color. Give it an alpha and set `background.appearance` to `blurred` or `transparent` to let the desktop show through:
+
+```json [settings]
+{
+  "theme_overrides": {
+    "One Dark": {
+      "background.appearance": "blurred",
+      "background": "#1e2127aa",
+      "layout": { "pane_gap": 6, "pane_radius": 8 }
+    }
+  }
+}
+```
+
 ## Local Themes {#local-themes}
 
 Store new themes locally by placing them in the `~/.config/zed/themes` directory (macOS and Linux) or `%USERPROFILE%\AppData\Roaming\Zed\themes\` (Windows).

@@ -529,6 +529,9 @@ pub struct ThemeStyleContent {
     #[serde(rename = "background.appearance")]
     pub window_background_appearance: Option<WindowBackgroundContent>,
 
+    /// Gap between the workspace regions (docks and center) and corner rounding of the docks.
+    pub layout: Option<LayoutContent>,
+
     #[serde(default)]
     pub accents: Vec<AccentContent>,
 
@@ -1365,6 +1368,17 @@ pub struct StatusColorsContent {
 
     #[serde(rename = "warning.border")]
     pub warning_border: Option<ThemeColor>,
+}
+
+/// Spacing and corner rounding of the workspace regions, used for a tiled look.
+#[with_fallible_options]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+#[serde(default)]
+pub struct LayoutContent {
+    /// Gap in pixels between the docks and the center, and around the workspace edge.
+    pub pane_gap: Option<f32>,
+    /// Corner radius in pixels of the dock panels and the zoomed view.
+    pub pane_radius: Option<f32>,
 }
 
 /// The background appearance of the window.

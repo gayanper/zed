@@ -2727,7 +2727,7 @@ impl Workspace {
             && use_flex
             && let Some(flex) = size_state.flex.or_else(|| self.default_dock_flex(position))
         {
-            let workspace_width = self.bounds.size.width;
+            let workspace_width = self.horizontal_layout_width(cx);
             if workspace_width <= Pixels::ZERO {
                 return None;
             }
@@ -2766,7 +2766,7 @@ impl Workspace {
             return None;
         }
 
-        let workspace_width = self.bounds.size.width;
+        let workspace_width = self.horizontal_layout_width(cx);
         if workspace_width <= Pixels::ZERO {
             return None;
         }
@@ -2807,6 +2807,17 @@ impl Workspace {
             size_state.flex = self.default_dock_flex(opposite_position);
         }
         Some((panel.clone(), size_state))
+    }
+
+    /// The width shared by the side docks and the center, excluding the pane gaps that
+    /// the open side docks add as margins (flex sizing distributes only what remains).
+    fn horizontal_layout_width(&self, cx: &App) -> Pixels {
+        let pane_gap = cx.theme().layout().pane_gap;
+        let open_side_docks = [&self.left_dock, &self.right_dock]
+            .into_iter()
+            .filter(|dock| dock.read(cx).visible_panel().is_some())
+            .count();
+        (self.bounds.size.width - pane_gap * open_side_docks as f32).max(Pixels::ZERO)
     }
 
     fn center_full_height_column_count(&self) -> f32 {
@@ -8683,6 +8694,7 @@ impl Workspace {
                         this.track_focus(self.region_focus_handles.dock(position))
                     })
             })
+            .debug_selector(|| dock_element_id.into())
             .flex()
             .overflow_hidden()
             .flex_none()
@@ -8692,8 +8704,16 @@ impl Workspace {
         // Apply sizing only when the dock is open. When closed the dock is still
         // included in the element tree so its focus handle remains mounted — without
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
+        let pane_gap = cx.theme().layout().pane_gap;
         let dock = dock.read(cx);
         if let Some(panel) = dock.visible_panel() {
+            // The gap goes on the open dock rather than the layout containers, because
+            // closed docks stay in the element tree and would otherwise add empty gaps.
+            container = match position {
+                DockPosition::Left => container.mr(pane_gap),
+                DockPosition::Right => container.ml(pane_gap),
+                DockPosition::Bottom => container.mt(pane_gap),
+            };
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
@@ -8893,6 +8913,7 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
+            .debug_selector(|| "editor-region".into())
             .child(self.center.render(
                 self.zoomed.as_ref(),
                 self.maximized_pane.as_ref(),
@@ -8984,7 +9005,7 @@ impl Workspace {
     }
 
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
-        let workspace_width = self.bounds.size.width;
+        let workspace_width = self.horizontal_layout_width(cx);
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
 
         self.right_dock.read_with(cx, |right_dock, cx| {
@@ -9003,7 +9024,7 @@ impl Workspace {
     }
 
     fn resize_right_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
-        let workspace_width = self.bounds.size.width;
+        let workspace_width = self.horizontal_layout_width(cx);
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
         self.left_dock.read_with(cx, |left_dock, cx| {
             let left_dock_size = left_dock
@@ -9687,6 +9708,7 @@ impl Render for Workspace {
                             .border_t_1()
                             .border_b_1()
                             .border_color(colors.border)
+                            .p(theme.layout().pane_gap)
                             .child({
                                 let this = cx.entity();
                                 canvas(
@@ -9724,8 +9746,13 @@ impl Render for Workspace {
                                     },
                                     |_, _, _, _| {},
                                 )
+                                // Absolute children size against the padding box, so inset by the
+                                // pane gap to measure only the area the docks and center occupy.
                                 .absolute()
-                                .size_full()
+                                .top(theme.layout().pane_gap)
+                                .left(theme.layout().pane_gap)
+                                .right(theme.layout().pane_gap)
+                                .bottom(theme.layout().pane_gap)
                             })
                             .when(self.zoomed.is_none(), |this| {
                                 this.on_drag_move(cx.listener(
@@ -10042,7 +10069,12 @@ impl Render for Workspace {
                                     .border_color(colors.border)
                                     .bg(colors.background)
                                     .child(zoomed_element)
-                                    .inset_0()
+                                    // Insets resolve against the padding box, so match the tiles' outer gap.
+                                    .top(theme.layout().pane_gap)
+                                    .left(theme.layout().pane_gap)
+                                    .right(theme.layout().pane_gap)
+                                    .bottom(theme.layout().pane_gap)
+                                    .rounded(theme.layout().pane_radius)
                                     .shadow_lg();
 
                                 if !WorkspaceSettings::get_global(cx).zoomed_padding {
@@ -15702,6 +15734,88 @@ mod tests {
         cx.run_until_parked();
 
         assert_zoomed_pane_is_padded(cx);
+    }
+
+    #[gpui::test]
+    async fn test_pane_gap_separates_open_docks_from_center(cx: &mut TestAppContext) {
+        init_test(cx);
+        let pane_gap = px(8.);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        cx.update(|_, cx| {
+            let mut theme = (*cx.theme().clone()).clone();
+            theme.styles.layout.pane_gap = pane_gap;
+            theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+        workspace.update(cx, |_, cx| cx.notify());
+
+        let editor_bounds = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("editor-region")
+                .expect("the center should render")
+        };
+        cx.run_until_parked();
+        let workspace_bounds = workspace.read_with(cx, |workspace, _| workspace.bounds);
+        // The workspace bounds are measured inside the outer gap, which keeps dock drag math unchanged.
+        assert_eq!(
+            editor_bounds(cx).left(),
+            workspace_bounds.left(),
+            "a closed left dock should not add a gap before the center"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+        });
+        cx.run_until_parked();
+
+        let left_dock_bounds = cx
+            .debug_bounds("left-dock")
+            .expect("the open left dock should render");
+        assert_eq!(left_dock_bounds.left(), workspace_bounds.left());
+        assert_eq!(
+            editor_bounds(cx).left(),
+            left_dock_bounds.right() + pane_gap,
+            "the center should start one gap after the open left dock"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+        cx.run_until_parked();
+
+        let workspace_bounds = workspace.read_with(cx, |workspace, _| workspace.bounds);
+        let right_dock_bounds = cx
+            .debug_bounds("right-dock")
+            .expect("the open right dock should render");
+        assert_eq!(right_dock_bounds.right(), workspace_bounds.right());
+        assert_eq!(
+            editor_bounds(cx).right() + pane_gap,
+            right_dock_bounds.left(),
+            "the center should end one gap before the open right dock"
+        );
+        assert_eq!(editor_bounds(cx).bottom(), workspace_bounds.bottom());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+        });
+        cx.run_until_parked();
+
+        let bottom_dock_bounds = cx
+            .debug_bounds("bottom-dock")
+            .expect("the open bottom dock should render");
+        assert_eq!(bottom_dock_bounds.bottom(), workspace_bounds.bottom());
+        assert_eq!(
+            editor_bounds(cx).bottom() + pane_gap,
+            bottom_dock_bounds.top(),
+            "the center should end one gap above the open bottom dock"
+        );
     }
 
     #[gpui::test]

@@ -5,7 +5,7 @@ use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, WindowBackgroundAppearan
 use crate::{
     AccentColors, Appearance, DEFAULT_DARK_THEME, PlayerColors, StatusColors,
     StatusColorsRefinement, SyntaxTheme, SystemColors, Theme, ThemeColors, ThemeColorsRefinement,
-    ThemeFamily, ThemeStyles, default_color_scales,
+    LayoutStyles, ThemeFamily, ThemeStyles, default_color_scales,
 };
 
 /// The default theme family for Zed.
@@ -110,6 +110,7 @@ pub(crate) fn zed_default_dark() -> Theme {
         appearance: Appearance::Dark,
         styles: ThemeStyles {
             window_background_appearance: WindowBackgroundAppearance::Opaque,
+            layout: LayoutStyles::default(),
             system: SystemColors::default(),
             accents: AccentColors(Arc::from(vec![
                 blue, orange, purple, teal, red, green, yellow,

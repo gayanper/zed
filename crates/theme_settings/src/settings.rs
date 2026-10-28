@@ -543,6 +543,9 @@ impl ThemeSettings {
             base_theme.styles.window_background_appearance =
                 window_background_appearance.into_gpui();
         }
+        if let Some(layout) = &theme_overrides.layout {
+            crate::apply_layout_content(&mut base_theme.styles.layout, layout);
+        }
         let status_color_refinement = status_colors_refinement(&theme_overrides.status);
 
         let theme_color_refinement = theme_colors_refinement(
@@ -812,6 +815,34 @@ mod tests {
             colors,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn layout_defaults_to_zero_without_layout_content() {
+        let test_theme = theme_with_colors(Default::default());
+        assert_eq!(test_theme.styles.layout, ::theme::LayoutStyles::default());
+    }
+
+    #[test]
+    fn layout_from_theme_is_refined_by_override() {
+        let theme_style: ::settings::ThemeStyleContent = serde_json::from_value(
+            serde_json::json!({ "layout": { "pane_gap": 6, "pane_radius": 8 } }),
+        )
+        .unwrap();
+        let mut test_theme = crate::refine_theme(&crate::ThemeContent {
+            name: "Test".into(),
+            appearance: ::theme::AppearanceContent::Dark,
+            style: theme_style,
+        });
+        assert_eq!(test_theme.styles.layout.pane_gap, px(6.));
+        assert_eq!(test_theme.styles.layout.pane_radius, px(8.));
+
+        let override_style: ::settings::ThemeStyleContent =
+            serde_json::from_value(serde_json::json!({ "layout": { "pane_gap": 10 } })).unwrap();
+        ThemeSettings::modify_theme(&mut test_theme, &override_style);
+
+        assert_eq!(test_theme.styles.layout.pane_gap, px(10.));
+        assert_eq!(test_theme.styles.layout.pane_radius, px(8.));
     }
 
     #[test]

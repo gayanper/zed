@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::{App, Hsla, SharedString, WindowBackgroundAppearance};
+use gpui::{App, Hsla, Pixels, SharedString, WindowBackgroundAppearance};
 use refineable::Refineable;
 use std::sync::Arc;
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
@@ -632,6 +632,7 @@ pub fn all_theme_colors(cx: &mut App) -> Vec<(Hsla, SharedString)> {
 pub struct ThemeStyles {
     /// The background appearance of the window.
     pub window_background_appearance: WindowBackgroundAppearance,
+    pub layout: LayoutStyles,
     pub system: SystemColors,
     /// An array of colors used for theme elements that iterate through a series of colors.
     ///
@@ -647,6 +648,15 @@ pub struct ThemeStyles {
     pub player: PlayerColors,
 
     pub syntax: Arc<SyntaxTheme>,
+}
+
+/// Gap between the workspace regions (docks and center) and corner rounding of the docks.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutStyles {
+    /// Gap between the docks and the center, and around the workspace edge.
+    pub pane_gap: Pixels,
+    /// Corner radius of the dock panels and the zoomed view.
+    pub pane_radius: Pixels,
 }
 
 #[cfg(test)]

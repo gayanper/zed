@@ -1338,6 +1338,7 @@ impl Render for Dock {
                 .focus_follows_mouse(self.focus_follows_mouse, cx)
                 .flex()
                 .bg(cx.theme().colors().panel_background)
+                .rounded(cx.theme().layout().pane_radius)
                 .border_color(cx.theme().colors().border)
                 .overflow_hidden()
                 .map(|this| match self.position().axis() {
@@ -1346,10 +1347,13 @@ impl Render for Dock {
                     Axis::Horizontal => this.w_full().h_full().flex_row(),
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
+                // With a pane gap the dock is a separate tile, so the gap replaces the divider border.
+                .when(cx.theme().layout().pane_gap == px(0.), |this| {
+                    this.map(|this| match self.position() {
+                        DockPosition::Left => this.border_r_1(),
+                        DockPosition::Right => this.border_l_1(),
+                        DockPosition::Bottom => this.border_t_1(),
+                    })
                 })
                 .child(
                     div()
