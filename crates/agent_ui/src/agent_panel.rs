@@ -2203,6 +2203,7 @@ impl AgentPanel {
         &mut self,
         parent_id: TerminalId,
         init_command: Option<String>,
+        source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2212,9 +2213,8 @@ impl AgentPanel {
         let Some(parent) = self.terminals.get(&parent_id) else {
             return;
         };
-        if parent.parent_terminal_id.is_some() {
-            return;
-        }
+        // Sub terminals only nest one level, so a sub terminal of a sub terminal becomes a sibling.
+        let parent_id = parent.parent_terminal_id.unwrap_or(parent_id);
         let working_directory = parent
             .working_directory
             .clone()
@@ -2230,7 +2230,7 @@ impl AgentPanel {
             true,
             init_command,
             Some(parent_id),
-            AgentThreadSource::Sidebar,
+            source,
             window,
             cx,
         );
@@ -6897,10 +6897,15 @@ impl AgentPanel {
                         })
                         .when(supports_terminal, |menu| {
                             let terminal_profiles = Self::terminal_profiles(cx);
+                            let menu = if showing_terminal {
+                                menu.when(crate::agent_threads_enabled(), |menu| menu.separator())
+                                    .header("New Sub Terminal")
+                            } else {
+                                menu
+                            };
                             terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
                                 menu.item(
                                     ContextMenuEntry::new(name)
-                                        .when(showing_terminal, |this| this.action(Box::new(NewThread)))
                                         .when(!showing_terminal, |this| {
                                             this.action(Box::new(NewTerminalThread))
                                         })
@@ -6912,14 +6917,32 @@ impl AgentPanel {
                                                 if let Some(workspace) = workspace.upgrade() {
                                                     workspace.update(cx, |workspace, cx| {
                                                         if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                                            let top_level =
+                                                                window.modifiers().secondary();
                                                             panel.update(cx, |panel, cx| {
-                                                                panel.new_terminal_with_init_command(
-                                                                    Some(workspace),
-                                                                    init_command.clone(),
-                                                                    AgentThreadSource::AgentPanel,
-                                                                    window,
-                                                                    cx,
-                                                                );
+                                                                match panel
+                                                                    .active_terminal_id()
+                                                                    .filter(|id| panel.has_terminal(*id))
+                                                                {
+                                                                    Some(parent_id) if !top_level => {
+                                                                        panel.new_sub_terminal(
+                                                                            parent_id,
+                                                                            init_command.clone(),
+                                                                            AgentThreadSource::AgentPanel,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                    _ => {
+                                                                        panel.new_terminal_with_init_command(
+                                                                            Some(workspace),
+                                                                            init_command.clone(),
+                                                                            AgentThreadSource::AgentPanel,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                }
                                                             });
                                                         }
                                                     });
@@ -7142,12 +7165,27 @@ impl AgentPanel {
                         .icon_size(IconSize::Small),
                     {
                         move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "New Thread\u{2026}",
-                                &ToggleNewThreadMenu,
-                                &focus_handle,
-                                cx,
-                            )
+                            if showing_terminal {
+                                let modifier = if cfg!(target_os = "macos") {
+                                    "\u{2318}"
+                                } else {
+                                    "Ctrl"
+                                };
+                                Tooltip::with_meta_in(
+                                    "New Thread\u{2026}",
+                                    Some(&ToggleNewThreadMenu),
+                                    format!("{modifier}-click a terminal for a top-level terminal"),
+                                    &focus_handle,
+                                    cx,
+                                )
+                            } else {
+                                Tooltip::for_action_in(
+                                    "New Thread\u{2026}",
+                                    &ToggleNewThreadMenu,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            }
                         }
                     },
                 )
@@ -11150,7 +11188,13 @@ mod tests {
         let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.test_terminal_spawn_gate = Some(spawn_gate);
-            panel.new_sub_terminal(parent_id, Some("codex".to_string()), window, cx);
+            panel.new_sub_terminal(
+                parent_id,
+                Some("codex".to_string()),
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
         });
         terminal_landed
             .send(())
@@ -11176,7 +11220,13 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
 
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.new_sub_terminal(TerminalId::new(), None, window, cx);
+            panel.new_sub_terminal(
+                TerminalId::new(),
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
             assert!(
                 panel.pending_terminal_spawn.is_none(),
                 "no spawn should start for a parent that isn't loaded"
@@ -11190,22 +11240,31 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_sub_terminal_rejects_nested_child(cx: &mut TestAppContext) {
+    async fn test_new_sub_terminal_of_sub_terminal_creates_sibling(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
         let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
 
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.new_sub_terminal(child_id, None, window, cx);
-            assert!(
-                panel.pending_terminal_spawn.is_none(),
-                "a sub terminal must not get its own sub terminals"
-            );
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.new_sub_terminal(child_id, None, AgentThreadSource::AgentPanel, window, cx);
         });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the sibling terminal spawn");
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, cx| {
-            assert_eq!(panel.terminals(cx).len(), 2);
+            assert_eq!(panel.terminals(cx).len(), 3);
+            let sibling_id = panel
+                .active_terminal_id()
+                .expect("the sibling terminal should become active");
+            assert_ne!(sibling_id, child_id);
+            let sibling = panel
+                .terminal_metadata(sibling_id, cx)
+                .expect("sibling terminal metadata should exist");
+            assert_eq!(sibling.parent_terminal_id, Some(parent_id));
         });
     }
 

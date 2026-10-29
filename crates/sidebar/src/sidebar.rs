@@ -7346,7 +7346,13 @@ impl Sidebar {
         workspace.update(cx, |workspace, cx| {
             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                 panel.update(cx, |panel, cx| {
-                    panel.new_sub_terminal(parent_id, init_command, window, cx);
+                    panel.new_sub_terminal(
+                        parent_id,
+                        init_command,
+                        AgentThreadSource::Sidebar,
+                        window,
+                        cx,
+                    );
                 });
             }
             workspace.focus_panel::<AgentPanel>(window, cx);
