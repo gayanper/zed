@@ -95,6 +95,8 @@ The terminal overview shows a terminal thread's sub terminals in a column beside
 
 The overview is hidden while the panel can't also give the parent terminal 40 columns.
 
+Starting a sub terminal from the agent panel's new thread menu keeps the parent terminal in view and focused, turns its overview on, and adds the new sub terminal to it.
+
 ## Navigating the Terminal Overview {#terminal-overview-navigation}
 
 While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb agent::FocusPreviousOverviewTerminal} move focus between the parent terminal and its sub terminals.

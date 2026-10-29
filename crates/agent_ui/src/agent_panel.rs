@@ -2193,6 +2193,7 @@ impl AgentPanel {
             true,
             init_command,
             None,
+            false,
             source,
             window,
             cx,
@@ -2220,16 +2221,19 @@ impl AgentPanel {
             .clone()
             .or_else(|| self.terminal_working_directory(None, cx));
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        self.activate_terminal(parent_id, true, window, cx);
+        self.set_terminal_overview(parent_id, true, cx);
         self.spawn_terminal(
             TerminalId::new(),
             working_directory,
             None,
             None,
             None,
-            true,
-            true,
+            false,
+            false,
             init_command,
             Some(parent_id),
+            true,
             source,
             window,
             cx,
@@ -2307,6 +2311,7 @@ impl AgentPanel {
         focus: bool,
         init_command: Option<String>,
         parent_terminal_id: Option<TerminalId>,
+        show_in_parent_overview: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2364,6 +2369,7 @@ impl AgentPanel {
                     created_at,
                     select && this.view_selection_generation == selection_generation,
                     focus,
+                    show_in_parent_overview,
                     source,
                     window,
                     cx,
@@ -2477,6 +2483,7 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
+        show_in_parent_overview: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2533,6 +2540,7 @@ impl AgentPanel {
                     .map(|metadata| (metadata.overview_enabled, metadata.shown_in_overview))
             })
             .unwrap_or_default();
+        let shown_in_overview = shown_in_overview || show_in_parent_overview;
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2807,6 +2815,7 @@ impl AgentPanel {
                 .init_command
                 .or_else(|| Self::default_terminal_init_command(cx)),
             metadata.parent_terminal_id,
+            false,
             source,
             window,
             cx,
@@ -3344,6 +3353,7 @@ impl AgentPanel {
             false,
             init_command,
             metadata.parent_terminal_id,
+            false,
             source,
             window,
             cx,
@@ -6162,6 +6172,7 @@ impl AgentPanel {
             false,
             Self::default_terminal_init_command(cx),
             None,
+            false,
             source,
             window,
             cx,
@@ -8094,6 +8105,7 @@ impl AgentPanel {
             None,
             true,
             true,
+            false,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -8596,6 +8608,7 @@ impl AgentPanel {
             created_at,
             select,
             focus,
+            false,
             source,
             window,
             cx,
@@ -9618,6 +9631,7 @@ mod tests {
                 false,
                 None,
                 Some(parent_id),
+                false,
                 AgentThreadSource::Sidebar,
                 window,
                 cx,
@@ -9903,6 +9917,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -11202,10 +11217,10 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, cx| {
-            let child_id = panel
-                .active_terminal_id()
-                .expect("the sub terminal should become active");
-            assert_ne!(child_id, parent_id);
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            let [child_id] = panel.loaded_sub_terminal_ids(parent_id)[..] else {
+                panic!("expected one sub terminal");
+            };
             let child = panel
                 .terminal_metadata(child_id, cx)
                 .expect("sub terminal metadata should exist");
@@ -11257,14 +11272,97 @@ mod tests {
 
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.terminals(cx).len(), 3);
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
             let sibling_id = panel
-                .active_terminal_id()
-                .expect("the sibling terminal should become active");
-            assert_ne!(sibling_id, child_id);
+                .loaded_sub_terminal_ids(parent_id)
+                .into_iter()
+                .find(|id| *id != child_id)
+                .expect("the sibling terminal should be loaded");
             let sibling = panel
                 .terminal_metadata(sibling_id, cx)
                 .expect("sibling terminal metadata should exist");
             assert_eq!(sibling.parent_terminal_id, Some(parent_id));
+            assert!(panel.terminals[&parent_id].overview);
+            assert!(panel.terminals[&sibling_id].shown_in_overview);
+        });
+    }
+
+    fn start_test_sub_terminal(
+        panel: &Entity<AgentPanel>,
+        from_id: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> TerminalId {
+        let existing_ids = panel.read_with(cx, |panel, _| {
+            panel.terminals.keys().copied().collect::<HashSet<_>>()
+        });
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.new_sub_terminal(from_id, None, AgentThreadSource::AgentPanel, window, cx);
+        });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the sub terminal spawn");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            panel
+                .terminals
+                .keys()
+                .copied()
+                .find(|id| !existing_ids.contains(id))
+                .expect("the sub terminal should be loaded")
+        })
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_opens_parent_overview(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, _) = setup_test_overview_selection(cx, 0).await;
+
+        let new_id = start_test_sub_terminal(&panel, parent_id, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+            assert_eq!(panel.visible_overview_sub_terminal_ids(parent_id), vec![new_id]);
+            assert!(
+                panel.terminals[&parent_id]
+                    .view
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_joins_existing_overview_selection(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_overview_selection(cx, 2).await;
+        let [first_id, _] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
+
+        let new_id = start_test_sub_terminal(&panel, parent_id, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            let mut selection = panel.overview_selection(parent_id, cx);
+            selection.sort();
+            let mut expected = vec![first_id, new_id];
+            expected.sort();
+            assert_eq!(selection, expected);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_sub_terminal_on_narrow_panel_keeps_overview_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx, parent_id, _) = setup_test_overview_selection(cx, 0).await;
+        set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
+
+        let new_id = start_test_sub_terminal(&panel, parent_id, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminals[&parent_id].overview);
+            assert!(panel.terminals[&new_id].shown_in_overview);
+            assert_eq!(panel.visible_overview_id(cx), None);
         });
     }
 
@@ -11480,6 +11578,7 @@ mod tests {
                 true,
                 Some("printf 'init_ran_%s\\n' 42".to_string()),
                 None,
+                false,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
