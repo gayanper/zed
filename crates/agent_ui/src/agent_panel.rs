@@ -807,10 +807,15 @@ impl ScreenText {
         let mut text = String::new();
         let mut byte_lines = Vec::new();
         for cell in &content.cells {
-            let character = cell.character();
-            if !character.is_whitespace() {
-                text.push(character);
-                byte_lines.extend(std::iter::repeat_n(cell.point.line, character.len_utf8()));
+            // Selected text includes a cell's zero-width characters, such as
+            // the U+FE0F in "➡️", so they must be here for comments to match.
+            let characters = std::iter::once(cell.character())
+                .chain(cell.zerowidth().into_iter().flatten().copied());
+            for character in characters {
+                if !character.is_whitespace() {
+                    text.push(character);
+                    byte_lines.extend(std::iter::repeat_n(cell.point.line, character.len_utf8()));
+                }
             }
         }
         Self { text, byte_lines }
@@ -13760,6 +13765,45 @@ mod tests {
             &mut cx,
         );
         assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [0..=1]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_on_text_with_zero_width_characters(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "alpha\r\n\u{27A1}\u{FE0F} next\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 6)),
+            "\u{27A1}\u{FE0F} next",
+            "Fix this.",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=1]);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_marker_on_wide_characters_joined_by_zero_width_joiner(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        let (terminal_id, terminal) = open_terminal_with_output(
+            &panel,
+            "alpha\r\n\u{1F468}\u{200D}\u{1F469} next\r\n",
+            &mut cx,
+        );
+        comment_in_terminal(
+            &panel,
+            terminal_id,
+            (terminal::Point::new(1, 0), terminal::Point::new(1, 8)),
+            "\u{1F468}\u{200D}\u{1F469} next",
+            "Fix this.",
+            &mut cx,
+        );
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [1..=1]);
     }
 
     #[gpui::test]
