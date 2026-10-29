@@ -2084,6 +2084,7 @@ impl Render for MultiWorkspace {
             root.key_context(workspace_key_context)
                 .relative()
                 .size_full()
+                .bg(cx.theme().colors().background)
                 .font(ui_font)
                 .text_color(text_color)
                 .on_action(cx.listener(Self::close_window))
