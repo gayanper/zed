@@ -9698,6 +9698,7 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
+                            .debug_selector(|| "workspace-region".into())
                             .bg(colors.background)
                             .relative()
                             .flex_1()
@@ -9708,7 +9709,6 @@ impl Render for Workspace {
                             .border_t_1()
                             .border_b_1()
                             .border_color(colors.border)
-                            .p(theme.layout().pane_gap)
                             .child({
                                 let this = cx.entity();
                                 canvas(
@@ -9746,13 +9746,8 @@ impl Render for Workspace {
                                     },
                                     |_, _, _, _| {},
                                 )
-                                // Absolute children size against the padding box, so inset by the
-                                // pane gap to measure only the area the docks and center occupy.
                                 .absolute()
-                                .top(theme.layout().pane_gap)
-                                .left(theme.layout().pane_gap)
-                                .right(theme.layout().pane_gap)
-                                .bottom(theme.layout().pane_gap)
+                                .size_full()
                             })
                             .when(self.zoomed.is_none(), |this| {
                                 this.on_drag_move(cx.listener(
@@ -10069,12 +10064,7 @@ impl Render for Workspace {
                                     .border_color(colors.border)
                                     .bg(colors.background)
                                     .child(zoomed_element)
-                                    // Insets resolve against the padding box, so match the tiles' outer gap.
-                                    .top(theme.layout().pane_gap)
-                                    .left(theme.layout().pane_gap)
-                                    .right(theme.layout().pane_gap)
-                                    .bottom(theme.layout().pane_gap)
-                                    .rounded(theme.layout().pane_radius)
+                                    .inset_0()
                                     .shadow_lg();
 
                                 if !WorkspaceSettings::get_global(cx).zoomed_padding {
@@ -15757,11 +15747,34 @@ mod tests {
         };
         cx.run_until_parked();
         let workspace_bounds = workspace.read_with(cx, |workspace, _| workspace.bounds);
-        // The workspace bounds are measured inside the outer gap, which keeps dock drag math unchanged.
         assert_eq!(
             editor_bounds(cx).left(),
             workspace_bounds.left(),
             "a closed left dock should not add a gap before the center"
+        );
+        let workspace_region = cx
+            .debug_bounds("workspace-region")
+            .expect("the workspace should render");
+        // The workspace has a 1px top and bottom border but no vertical gap.
+        assert_eq!(
+            editor_bounds(cx).top(),
+            workspace_region.top() + px(1.),
+            "the center should sit flush below the title bar"
+        );
+        assert_eq!(
+            editor_bounds(cx).bottom(),
+            workspace_region.bottom() - px(1.),
+            "the center should sit flush above the status bar"
+        );
+        assert_eq!(
+            workspace_bounds.left(),
+            workspace_region.left(),
+            "the center should sit flush against the window's left edge"
+        );
+        assert_eq!(
+            workspace_bounds.right(),
+            workspace_region.right(),
+            "the center should sit flush against the window's right edge"
         );
 
         workspace.update_in(cx, |workspace, window, cx| {
@@ -15774,7 +15787,7 @@ mod tests {
         let left_dock_bounds = cx
             .debug_bounds("left-dock")
             .expect("the open left dock should render");
-        assert_eq!(left_dock_bounds.left(), workspace_bounds.left());
+        assert_eq!(left_dock_bounds.left(), workspace_region.left());
         assert_eq!(
             editor_bounds(cx).left(),
             left_dock_bounds.right() + pane_gap,
@@ -15792,7 +15805,7 @@ mod tests {
         let right_dock_bounds = cx
             .debug_bounds("right-dock")
             .expect("the open right dock should render");
-        assert_eq!(right_dock_bounds.right(), workspace_bounds.right());
+        assert_eq!(right_dock_bounds.right(), workspace_region.right());
         assert_eq!(
             editor_bounds(cx).right() + pane_gap,
             right_dock_bounds.left(),

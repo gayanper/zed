@@ -653,9 +653,9 @@ pub struct ThemeStyles {
 /// Gap between the workspace regions (docks and center) and corner rounding of the docks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutStyles {
-    /// Gap between the docks and the center, and around the workspace edge.
+    /// Gap between the docks and the center.
     pub pane_gap: Pixels,
-    /// Corner radius of the dock panels and the zoomed view.
+    /// Corner radius of the dock panels.
     pub pane_radius: Pixels,
 }
 

@@ -1375,9 +1375,9 @@ pub struct StatusColorsContent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 #[serde(default)]
 pub struct LayoutContent {
-    /// Gap in pixels between the docks and the center, and around the workspace edge.
+    /// Gap in pixels between the docks and the center.
     pub pane_gap: Option<f32>,
-    /// Corner radius in pixels of the dock panels and the zoomed view.
+    /// Corner radius in pixels of the dock panels.
     pub pane_radius: Option<f32>,
 }
 

@@ -2051,6 +2051,14 @@ impl Render for MultiWorkspace {
                     .h_full()
                     .w(sidebar_width)
                     .flex_shrink_0()
+                    .map(|this| {
+                        let pane_gap = cx.theme().layout().pane_gap;
+                        if sidebar_on_right {
+                            this.ml(pane_gap)
+                        } else {
+                            this.mr(pane_gap)
+                        }
+                    })
                     .child(sidebar_handle.to_any())
                     .child(resize_handle)
                     .into_any_element()
