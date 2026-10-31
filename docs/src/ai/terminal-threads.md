@@ -100,9 +100,11 @@ The terminal overview shows a terminal thread's sub terminals in a column beside
 
 The overview is hidden while the panel can't also give the parent terminal 40 columns.
 
-Starting a sub terminal from the agent panel's new thread menu keeps the parent terminal in view and focused, turns its overview on, and adds the new sub terminal to it.
+Starting a sub terminal from the agent panel's new thread menu keeps the parent terminal in view and focused, and turns its overview on.
 
-Sub terminals appear only in the overview, not in the sidebar. Opening a terminal that isn't loaded from the sidebar also opens its overview. The overview button's badge shows how many a terminal has. A notification from a sub terminal marks its parent in the sidebar. Close a sub terminal from its overview header or from the **Choose Sub Terminals** menu.
+Sub terminals appear only in the overview, not in the sidebar. Opening a terminal that isn't loaded from the sidebar also opens its overview. The overview button's badge shows how many a terminal has. A notification from a sub terminal marks its parent in the sidebar. The overview shows all of a terminal's sub terminals. Close one from its header.
+
+To save space, minimize a sub terminal from its header or with {#kb agent::ToggleMinimizeOverviewTerminal}, leaving only the header. The header then takes focus, and the same button or keys restore the sub terminal. A notification from a minimized sub terminal marks its header and its parent in the sidebar until it's restored. A sub terminal that fails to start stays in the overview as a header with a retry button.
 
 ## Navigating the Terminal Overview {#terminal-overview-navigation}
 

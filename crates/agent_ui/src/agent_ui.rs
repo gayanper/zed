@@ -421,6 +421,8 @@ actions!(
         /// Swaps the focused sub terminal with its parent in the terminal overview,
         /// or swaps them back.
         ToggleZoomOverviewTerminal,
+        /// Minimizes the focused sub terminal to its header, or restores it.
+        ToggleMinimizeOverviewTerminal,
     ]
 );
 

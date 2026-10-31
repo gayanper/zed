@@ -1360,12 +1360,23 @@
     },
   },
   {
+    "context": "AgentPanel > OverviewTerminalHeader",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k ctrl-]": "agent::FocusNextOverviewTerminal",
+      "ctrl-k ctrl-[": "agent::FocusPreviousOverviewTerminal",
+      "ctrl-k ctrl-m": "agent::ToggleZoomOverviewTerminal",
+      "ctrl-k ctrl-h": "agent::ToggleMinimizeOverviewTerminal",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-k ctrl-]": "agent::FocusNextOverviewTerminal",
       "ctrl-k ctrl-[": "agent::FocusPreviousOverviewTerminal",
       "ctrl-k ctrl-m": "agent::ToggleZoomOverviewTerminal",
+      "ctrl-k ctrl-h": "agent::ToggleMinimizeOverviewTerminal",
       "ctrl-f": "agent::ToggleSearch",
       "ctrl-n": "agent::NewThread",
     },

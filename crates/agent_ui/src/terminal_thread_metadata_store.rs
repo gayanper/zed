@@ -57,8 +57,8 @@ pub struct TerminalThreadMetadata {
     pub parent_terminal_id: Option<TerminalId>,
     /// Whether this parent terminal shows its sub terminals beside it.
     pub overview_enabled: bool,
-    /// Whether this sub terminal is part of its parent's overview selection.
-    pub shown_in_overview: bool,
+    /// Whether this sub terminal is collapsed to its header in its parent's overview.
+    pub minimized_in_overview: bool,
 }
 
 impl TerminalThreadMetadata {
@@ -308,20 +308,20 @@ impl TerminalThreadMetadataStore {
         cx.notify();
     }
 
-    pub fn set_shown_in_overview(
+    pub fn set_minimized_in_overview(
         &mut self,
         terminal_id: TerminalId,
-        shown_in_overview: bool,
+        minimized_in_overview: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(mut metadata) = self.entry(terminal_id).cloned() else {
             return;
         };
-        if metadata.shown_in_overview == shown_in_overview {
+        if metadata.minimized_in_overview == minimized_in_overview {
             return;
         }
 
-        metadata.shown_in_overview = shown_in_overview;
+        metadata.minimized_in_overview = minimized_in_overview;
         self.save_internal(metadata);
         cx.notify();
     }
@@ -532,6 +532,9 @@ impl Domain for TerminalThreadMetadataDb {
             ALTER TABLE sidebar_terminal_threads ADD COLUMN overview_enabled INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE sidebar_terminal_threads ADD COLUMN shown_in_overview INTEGER NOT NULL DEFAULT 0;
         ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN minimized_in_overview INTEGER NOT NULL DEFAULT 0;
+        ),
     ];
 }
 
@@ -543,7 +546,7 @@ impl TerminalThreadMetadataDb {
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
              main_worktree_paths_order, remote_connection, init_command, parent_terminal_id, \
-             overview_enabled, shown_in_overview \
+             overview_enabled, minimized_in_overview \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -582,10 +585,10 @@ impl TerminalThreadMetadataDb {
             .parent_terminal_id
             .map(|terminal_id| terminal_id.to_key_string());
         let overview_enabled = row.overview_enabled;
-        let shown_in_overview = row.shown_in_overview;
+        let minimized_in_overview = row.minimized_in_overview;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, parent_terminal_id, overview_enabled, shown_in_overview) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, parent_terminal_id, overview_enabled, minimized_in_overview) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
@@ -600,7 +603,7 @@ impl TerminalThreadMetadataDb {
                             init_command = excluded.init_command, \
                             parent_terminal_id = excluded.parent_terminal_id, \
                             overview_enabled = excluded.overview_enabled, \
-                            shown_in_overview = excluded.shown_in_overview";
+                            minimized_in_overview = excluded.minimized_in_overview";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -615,7 +618,7 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&init_command, i)?;
             i = stmt.bind(&parent_terminal_id, i)?;
             i = stmt.bind(&overview_enabled, i)?;
-            stmt.bind(&shown_in_overview, i)?;
+            stmt.bind(&minimized_in_overview, i)?;
             stmt.exec()
         })
         .await
@@ -654,7 +657,7 @@ impl Column for TerminalThreadMetadata {
         let (init_command, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (parent_terminal_id, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (overview_enabled, next): (bool, i32) = Column::column(statement, next)?;
-        let (shown_in_overview, next): (bool, i32) = Column::column(statement, next)?;
+        let (minimized_in_overview, next): (bool, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -700,7 +703,7 @@ impl Column for TerminalThreadMetadata {
                     .map(TerminalId::from_key_string)
                     .transpose()?,
                 overview_enabled,
-                shown_in_overview,
+                minimized_in_overview,
             },
             next,
         ))
@@ -733,7 +736,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         }
     }
 
@@ -906,7 +909,7 @@ mod tests {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(parent, cx);
                 store.save(child, cx);
-                store.set_shown_in_overview(child_id, true, cx);
+                store.set_minimized_in_overview(child_id, true, cx);
             });
         });
         cx.run_until_parked();
@@ -922,12 +925,12 @@ mod tests {
                 .entry(parent_id)
                 .expect("parent terminal metadata should exist");
             assert!(parent.overview_enabled);
-            assert!(!parent.shown_in_overview);
+            assert!(!parent.minimized_in_overview);
             let child = store
                 .entry(child_id)
                 .expect("child terminal metadata should exist");
             assert!(!child.overview_enabled);
-            assert!(child.shown_in_overview);
+            assert!(child.minimized_in_overview);
         });
     }
 

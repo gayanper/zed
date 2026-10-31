@@ -2452,7 +2452,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         init_command: None,
         parent_terminal_id: None,
         overview_enabled: false,
-        shown_in_overview: false,
+        minimized_in_overview: false,
     };
 
     cx.update(|_, cx| {
@@ -3687,7 +3687,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         init_command: None,
         parent_terminal_id: None,
         overview_enabled: false,
-        shown_in_overview: false,
+        minimized_in_overview: false,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3798,7 +3798,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         init_command: None,
         parent_terminal_id: None,
         overview_enabled: false,
-        shown_in_overview: false,
+        minimized_in_overview: false,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3972,7 +3972,7 @@ async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &m
         init_command: None,
         parent_terminal_id: None,
         overview_enabled: false,
-        shown_in_overview: false,
+        minimized_in_overview: false,
     };
     let sub_terminal_metadata = TerminalThreadMetadata {
         terminal_id: sub_terminal_id,

@@ -58,7 +58,8 @@ use crate::{
     FocusPreviousOverviewTerminal, Follow, LoadThreadFromClipboard, NewTerminalThread, NewThread,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread, ResetFastModeWarnings,
     ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
-    ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview, ToggleZoomOverviewTerminal,
+    ToggleMinimizeOverviewTerminal, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview,
+    ToggleZoomOverviewTerminal,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -100,8 +101,8 @@ use terminal_view::terminal_element::scaled_font_size;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, CountBadge, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, SplitButton, SplitButtonStyle, Tab, Tooltip, prelude::*,
+    ContextMenu, ContextMenuEntry, CountBadge, GradientFade, IconButton, Indicator, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
     utils::WithRemSize,
 };
 use util::ResultExt as _;
@@ -132,13 +133,6 @@ struct TerminalOverviewButtonState {
     sub_terminal_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct OverviewSubTerminal {
-    terminal_id: TerminalId,
-    title: SharedString,
-    created_at: DateTime<Utc>,
-    shown: bool,
-}
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1076,10 +1070,12 @@ struct AgentTerminal {
     parent_terminal_id: Option<TerminalId>,
     created_at: DateTime<Utc>,
     has_notification: bool,
-    /// Shows this terminal next to its selected sub terminals.
+    /// Shows this terminal next to its sub terminals.
     overview: bool,
-    /// Whether this sub terminal is selected for its parent's overview.
-    shown_in_overview: bool,
+    /// Collapses this sub terminal to its header in its parent's overview.
+    minimized_in_overview: bool,
+    /// Holds focus while the terminal itself is minimized and can't.
+    header_focus_handle: FocusHandle,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
@@ -1262,6 +1258,11 @@ pub struct AgentPanel {
     /// Width of the terminal content area from the last frame. The overview
     /// toggle depends on it, but the toolbar renders before that area is laid out.
     terminal_content_width: Rc<Cell<Pixels>>,
+    /// Sub terminals whose last start failed, which only a retry starts again.
+    failed_sub_terminals: HashSet<TerminalId>,
+    /// Sub terminals still starting, with their parents. They have no metadata
+    /// or terminal yet, so nothing else shows that they're coming.
+    spawning_sub_terminals: HashMap<TerminalId, TerminalId>,
     /// Sub terminal swapped with its parent in the overview. Read it through
     /// `zoomed_overview_terminal_id`, since the sub terminal may no longer be shown.
     zoomed_overview_terminal: Option<TerminalId>,
@@ -1724,6 +1725,8 @@ impl AgentPanel {
             pending_terminal_spawn: None,
             pending_terminal_restores: HashMap::default(),
             terminal_content_width: Rc::new(Cell::new(Pixels::ZERO)),
+            failed_sub_terminals: HashSet::default(),
+            spawning_sub_terminals: HashMap::default(),
             zoomed_overview_terminal: None,
             view_selection_generation: 0,
             #[cfg(test)]
@@ -2201,7 +2204,6 @@ impl AgentPanel {
             true,
             init_command,
             None,
-            false,
             source,
             window,
             cx,
@@ -2242,7 +2244,6 @@ impl AgentPanel {
             false,
             init_command,
             Some(parent_id),
-            true,
             source,
             window,
             cx,
@@ -2345,7 +2346,6 @@ impl AgentPanel {
         focus: bool,
         init_command: Option<String>,
         parent_terminal_id: Option<TerminalId>,
-        show_in_parent_overview: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2360,6 +2360,9 @@ impl AgentPanel {
             self.pending_terminal_spawn = Some(terminal_id);
         }
         let terminal_working_directory = working_directory.clone();
+        if let Some(parent_id) = parent_terminal_id {
+            self.spawning_sub_terminals.insert(terminal_id, parent_id);
+        }
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2378,6 +2381,9 @@ impl AgentPanel {
                         if this.pending_terminal_spawn == Some(terminal_id) {
                             this.pending_terminal_spawn = None;
                             cx.notify();
+                        }
+                        if let Some(parent_id) = parent_terminal_id {
+                            this.sub_terminal_spawn_failed(terminal_id, parent_id, cx);
                         }
                     })
                     .log_err();
@@ -2403,7 +2409,6 @@ impl AgentPanel {
                     created_at,
                     select && this.view_selection_generation == selection_generation,
                     focus,
-                    show_in_parent_overview,
                     source,
                     window,
                     cx,
@@ -2413,6 +2418,100 @@ impl AgentPanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn sub_terminal_spawn_failed(
+        &mut self,
+        terminal_id: TerminalId,
+        parent_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawning_sub_terminals.remove(&terminal_id);
+        self.mark_sub_terminal_failed(terminal_id, cx);
+        // A new sub terminal has no saved entry to show as failed. Another one
+        // still starting may yet need the overview.
+        if self.sub_terminal_count(parent_id, cx) == 0
+            && !self
+                .spawning_sub_terminals
+                .values()
+                .any(|id| *id == parent_id)
+        {
+            self.set_terminal_overview(parent_id, false, cx);
+        }
+    }
+
+    /// Keeps a sub terminal that couldn't start in its parent's overview as a
+    /// header-only row, since retrying may succeed once the cause clears.
+    fn mark_sub_terminal_failed(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        if store.read(cx).entry(terminal_id).is_none() {
+            return;
+        }
+        self.failed_sub_terminals.insert(terminal_id);
+        cx.notify();
+    }
+
+    fn retry_failed_sub_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        parent_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_terminal(cx) || !self.failed_sub_terminals.remove(&terminal_id) {
+            return;
+        }
+        self.restore_overview_sub_terminals(parent_id, AgentThreadSource::AgentPanel, window, cx);
+        cx.notify();
+    }
+
+    fn close_failed_sub_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        parent_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        self.failed_sub_terminals.remove(&terminal_id);
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| store.delete(terminal_id, cx));
+        }
+        if self.sub_terminal_count(parent_id, cx) == 0 {
+            self.set_terminal_overview(parent_id, false, cx);
+        }
+        cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
+    }
+
+    fn failed_sub_terminals_of(
+        &self,
+        parent_id: TerminalId,
+        cx: &App,
+    ) -> Vec<(TerminalId, SharedString)> {
+        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
+            return Vec::new();
+        };
+        let store = store.read(cx);
+        let mut failed = store
+            .entries()
+            .filter(|metadata| {
+                metadata.parent_terminal_id == Some(parent_id)
+                    && self.failed_sub_terminals.contains(&metadata.terminal_id)
+            })
+            .map(|metadata| {
+                (
+                    metadata.created_at,
+                    metadata.terminal_id,
+                    metadata.display_title(),
+                )
+            })
+            .collect::<Vec<_>>();
+        failed.sort_by_key(|(created_at, terminal_id, _)| (*created_at, *terminal_id));
+        failed
+            .into_iter()
+            .map(|(_, terminal_id, title)| (terminal_id, title))
+            .collect()
     }
 
     fn create_terminal_shell(
@@ -2520,7 +2619,6 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        show_in_parent_overview: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2569,15 +2667,14 @@ impl AgentPanel {
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
-        let (overview, shown_in_overview) = TerminalThreadMetadataStore::try_global(cx)
+        let (overview, minimized_in_overview) = TerminalThreadMetadataStore::try_global(cx)
             .and_then(|store| {
                 store
                     .read(cx)
                     .entry(terminal_id)
-                    .map(|metadata| (metadata.overview_enabled, metadata.shown_in_overview))
+                    .map(|metadata| (metadata.overview_enabled, metadata.minimized_in_overview))
             })
             .unwrap_or_default();
-        let shown_in_overview = shown_in_overview || show_in_parent_overview;
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2592,7 +2689,8 @@ impl AgentPanel {
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
             overview,
-            shown_in_overview,
+            minimized_in_overview,
+            header_focus_handle: cx.focus_handle(),
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -2601,24 +2699,34 @@ impl AgentPanel {
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
         }
-        let (select, focus) = match self.pending_terminal_restores.remove(&terminal_id) {
-            Some(PendingTerminalRestore::SelectOnLand {
-                focus,
-                selection_generation,
-            }) if selection_generation == self.view_selection_generation => (true, focus),
-            _ => (select, focus),
-        };
+        let (select, focus, selected_on_land) =
+            match self.pending_terminal_restores.remove(&terminal_id) {
+                Some(PendingTerminalRestore::SelectOnLand {
+                    focus,
+                    selection_generation,
+                }) if selection_generation == self.view_selection_generation => (true, focus, true),
+                _ => (select, focus, false),
+            };
         terminal.refresh_metadata(cx);
         terminal.report_started_terminal_program(terminal_id, source, cx);
-        let restore_overview = terminal.overview && terminal.parent_terminal_id.is_none();
+        let parent_terminal_id = terminal.parent_terminal_id;
+        let restore_overview = terminal.overview && parent_terminal_id.is_none();
         self.terminals.insert(terminal_id, terminal);
+        self.failed_sub_terminals.remove(&terminal_id);
+        self.spawning_sub_terminals.remove(&terminal_id);
         self.persist_terminal_metadata(terminal_id, cx);
         self.emit_terminal_thread_started(terminal_id, source, cx);
         if select {
-            self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
+            let has_loaded_parent =
+                parent_terminal_id.is_some_and(|parent_id| self.terminals.contains_key(&parent_id));
+            if selected_on_land && has_loaded_parent {
+                self.activate_terminal(terminal_id, focus, window, cx);
+            } else {
+                self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
+            }
         }
         // A parent restored with its overview on can only show it once its
-        // selected sub terminals are running again.
+        // sub terminals are running again.
         if restore_overview {
             self.restore_overview_sub_terminals(terminal_id, source, window, cx);
         }
@@ -2641,9 +2749,21 @@ impl AgentPanel {
             .and_then(|terminal| terminal.parent_terminal_id)
             .filter(|parent_id| self.terminals.contains_key(parent_id))
         {
-            self.set_shown_in_overview(terminal_id, true, cx);
+            self.set_minimized_in_overview(terminal_id, false, cx);
             self.set_terminal_overview(parent_id, true, cx);
+            self.restore_overview_sub_terminals(
+                parent_id,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
             self.activate_terminal(parent_id, focus, window, cx);
+            if focus
+                && self.visible_overview_id(cx) == Some(parent_id)
+                && let Some(terminal) = self.terminals.get(&terminal_id)
+            {
+                window.focus(&terminal.view.focus_handle(cx), cx);
+            }
             return;
         }
         self.supersede_pending_selections();
@@ -2688,6 +2808,12 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The panel only refocuses when the active terminal closes, and a sub
+        // terminal never is.
+        let parent_to_focus = self
+            .focused_overview_terminal_id(window, cx)
+            .filter(|focused_id| *focused_id == terminal_id)
+            .and_then(|_| self.terminals.get(&terminal_id)?.parent_terminal_id);
         let was_active = self.active_terminal_id() == Some(terminal_id);
 
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2711,9 +2837,12 @@ impl AgentPanel {
                 .terminals
                 .get(&parent_id)
                 .is_some_and(|parent| parent.overview)
-            && self.overview_selection(parent_id, cx).is_empty()
+            && self.sub_terminal_count(parent_id, cx) == 0
         {
             self.set_terminal_overview(parent_id, false, cx);
+        }
+        if let Some(parent) = parent_to_focus.and_then(|id| self.terminals.get(&id)) {
+            window.focus(&parent.view.focus_handle(cx), cx);
         }
         if was_active {
             self.base_view = BaseView::Uninitialized;
@@ -2811,7 +2940,7 @@ impl AgentPanel {
             init_command: terminal.init_command.clone(),
             parent_terminal_id: terminal.parent_terminal_id,
             overview_enabled: terminal.overview,
-            shown_in_overview: terminal.shown_in_overview,
+            minimized_in_overview: terminal.minimized_in_overview,
         })
     }
 
@@ -2866,7 +2995,6 @@ impl AgentPanel {
                 .init_command
                 .or_else(|| Self::default_terminal_init_command(cx)),
             metadata.parent_terminal_id,
-            false,
             source,
             window,
             cx,
@@ -2880,22 +3008,18 @@ impl AgentPanel {
     /// Marks a persisted parent to open its overview when it's restored. Sub
     /// terminals have no sidebar row, so the overview is how they get reached.
     pub fn show_overview_on_restore(&self, parent_id: TerminalId, cx: &mut App) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
         let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
             return;
         };
         store.update(cx, |store, cx| {
-            let sub_terminals = store
+            if !store
                 .entries()
-                .filter(|entry| entry.parent_terminal_id == Some(parent_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if sub_terminals.is_empty() {
+                .any(|entry| entry.parent_terminal_id == Some(parent_id))
+            {
                 return;
-            }
-            if !sub_terminals.iter().any(|entry| entry.shown_in_overview) {
-                for sub_terminal in sub_terminals {
-                    store.set_shown_in_overview(sub_terminal.terminal_id, true, cx);
-                }
             }
             if let Some(mut parent) = store.entry(parent_id).cloned() {
                 parent.overview_enabled = true;
@@ -2911,25 +3035,6 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.restore_sub_terminals_matching(
-            parent_id,
-            |metadata| metadata.shown_in_overview,
-            source,
-            None,
-            window,
-            cx,
-        );
-    }
-
-    fn restore_sub_terminals_matching(
-        &mut self,
-        parent_id: TerminalId,
-        predicate: impl Fn(&TerminalThreadMetadata) -> bool,
-        source: AgentThreadSource,
-        workspace: Option<&Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         if !self.supports_terminal(cx) {
             return;
         }
@@ -2941,7 +3046,7 @@ impl AgentPanel {
             .entries()
             .filter(|metadata| {
                 metadata.parent_terminal_id == Some(parent_id)
-                    && predicate(metadata)
+                    && !self.failed_sub_terminals.contains(&metadata.terminal_id)
                     && !self.has_terminal(metadata.terminal_id)
                     && self.pending_terminal_spawn != Some(metadata.terminal_id)
                     && !self
@@ -2954,7 +3059,7 @@ impl AgentPanel {
         for metadata in sub_terminals {
             self.pending_terminal_restores
                 .insert(metadata.terminal_id, PendingTerminalRestore::Background);
-            self.spawn_background_restored_terminal(metadata, source, workspace, window, cx);
+            self.spawn_background_restored_terminal(metadata, source, None, window, cx);
         }
     }
 
@@ -2985,70 +3090,24 @@ impl AgentPanel {
             })
     }
 
-    /// Loaded and persisted sub terminals of `parent_id`, oldest first.
-    fn overview_sub_terminals(&self, parent_id: TerminalId, cx: &App) -> Vec<OverviewSubTerminal> {
-        let mut sub_terminals = HashMap::default();
+    /// Counts persisted sub terminals too, which may not be loaded yet.
+    fn sub_terminal_count(&self, parent_id: TerminalId, cx: &App) -> usize {
+        let mut sub_terminal_ids = self
+            .terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.parent_terminal_id == Some(parent_id))
+            .map(|(terminal_id, _)| *terminal_id)
+            .collect::<HashSet<_>>();
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
-            for metadata in store
-                .read(cx)
-                .entries()
-                .filter(|metadata| metadata.parent_terminal_id == Some(parent_id))
-            {
-                sub_terminals.insert(
-                    metadata.terminal_id,
-                    OverviewSubTerminal {
-                        terminal_id: metadata.terminal_id,
-                        title: Self::overview_sub_terminal_title(metadata.display_title()),
-                        created_at: metadata.created_at,
-                        shown: metadata.shown_in_overview,
-                    },
-                );
-            }
+            sub_terminal_ids.extend(
+                store
+                    .read(cx)
+                    .entries()
+                    .filter(|metadata| metadata.parent_terminal_id == Some(parent_id))
+                    .map(|metadata| metadata.terminal_id),
+            );
         }
-        for (terminal_id, terminal) in &self.terminals {
-            if terminal.parent_terminal_id == Some(parent_id) {
-                sub_terminals.insert(
-                    *terminal_id,
-                    OverviewSubTerminal {
-                        terminal_id: *terminal_id,
-                        title: Self::overview_sub_terminal_title(terminal.title(cx)),
-                        created_at: terminal.created_at,
-                        shown: terminal.shown_in_overview,
-                    },
-                );
-            }
-        }
-        let mut sub_terminals = sub_terminals.into_values().collect::<Vec<_>>();
-        sub_terminals
-            .sort_by_key(|sub_terminal| (sub_terminal.created_at, sub_terminal.terminal_id));
-        sub_terminals
-    }
-
-    fn overview_sub_terminal_title(title: SharedString) -> SharedString {
-        if title.is_empty() {
-            SharedString::from("Terminal")
-        } else {
-            title
-        }
-    }
-
-    fn overview_selection(&self, parent_id: TerminalId, cx: &App) -> Vec<TerminalId> {
-        self.overview_sub_terminals(parent_id, cx)
-            .into_iter()
-            .filter(|sub_terminal| sub_terminal.shown)
-            .map(|sub_terminal| sub_terminal.terminal_id)
-            .collect()
-    }
-
-    fn visible_overview_sub_terminal_ids(&self, parent_id: TerminalId) -> Vec<TerminalId> {
-        self.loaded_sub_terminal_ids(parent_id)
-            .into_iter()
-            .filter(|terminal_id| {
-                self.terminals
-                    .get(terminal_id)
-                    .is_some_and(|terminal| terminal.shown_in_overview)
-            })
-            .collect()
+        sub_terminal_ids.len()
     }
 
     fn set_terminal_overview(
@@ -3057,12 +3116,19 @@ impl AgentPanel {
         overview: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.terminals.contains_key(&terminal_id) {
+            return;
+        }
+        let zoomed_in_other_overview = self
+            .zoomed_overview_terminal
+            .and_then(|zoomed_id| self.terminals.get(&zoomed_id))
+            .is_some_and(|zoomed| zoomed.parent_terminal_id != Some(terminal_id));
+        if !overview && !zoomed_in_other_overview {
+            self.zoomed_overview_terminal = None;
+        }
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
-        if !overview {
-            self.zoomed_overview_terminal = None;
-        }
         if terminal.overview != overview {
             terminal.overview = overview;
             self.persist_terminal_metadata(terminal_id, cx);
@@ -3077,9 +3143,10 @@ impl AgentPanel {
             return;
         }
         let mut cleared = false;
-        for terminal_id in self.visible_overview_sub_terminal_ids(parent_id) {
+        for terminal_id in self.loaded_sub_terminal_ids(parent_id) {
             if let Some(terminal) = self.terminals.get_mut(&terminal_id)
                 && terminal.has_notification
+                && !terminal.minimized_in_overview
             {
                 terminal.has_notification = false;
                 self.dismiss_terminal_notifications(terminal_id, cx);
@@ -3092,96 +3159,65 @@ impl AgentPanel {
         }
     }
 
-    fn close_sub_terminal(
+    fn set_minimized_in_overview(
         &mut self,
-        parent_id: TerminalId,
+        terminal_id: TerminalId,
+        minimized: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id)
+            && terminal.minimized_in_overview != minimized
+        {
+            terminal.minimized_in_overview = minimized;
+            self.persist_terminal_metadata(terminal_id, cx);
+        }
+    }
+
+    /// A minimized terminal isn't in the element tree, so its header takes focus.
+    fn overview_terminal_focus_handle(terminal: &AgentTerminal, cx: &App) -> FocusHandle {
+        if terminal.minimized_in_overview {
+            terminal.header_focus_handle.clone()
+        } else {
+            terminal.view.focus_handle(cx)
+        }
+    }
+
+    fn toggle_overview_terminal_minimized(
+        &mut self,
         terminal_id: TerminalId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminals.contains_key(&terminal_id) {
-            self.close_terminal(terminal_id, window, cx);
+        if Some(terminal_id) == self.zoomed_overview_terminal_id(cx) {
             return;
         }
-        // A restore in flight can't be cancelled and would save the metadata again.
-        if self.pending_terminal_restores.contains_key(&terminal_id) {
-            return;
-        }
-        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
-            store.update(cx, |store, cx| {
-                store.delete(terminal_id, cx);
-            });
-        }
-        if self.overview_selection(parent_id, cx).is_empty() {
-            self.set_terminal_overview(parent_id, false, cx);
-        }
-        cx.notify();
-    }
-
-    fn set_shown_in_overview(
-        &mut self,
-        terminal_id: TerminalId,
-        shown_in_overview: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if !shown_in_overview && self.zoomed_overview_terminal == Some(terminal_id) {
-            self.zoomed_overview_terminal = None;
-        }
-        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-            if terminal.shown_in_overview != shown_in_overview {
-                terminal.shown_in_overview = shown_in_overview;
-                self.persist_terminal_metadata(terminal_id, cx);
-            }
-        } else if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
-            store.update(cx, |store, cx| {
-                store.set_shown_in_overview(terminal_id, shown_in_overview, cx);
-            });
-        }
-    }
-
-    /// Only the transitions between an empty and a non-empty selection turn the
-    /// overview on or off, so editing a hidden selection keeps it hidden.
-    fn toggle_overview_sub_terminal(
-        &mut self,
-        parent_id: TerminalId,
-        sub_terminal_id: TerminalId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let sub_terminals = self.overview_sub_terminals(parent_id, cx);
-        let Some(sub_terminal) = sub_terminals
-            .iter()
-            .find(|sub_terminal| sub_terminal.terminal_id == sub_terminal_id)
-        else {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
             return;
         };
-        let shown = !sub_terminal.shown;
-        let was_empty = !sub_terminals.iter().any(|sub_terminal| sub_terminal.shown);
-        self.set_shown_in_overview(sub_terminal_id, shown, cx);
-        self.clear_overview_notifications(parent_id, cx);
-        let is_empty = self.overview_selection(parent_id, cx).is_empty();
-        if was_empty && !is_empty {
-            self.set_terminal_overview(parent_id, true, cx);
-        } else if is_empty {
-            self.set_terminal_overview(parent_id, false, cx);
+        if terminal.parent_terminal_id.is_none() {
+            return;
         }
-        // A hidden overview restores its selection when it's turned on, so a
-        // selection edit alone doesn't start shells nothing will show.
-        let overview = self
-            .terminals
-            .get(&parent_id)
-            .is_some_and(|parent| parent.overview);
-        if shown && overview {
-            self.restore_sub_terminals_matching(
-                parent_id,
-                |metadata| metadata.terminal_id == sub_terminal_id,
-                AgentThreadSource::AgentPanel,
-                None,
-                window,
-                cx,
-            );
+        let parent_id = terminal.parent_terminal_id;
+        let minimized = !terminal.minimized_in_overview;
+        self.set_minimized_in_overview(terminal_id, minimized, cx);
+        if let Some(parent_id) = parent_id {
+            self.clear_overview_notifications(parent_id, cx);
+        }
+        if let Some(terminal) = self.terminals.get(&terminal_id) {
+            window.focus(&Self::overview_terminal_focus_handle(terminal, cx), cx);
         }
         cx.notify();
+    }
+
+    fn toggle_minimize_overview_terminal(
+        &mut self,
+        _: &ToggleMinimizeOverviewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(terminal_id) = self.focused_overview_terminal_id(window, cx) {
+            self.toggle_overview_terminal_minimized(terminal_id, window, cx);
+        }
     }
 
     fn overview_candidate_id(&self, cx: &App) -> Option<TerminalId> {
@@ -3260,12 +3296,11 @@ impl AgentPanel {
 
     fn visible_overview_id(&self, cx: &App) -> Option<TerminalId> {
         let terminal_id = self.overview_candidate_id(cx)?;
-        // Persisted sub terminals may still be restoring, or may have failed to,
-        // which would leave the sub terminal column empty.
+        // Persisted sub terminals may still be restoring, which would leave the
+        // sub terminal column empty. Failed ones show there, to be retried.
         (self.terminals.get(&terminal_id)?.overview
-            && !self
-                .visible_overview_sub_terminal_ids(terminal_id)
-                .is_empty()
+            && (!self.loaded_sub_terminal_ids(terminal_id).is_empty()
+                || !self.failed_sub_terminals_of(terminal_id, cx).is_empty())
             && self.terminal_overview_fits(terminal_id, cx))
         .then_some(terminal_id)
     }
@@ -3273,7 +3308,7 @@ impl AgentPanel {
     fn zoomed_overview_terminal_id(&self, cx: &App) -> Option<TerminalId> {
         let zoomed_id = self.zoomed_overview_terminal?;
         let parent_id = self.visible_overview_id(cx)?;
-        self.visible_overview_sub_terminal_ids(parent_id)
+        self.loaded_sub_terminal_ids(parent_id)
             .contains(&zoomed_id)
             .then_some(zoomed_id)
     }
@@ -3288,7 +3323,7 @@ impl AgentPanel {
         let zoomed_id = self.zoomed_overview_terminal_id(cx);
         let mut order = vec![zoomed_id.unwrap_or(parent_id)];
         order.extend(
-            self.visible_overview_sub_terminal_ids(parent_id)
+            self.loaded_sub_terminal_ids(parent_id)
                 .into_iter()
                 .map(|terminal_id| {
                     if Some(terminal_id) == zoomed_id {
@@ -3306,7 +3341,7 @@ impl AgentPanel {
             .into_iter()
             .find(|terminal_id| {
                 self.terminals.get(terminal_id).is_some_and(|terminal| {
-                    terminal.view.focus_handle(cx).contains_focused(window, cx)
+                    Self::overview_terminal_focus_handle(terminal, cx).contains_focused(window, cx)
                 })
             })
     }
@@ -3341,7 +3376,7 @@ impl AgentPanel {
             .get(next_index)
             .and_then(|terminal_id| self.terminals.get(terminal_id))
         {
-            window.focus(&terminal.view.focus_handle(cx), cx);
+            window.focus(&Self::overview_terminal_focus_handle(terminal, cx), cx);
         }
     }
 
@@ -3378,10 +3413,36 @@ impl AgentPanel {
             let Some(focused_id) = self.focused_overview_terminal_id(window, cx) else {
                 return;
             };
-            if focused_id == parent_id {
+            let minimized = self
+                .terminals
+                .get(&focused_id)
+                .is_some_and(|terminal| terminal.minimized_in_overview);
+            if focused_id == parent_id || minimized {
                 return;
             }
             self.zoomed_overview_terminal = Some(focused_id);
+        }
+        cx.notify();
+    }
+
+    /// The overview comes and goes with the panel width, with no focus change
+    /// or activation to clear notifications or move focus out of it.
+    fn terminal_width_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(parent_id) = self.visible_overview_id(cx) {
+            self.clear_overview_notifications(parent_id, cx);
+        } else if let Some(parent_id) = self.active_terminal_id() {
+            let sub_terminal_focused =
+                self.loaded_sub_terminal_ids(parent_id)
+                    .iter()
+                    .any(|terminal_id| {
+                        self.terminals.get(terminal_id).is_some_and(|terminal| {
+                            Self::overview_terminal_focus_handle(terminal, cx)
+                                .contains_focused(window, cx)
+                        })
+                    });
+            if sub_terminal_focused && let Some(parent) = self.terminals.get(&parent_id) {
+                window.focus(&parent.view.focus_handle(cx), cx);
+            }
         }
         cx.notify();
     }
@@ -3408,10 +3469,14 @@ impl AgentPanel {
         if !overview && !fits {
             return;
         }
-        if !overview && self.overview_selection(terminal_id, cx).is_empty() {
-            for sub_terminal in self.overview_sub_terminals(terminal_id, cx) {
-                self.set_shown_in_overview(sub_terminal.terminal_id, true, cx);
-            }
+        // Hiding the column takes a focused sub terminal out of the tree.
+        if overview
+            && self
+                .focused_overview_terminal_id(window, cx)
+                .is_some_and(|focused_id| focused_id != terminal_id)
+            && let Some(parent) = self.terminals.get(&terminal_id)
+        {
+            window.focus(&parent.view.focus_handle(cx), cx);
         }
         self.set_terminal_overview(terminal_id, !overview, cx);
         if !overview {
@@ -3468,7 +3533,6 @@ impl AgentPanel {
             false,
             init_command,
             metadata.parent_terminal_id,
-            false,
             source,
             window,
             cx,
@@ -3891,9 +3955,9 @@ impl AgentPanel {
             return true;
         }
         self.visible_overview_id(cx).is_some_and(|overview_id| {
-            self.terminals
-                .get(&terminal_id)
-                .is_some_and(|terminal| terminal.parent_terminal_id == Some(overview_id))
+            self.terminals.get(&terminal_id).is_some_and(|terminal| {
+                terminal.parent_terminal_id == Some(overview_id) && !terminal.minimized_in_overview
+            })
         })
     }
 
@@ -6289,7 +6353,6 @@ impl AgentPanel {
             false,
             Self::default_terminal_init_command(cx),
             None,
-            false,
             source,
             window,
             cx,
@@ -7417,7 +7480,7 @@ impl AgentPanel {
             toggled: overview,
             disabled: !fits && !overview,
             tooltip,
-            sub_terminal_count: self.overview_sub_terminals(terminal_id, cx).len(),
+            sub_terminal_count: self.sub_terminal_count(terminal_id, cx),
         })
     }
 
@@ -7444,84 +7507,20 @@ impl AgentPanel {
                 this.toggle_terminal_overview(&ToggleTerminalOverview, window, cx);
             }));
 
-        let selection_button =
-            IconButton::new("terminal-overview-selection", IconName::ChevronDown)
-                .icon_size(IconSize::XSmall);
-        // The selection can't be shown while the overview doesn't fit, so editing
-        // it there would be invisible.
-        let selection_menu = if state.disabled {
-            selection_button
-                .disabled(true)
-                .tooltip(Tooltip::text(state.tooltip))
-                .into_any_element()
-        } else {
-            let panel = cx.weak_entity();
-            let parent_id = state.terminal_id;
-            PopoverMenu::new("terminal-overview-selection-menu")
-                .trigger_with_tooltip(selection_button, Tooltip::text("Choose Sub Terminals"))
-                .anchor(Anchor::TopRight)
-                .menu(move |window, cx| {
-                    let panel = panel.clone();
-                    Some(ContextMenu::build_persistent(
-                        window,
-                        cx,
-                        move |mut menu, _window, cx| {
-                            let Some(this) = panel.upgrade() else {
-                                return menu;
-                            };
-                            for sub_terminal in this.read(cx).overview_sub_terminals(parent_id, cx)
-                            {
-                                let panel = panel.clone();
-                                let sub_terminal_id = sub_terminal.terminal_id;
-                                let close_panel = panel.clone();
-                                menu = menu.item(
-                                    ContextMenuEntry::new(sub_terminal.title)
-                                        .toggleable(IconPosition::Start, sub_terminal.shown)
-                                        .handler(move |window, cx| {
-                                            panel
-                                                .update(cx, |this, cx| {
-                                                    this.toggle_overview_sub_terminal(
-                                                        parent_id,
-                                                        sub_terminal_id,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                                .log_err();
-                                        })
-                                        .end_slot(
-                                            IconName::Close,
-                                            "Close Sub Terminal".into(),
-                                            move |window, cx| {
-                                                close_panel
-                                                    .update(cx, |this, cx| {
-                                                        this.close_sub_terminal(
-                                                            parent_id,
-                                                            sub_terminal_id,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    })
-                                                    .log_err();
-                                            },
-                                        ),
-                                );
-                            }
-                            menu.end_slot_action(Box::new(menu::SecondaryConfirm))
-                        },
-                    ))
-                })
-                .into_any_element()
-        };
-
         Some(
             div()
                 .relative()
+                .child(toggle_button)
                 .child(
-                    SplitButton::new(toggle_button, selection_menu)
-                        .style(SplitButtonStyle::Transparent),
+                    // `CountBadge` pins itself to its parent's corner, so this
+                    // offset parent moves it clear of the icon.
+                    div()
+                        .absolute()
+                        .top(px(-4.))
+                        .right(px(-4.))
+                        .size_3p5()
+                        .child(CountBadge::new(state.sub_terminal_count)),
                 )
-                .child(CountBadge::new(state.sub_terminal_count))
                 .into_any_element(),
         )
     }
@@ -7559,6 +7558,7 @@ impl AgentPanel {
     ) -> impl IntoElement {
         let sub_width = self.terminal_overview_sub_width(terminal_id, cx);
         let zoomed = self.zoomed_overview_terminal_id(cx).is_some();
+        let focused_header_background = cx.theme().colors().element_selected;
         let sub_terminals = self
             .overview_terminal_order(cx)
             .into_iter()
@@ -7572,10 +7572,12 @@ impl AgentPanel {
             .enumerate()
             .map(
                 |(index, (column_terminal_id, sub_terminal, is_zoomed_parent))| {
-                    let parent_id = sub_terminal.parent_terminal_id.unwrap_or(terminal_id);
+                    let minimized = sub_terminal.minimized_in_overview;
+                    let shortcut_focus_handle =
+                        Self::overview_terminal_focus_handle(sub_terminal, cx);
                     v_flex()
-                        .flex_1()
-                        .min_h_0()
+                        .when(minimized, |this| this.flex_none())
+                        .when(!minimized, |this| this.flex_1().min_h_0())
                         .when(index > 0, |this| this.border_t_1())
                         .border_color(cx.theme().colors().border)
                         .child(
@@ -7585,24 +7587,74 @@ impl AgentPanel {
                                 .py_0p5()
                                 .gap_1()
                                 .justify_between()
+                                // Only minimizing and navigation focus a header.
+                                .on_any_mouse_down(|_, window, _| window.prevent_default())
+                                .when(minimized, |this| {
+                                    this.key_context("OverviewTerminalHeader")
+                                        .track_focus(&sub_terminal.header_focus_handle)
+                                        .focus(|this| this.bg(focused_header_background))
+                                })
                                 .bg(if is_zoomed_parent {
                                     cx.theme().colors().element_selected
                                 } else {
                                     cx.theme().colors().tab_bar_background
                                 })
                                 .child(
-                                    Label::new(sub_terminal.title(cx))
-                                        .size(LabelSize::Small)
-                                        .color(if is_zoomed_parent {
-                                            Color::Accent
-                                        } else {
-                                            Color::Muted
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .when(minimized && sub_terminal.has_notification, |this| {
+                                            this.child(Indicator::dot().color(Color::Accent))
                                         })
-                                        .truncate(),
+                                        .child(
+                                            Label::new(sub_terminal.title(cx))
+                                                .size(LabelSize::Small)
+                                                .color(if is_zoomed_parent {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Muted
+                                                })
+                                                .truncate(),
+                                        ),
                                 )
                                 // The zoomed parent sits in this column and closes from the sidebar.
                                 .when(!is_zoomed_parent, |this| {
                                     this.child(
+                                        IconButton::new(
+                                            SharedString::from(format!(
+                                                "minimize-sub-terminal-{column_terminal_id}"
+                                            )),
+                                            if minimized {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            },
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(move |_window, cx| {
+                                            Tooltip::for_action_in(
+                                                if minimized {
+                                                    "Restore Sub Terminal"
+                                                } else {
+                                                    "Minimize Sub Terminal"
+                                                },
+                                                &ToggleMinimizeOverviewTerminal,
+                                                &shortcut_focus_handle,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.toggle_overview_terminal_minimized(
+                                                    column_terminal_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    )
+                                    .child(
                                         IconButton::new(
                                             SharedString::from(format!(
                                                 "close-sub-terminal-{column_terminal_id}"
@@ -7613,20 +7665,87 @@ impl AgentPanel {
                                         .tooltip(Tooltip::text("Close Sub Terminal"))
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
-                                                this.close_sub_terminal(
-                                                    parent_id,
-                                                    column_terminal_id,
-                                                    window,
-                                                    cx,
-                                                );
+                                                this.close_terminal(column_terminal_id, window, cx);
                                             }),
                                         ),
                                     )
                                 }),
                         )
-                        .child(div().flex_1().min_h_0().child(sub_terminal.view.clone()))
+                        .when(!minimized, |this| {
+                            this.child(div().flex_1().min_h_0().child(sub_terminal.view.clone()))
+                        })
                 },
             );
+
+        let has_loaded_sub_terminals = !self.loaded_sub_terminal_ids(terminal_id).is_empty();
+        let failed_sub_terminals = self
+            .failed_sub_terminals_of(terminal_id, cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (failed_id, title))| {
+                h_flex()
+                    .flex_none()
+                    // Only the buttons act, so a click keeps focus where it is.
+                    .on_any_mouse_down(|_, window, _| window.prevent_default())
+                    .px_2()
+                    .py_0p5()
+                    .gap_1()
+                    .justify_between()
+                    .when(index > 0 || has_loaded_sub_terminals, |this| {
+                        this.border_t_1()
+                    })
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().tab_bar_background)
+                    .child(
+                        Label::new(if title.is_empty() {
+                            SharedString::from("Terminal")
+                        } else {
+                            title
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Error)
+                        .truncate(),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("retry-sub-terminal-{failed_id}")),
+                                    IconName::RotateCw,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Retry Sub Terminal"))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.retry_failed_sub_terminal(
+                                            failed_id,
+                                            terminal_id,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!(
+                                        "close-failed-sub-terminal-{failed_id}"
+                                    )),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Close Sub Terminal"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.close_failed_sub_terminal(failed_id, terminal_id, cx);
+                                    },
+                                )),
+                            ),
+                    )
+            })
+            .collect::<Vec<_>>();
 
         h_flex()
             .size_full()
@@ -7638,7 +7757,8 @@ impl AgentPanel {
                     .when_some(sub_width, |this, sub_width| this.w(sub_width))
                     .border_l_1()
                     .border_color(cx.theme().colors().border)
-                    .children(sub_terminals),
+                    .children(sub_terminals)
+                    .children(failed_sub_terminals),
             )
     }
 
@@ -8256,7 +8376,6 @@ impl AgentPanel {
             None,
             true,
             true,
-            false,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -8373,6 +8492,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::focus_next_overview_terminal))
             .on_action(cx.listener(Self::focus_previous_overview_terminal))
             .on_action(cx.listener(Self::toggle_zoom_overview_terminal))
+            .on_action(cx.listener(Self::toggle_minimize_overview_terminal))
             .on_action(cx.listener(|this, _: &ReauthenticateAgent, window, cx| {
                 if let Some(conversation_view) = this.active_conversation_view() {
                     conversation_view.update(cx, |conversation_view, cx| {
@@ -8429,7 +8549,7 @@ impl Render for AgentPanel {
                         None => terminal_content.into_any_element(),
                     };
                     let terminal_content_width = self.terminal_content_width.clone();
-                    let panel_id = cx.entity_id();
+                    let panel = cx.weak_entity();
 
                     parent
                         .child(
@@ -8442,7 +8562,13 @@ impl Render for AgentPanel {
                                             // toolbar was already rendered with the old one.
                                             // A notify during a draw doesn't schedule another
                                             // frame, so defer it.
-                                            window.on_next_frame(move |_, cx| cx.notify(panel_id));
+                                            window.on_next_frame(move |window, cx| {
+                                                panel
+                                                    .update(cx, |panel, cx| {
+                                                        panel.terminal_width_changed(window, cx);
+                                                    })
+                                                    .log_err();
+                                            });
                                         }
                                     },
                                     |_, _, _, _| {},
@@ -8759,7 +8885,6 @@ impl AgentPanel {
             created_at,
             select,
             focus,
-            false,
             source,
             window,
             cx,
@@ -9532,7 +9657,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -9674,7 +9799,7 @@ mod tests {
             init_command: init_command.map(str::to_string),
             parent_terminal_id: Some(parent_terminal_id),
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
         let terminal_id = metadata.terminal_id;
         cx.update(|_, cx| {
@@ -9705,14 +9830,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.restore_sub_terminals_matching(
-                parent_id,
-                |_| true,
-                AgentThreadSource::Sidebar,
-                None,
-                window,
-                cx,
-            );
+            panel.restore_overview_sub_terminals(parent_id, AgentThreadSource::Sidebar, window, cx);
         });
         cx.run_until_parked();
 
@@ -9751,14 +9869,7 @@ mod tests {
                 .pending_terminal_restores
                 .insert(pending_child_id, PendingTerminalRestore::Background);
             let terminal_count = panel.terminals.len();
-            panel.restore_sub_terminals_matching(
-                parent_id,
-                |_| true,
-                AgentThreadSource::Sidebar,
-                None,
-                window,
-                cx,
-            );
+            panel.restore_overview_sub_terminals(parent_id, AgentThreadSource::Sidebar, window, cx);
             assert_eq!(
                 panel.terminals.len(),
                 terminal_count,
@@ -9796,7 +9907,6 @@ mod tests {
                 false,
                 None,
                 Some(parent_id),
-                false,
                 AgentThreadSource::Sidebar,
                 window,
                 cx,
@@ -9819,7 +9929,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restoring_in_flight_sub_terminal_selects_it_when_it_lands(
+    async fn test_restoring_in_flight_sub_terminal_shows_parent_overview_when_it_lands(
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -9867,7 +9977,8 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _cx| {
-            assert_eq!(panel.active_terminal_id(), Some(child_id));
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert!(panel.terminals[&parent_id].overview);
             assert!(panel.pending_terminal_restores.is_empty());
         });
     }
@@ -9942,7 +10053,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: Some(parent_terminal_id),
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         }
     }
 
@@ -10082,7 +10193,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -10358,66 +10468,361 @@ mod tests {
         (panel, cx, parent_id, sub_terminal_ids)
     }
 
-    fn toggle_test_overview_sub_terminal(
-        panel: &Entity<AgentPanel>,
-        parent_id: TerminalId,
-        sub_terminal_id: TerminalId,
-        cx: &mut VisualTestContext,
-    ) {
-        panel.update_in(cx, |panel, window, cx| {
-            panel.toggle_overview_sub_terminal(parent_id, sub_terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-    }
-
     #[gpui::test]
-    async fn test_overview_shows_only_selected_sub_terminals(cx: &mut TestAppContext) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) =
-            setup_test_overview_selection(cx, 2).await;
+    async fn test_minimizing_sub_terminal_moves_focus_to_header(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 2).await;
         let [first_id, second_id] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-
         toggle_test_terminal_overview(&panel, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert_eq!(
-                panel.overview_selection(parent_id, cx),
-                vec![first_id, second_id],
-                "turning the overview on with nothing selected should select every sub terminal"
-            );
-        });
 
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(panel.terminals[&parent_id].overview);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(first_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(panel.terminals[&first_id].minimized_in_overview);
             assert!(
-                panel.has_terminal(first_id),
-                "hiding must not close the terminal"
+                panel.terminals[&first_id]
+                    .header_focus_handle
+                    .is_focused(window)
             );
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
             assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![second_id]
+                panel.loaded_sub_terminal_ids(parent_id),
+                vec![first_id, second_id],
+                "minimizing must keep the sub terminal in the overview"
+            );
+            assert_eq!(
+                panel.focused_overview_terminal_id(window, cx),
+                Some(first_id)
+            );
+            panel.toggle_zoom_overview_terminal(&ToggleZoomOverviewTerminal, window, cx);
+            assert_eq!(panel.zoomed_overview_terminal, None);
+            panel.toggle_minimize_overview_terminal(&ToggleMinimizeOverviewTerminal, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(!panel.terminals[&first_id].minimized_in_overview);
+            assert!(
+                panel.terminals[&first_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            assert!(
+                !panel.terminals[&first_id]
+                    .header_focus_handle
+                    .is_focused(window)
             );
         });
+    }
 
-        toggle_test_overview_sub_terminal(&panel, parent_id, second_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.terminals[&parent_id].overview);
-            assert!(panel.overview_selection(parent_id, cx).is_empty());
+    #[gpui::test]
+    async fn test_closing_focused_sub_terminal_focuses_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 2).await;
+        let [first_id, _] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(first_id, window, cx);
         });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(first_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(
+                panel.terminals[&parent_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    }
 
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
+    #[gpui::test]
+    async fn test_narrowing_panel_moves_sub_terminal_focus_to_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
+        let [sub_terminal_id] = sub_terminal_ids[..] else {
+            panic!("expected one sub terminal");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.terminal_content_width.set(px(100.));
+            panel.terminal_width_changed(window, cx);
+            assert!(
+                panel.terminals[&parent_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_widening_panel_clears_sub_terminal_notification(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
+        let [sub_terminal_id] = sub_terminal_ids[..] else {
+            panic!("expected one sub terminal");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+            if let Some(terminal) = panel.terminals.get_mut(&sub_terminal_id) {
+                terminal.has_notification = true;
+            }
+            panel.terminal_width_changed(window, cx);
+            assert!(!panel.terminals[&sub_terminal_id].has_notification);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_minimized_sub_terminal_keeps_notification_until_restored(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
+        let [sub_terminal_id] = sub_terminal_ids[..] else {
+            panic!("expected one sub terminal");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(panel.terminal_surface_visible(sub_terminal_id, cx));
+            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+            assert!(!panel.terminal_surface_visible(sub_terminal_id, cx));
+            if let Some(terminal) = panel.terminals.get_mut(&sub_terminal_id) {
+                terminal.has_notification = true;
+            }
+            panel.clear_overview_notifications(parent_id, cx);
+            assert!(panel.terminals[&sub_terminal_id].has_notification);
+            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+            assert!(!panel.terminals[&sub_terminal_id].has_notification);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_failed_sub_terminal_stays_as_header_until_retried(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let failed_id =
+            save_test_sub_terminal_metadata(parent_id, "Failed", Utc::now(), None, &mut cx);
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.mark_sub_terminal_failed(failed_id, cx);
+            panel.restore_overview_sub_terminals(
+                parent_id,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            assert!(!panel.has_terminal(failed_id));
+            assert_eq!(panel.sub_terminal_count(parent_id, cx), 1);
+            assert_eq!(panel.failed_sub_terminals_of(parent_id, cx).len(), 1);
+            panel.set_terminal_overview(parent_id, true, cx);
+            panel.terminal_content_width.set(px(1600.));
+            panel.retry_failed_sub_terminal(failed_id, parent_id, window, cx);
+        });
+        cx.run_until_parked();
         panel.read_with(&cx, |panel, cx| {
+            assert!(panel.has_terminal(failed_id));
+            assert!(!panel.terminals[&failed_id].minimized_in_overview);
+            assert!(panel.failed_sub_terminals_of(parent_id, cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_closing_failed_sub_terminal_forgets_it(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let failed_id =
+            save_test_sub_terminal_metadata(parent_id, "Failed", Utc::now(), None, &mut cx);
+        cx.run_until_parked();
+        panel.update(&mut cx, |panel, cx| {
+            panel.set_terminal_overview(parent_id, true, cx);
+            panel.mark_sub_terminal_failed(failed_id, cx);
+            panel.close_failed_sub_terminal(failed_id, parent_id, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.sub_terminal_count(parent_id, cx), 0);
+            assert!(!panel.terminals[&parent_id].overview);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_failed_sub_terminal_waits_for_starting_siblings(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let (first_id, second_id) = (TerminalId::new(), TerminalId::new());
+        panel.update(&mut cx, |panel, cx| {
+            panel.set_terminal_overview(parent_id, true, cx);
+            panel.spawning_sub_terminals.insert(first_id, parent_id);
+            panel.spawning_sub_terminals.insert(second_id, parent_id);
+            panel.sub_terminal_spawn_failed(first_id, parent_id, cx);
             assert!(
                 panel.terminals[&parent_id].overview,
-                "selecting from an empty selection should turn the overview on"
+                "a sibling still starting may need the overview"
             );
+            panel.sub_terminal_spawn_failed(second_id, parent_id, cx);
+            assert!(!panel.terminals[&parent_id].overview);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_saved_sub_terminal_failure_keeps_overview_on(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let failed_id =
+            save_test_sub_terminal_metadata(parent_id, "Failed", Utc::now(), None, &mut cx);
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.set_terminal_overview(parent_id, true, cx);
+            panel.sub_terminal_spawn_failed(failed_id, parent_id, cx);
+            assert!(panel.terminals[&parent_id].overview);
             assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![first_id]
+                panel.visible_overview_id(cx),
+                Some(parent_id),
+                "the failed row needs a column to show in"
             );
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turning_overview_off_keeps_zoom_of_other_overview(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let other_parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let other_sub_id =
+            insert_test_terminal_with_parent(&panel, None, Some(other_parent_id), &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.zoomed_overview_terminal = Some(other_sub_id);
+            panel.set_terminal_overview(parent_id, false, cx);
+            assert_eq!(panel.zoomed_overview_terminal, Some(other_sub_id));
+            panel.set_terminal_overview(other_parent_id, false, cx);
+            assert_eq!(panel.zoomed_overview_terminal, None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_popup_activation_restores_minimized_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
+        let [sub_terminal_id] = sub_terminal_ids[..] else {
+            panic!("expected one sub terminal");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(sub_terminal_id, true, window, cx);
+            assert_eq!(panel.active_terminal_id(), Some(parent_id));
+            assert!(!panel.terminals[&sub_terminal_id].minimized_in_overview);
+            assert!(
+                panel.terminals[&sub_terminal_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_minimized_header_handles_restore_keystroke(cx: &mut TestAppContext) {
+        let (panel, mut cx, _parent_id, sub_terminal_ids) =
+            setup_visible_test_overview(cx, 1).await;
+        let [sub_terminal_id] = sub_terminal_ids[..] else {
+            panic!("expected one sub terminal");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-h",
+                ToggleMinimizeOverviewTerminal,
+                Some("AgentPanel > OverviewTerminalHeader"),
+            )]);
+        });
+        cx.simulate_keystrokes("ctrl-h");
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(!panel.terminals[&sub_terminal_id].minimized_in_overview);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_closing_focused_zoomed_sub_terminal_focuses_parent(cx: &mut TestAppContext) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 2).await;
+        let [first_id, _] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        focus_test_terminal(&panel, first_id, &mut cx);
+        dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(first_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(
+                panel.terminals[&parent_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_overview_navigation_stops_on_minimized_header(cx: &mut TestAppContext) {
+        let (panel, mut cx, _parent_id, sub_terminal_ids) =
+            setup_visible_test_overview(cx, 2).await;
+        let [first_id, second_id] = sub_terminal_ids[..] else {
+            panic!("expected two sub terminals");
+        };
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_overview_terminal_minimized(second_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(
+                panel.focused_overview_terminal_id(window, cx),
+                Some(second_id)
+            );
+            panel.focus_previous_overview_terminal(&FocusPreviousOverviewTerminal, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(
+                panel.focused_overview_terminal_id(window, cx),
+                Some(first_id)
+            );
+            panel.focus_next_overview_terminal(&FocusNextOverviewTerminal, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, _cx| {
+            assert!(
+                panel.terminals[&second_id]
+                    .header_focus_handle
+                    .is_focused(window)
+            );
         });
     }
 
@@ -10486,7 +10891,9 @@ mod tests {
         );
 
         toggle_test_terminal_overview(&panel, &mut cx);
-        toggle_test_overview_sub_terminal(&panel, parent_id, hidden_id, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(hidden_id, window, cx);
+        });
         focus_test_terminal(&panel, parent_id, &mut cx);
 
         for expected_id in [first_id, second_id, parent_id] {
@@ -10648,12 +11055,6 @@ mod tests {
         });
         assert_not_zoomed(&mut cx);
 
-        zoom(first_id, &mut cx);
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-        assert_not_zoomed(&mut cx);
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-        assert_not_zoomed(&mut cx);
-
         zoom(second_id, &mut cx);
         toggle_test_terminal_overview(&panel, &mut cx);
         assert_not_zoomed(&mut cx);
@@ -10666,183 +11067,6 @@ mod tests {
         });
         cx.run_until_parked();
         assert_not_zoomed(&mut cx);
-    }
-
-    #[gpui::test]
-    async fn test_overview_toggle_remembers_selection(cx: &mut TestAppContext) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) =
-            setup_test_overview_selection(cx, 3).await;
-        let [first_id, second_id, third_id] = sub_terminal_ids[..] else {
-            panic!("expected three sub terminals");
-        };
-
-        toggle_test_terminal_overview(&panel, &mut cx);
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.terminals[&parent_id].overview);
-            assert_eq!(panel.visible_overview_id(cx), None);
-        });
-
-        toggle_test_overview_sub_terminal(&panel, parent_id, second_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(
-                !panel.terminals[&parent_id].overview,
-                "editing a non-empty selection should not turn the overview on"
-            );
-            assert_eq!(panel.overview_selection(parent_id, cx), vec![third_id]);
-        });
-
-        toggle_test_terminal_overview(&panel, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
-            assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![third_id]
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_new_sub_terminal_is_not_selected_for_overview(cx: &mut TestAppContext) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) =
-            setup_test_overview_selection(cx, 1).await;
-        toggle_test_terminal_overview(&panel, &mut cx);
-
-        let new_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.activate_terminal(parent_id, true, window, cx);
-        });
-        panel.read_with(&cx, |panel, cx| {
-            assert!(panel.has_terminal(new_id));
-            assert_eq!(panel.overview_selection(parent_id, cx), sub_terminal_ids);
-            assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                sub_terminal_ids
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_closing_last_selected_sub_terminal_turns_overview_off(cx: &mut TestAppContext) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) =
-            setup_test_overview_selection(cx, 2).await;
-        let [first_id, second_id] = sub_terminal_ids[..] else {
-            panic!("expected two sub terminals");
-        };
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.close_terminal(first_id, window, cx);
-        });
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.terminals[&parent_id].overview);
-            assert!(panel.has_terminal(second_id));
-            assert!(panel.overview_selection(parent_id, cx).is_empty());
-        });
-    }
-
-    #[gpui::test]
-    async fn test_overview_selection_restores_persisted_sub_terminal(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
-        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
-        let now = Utc::now();
-        let first_id = save_test_sub_terminal_metadata(parent_id, "First", now, None, &mut cx);
-        let second_id = save_test_sub_terminal_metadata(
-            parent_id,
-            "Second",
-            now + chrono::Duration::minutes(1),
-            None,
-            &mut cx,
-        );
-        cx.run_until_parked();
-        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-
-        panel.read_with(&cx, |panel, cx| {
-            let sub_terminals = panel.overview_sub_terminals(parent_id, cx);
-            assert_eq!(
-                sub_terminals
-                    .iter()
-                    .map(|sub_terminal| sub_terminal.terminal_id)
-                    .collect::<Vec<_>>(),
-                vec![first_id, second_id],
-                "sub terminals that aren't running should still be listed"
-            );
-        });
-
-        toggle_test_overview_sub_terminal(&panel, parent_id, second_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.has_terminal(first_id));
-            assert!(panel.has_terminal(second_id));
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
-            assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![second_id]
-            );
-            let store = TerminalThreadMetadataStore::global(cx);
-            let store = store.read(cx);
-            assert!(
-                store
-                    .entry(parent_id)
-                    .is_some_and(|metadata| metadata.overview_enabled)
-            );
-            assert!(
-                store
-                    .entry(second_id)
-                    .is_some_and(|metadata| metadata.shown_in_overview)
-            );
-            assert!(
-                store
-                    .entry(first_id)
-                    .is_some_and(|metadata| !metadata.shown_in_overview)
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_selecting_while_overview_hidden_does_not_restore(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
-        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
-        let loaded_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.activate_terminal(parent_id, true, window, cx);
-        });
-        let persisted_id = save_test_sub_terminal_metadata(
-            parent_id,
-            "Persisted",
-            Utc::now() + chrono::Duration::minutes(1),
-            None,
-            &mut cx,
-        );
-        cx.run_until_parked();
-        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-
-        toggle_test_overview_sub_terminal(&panel, parent_id, loaded_id, &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
-        toggle_test_overview_sub_terminal(&panel, parent_id, persisted_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(!panel.terminals[&parent_id].overview);
-            assert_eq!(
-                panel.overview_selection(parent_id, cx),
-                vec![loaded_id, persisted_id]
-            );
-            assert!(
-                !panel.has_terminal(persisted_id),
-                "selecting while the overview is hidden should not start a shell"
-            );
-        });
-
-        toggle_test_terminal_overview(&panel, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            assert!(panel.has_terminal(persisted_id));
-            assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![loaded_id, persisted_id]
-            );
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
-        });
     }
 
     #[gpui::test]
@@ -10870,7 +11094,7 @@ mod tests {
         cx.update(|_, cx| {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(parent_metadata, cx);
-                store.set_shown_in_overview(selected_id, true, cx);
+                store.set_minimized_in_overview(hidden_id, true, cx);
             });
         });
         cx.run_until_parked();
@@ -10899,11 +11123,12 @@ mod tests {
         panel.read_with(&cx, |panel, cx| {
             assert!(panel.terminals[&parent_id].overview);
             assert!(panel.has_terminal(selected_id));
-            assert!(!panel.has_terminal(hidden_id));
+            assert!(panel.has_terminal(hidden_id));
+            assert!(panel.terminals[&hidden_id].minimized_in_overview);
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
             assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![selected_id]
+                panel.loaded_sub_terminal_ids(parent_id),
+                vec![selected_id, hidden_id]
             );
         });
     }
@@ -11155,28 +11380,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_close_sub_terminal_closes_loaded_and_persisted(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
-        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
-        let loaded_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
-        let persisted_id =
-            save_test_sub_terminal_metadata(parent_id, "Persisted", Utc::now(), None, &mut cx);
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.close_sub_terminal(parent_id, loaded_id, window, cx);
-            panel.close_sub_terminal(parent_id, persisted_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            assert!(panel.has_terminal(parent_id));
-            assert!(!panel.has_terminal(loaded_id));
-            assert!(!panel.has_sub_terminals(parent_id, cx));
-        });
-    }
-
-    #[gpui::test]
     async fn test_activating_sub_terminal_shows_parent_overview(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
@@ -11192,22 +11395,15 @@ mod tests {
                     .get(&parent_id)
                     .is_some_and(|parent| parent.overview)
             );
-            assert!(
-                panel
-                    .terminals
-                    .get(&child_id)
-                    .is_some_and(|child| child.shown_in_overview)
-            );
         });
     }
 
     #[gpui::test]
-    async fn test_show_overview_on_restore_selects_sub_terminals(cx: &mut TestAppContext) {
+    async fn test_show_overview_on_restore_enables_overview(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
-        let child_id =
-            save_test_sub_terminal_metadata(parent_id, "Child", Utc::now(), None, &mut cx);
+        save_test_sub_terminal_metadata(parent_id, "Child", Utc::now(), None, &mut cx);
         panel.update(&mut cx, |panel, cx| {
             panel.show_overview_on_restore(parent_id, cx);
         });
@@ -11217,11 +11413,6 @@ mod tests {
                 store
                     .entry(parent_id)
                     .is_some_and(|entry| entry.overview_enabled)
-            );
-            assert!(
-                store
-                    .entry(child_id)
-                    .is_some_and(|entry| entry.shown_in_overview)
             );
         });
     }
@@ -11236,7 +11427,6 @@ mod tests {
         });
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
         panel.update(&mut cx, |panel, cx| {
-            panel.set_shown_in_overview(child_id, true, cx);
             if let Some(child) = panel.terminals.get_mut(&child_id) {
                 child.has_notification = true;
             }
@@ -11540,7 +11730,6 @@ mod tests {
                 .expect("sibling terminal metadata should exist");
             assert_eq!(sibling.parent_terminal_id, Some(parent_id));
             assert!(panel.terminals[&parent_id].overview);
-            assert!(panel.terminals[&sibling_id].shown_in_overview);
         });
     }
 
@@ -11579,35 +11768,13 @@ mod tests {
         panel.update_in(&mut cx, |panel, window, cx| {
             assert_eq!(panel.active_terminal_id(), Some(parent_id));
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
-            assert_eq!(
-                panel.visible_overview_sub_terminal_ids(parent_id),
-                vec![new_id]
-            );
+            assert_eq!(panel.loaded_sub_terminal_ids(parent_id), vec![new_id]);
             assert!(
                 panel.terminals[&parent_id]
                     .view
                     .focus_handle(cx)
                     .contains_focused(window, cx)
             );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_new_sub_terminal_joins_existing_overview_selection(cx: &mut TestAppContext) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) =
-            setup_test_overview_selection(cx, 2).await;
-        let [first_id, _] = sub_terminal_ids[..] else {
-            panic!("expected two sub terminals");
-        };
-        toggle_test_overview_sub_terminal(&panel, parent_id, first_id, &mut cx);
-
-        let new_id = start_test_sub_terminal(&panel, parent_id, &mut cx);
-        panel.read_with(&cx, |panel, cx| {
-            let mut selection = panel.overview_selection(parent_id, cx);
-            selection.sort();
-            let mut expected = vec![first_id, new_id];
-            expected.sort();
-            assert_eq!(selection, expected);
         });
     }
 
@@ -11619,7 +11786,7 @@ mod tests {
         let new_id = start_test_sub_terminal(&panel, parent_id, &mut cx);
         panel.read_with(&cx, |panel, cx| {
             assert!(panel.terminals[&parent_id].overview);
-            assert!(panel.terminals[&new_id].shown_in_overview);
+            assert!(panel.has_terminal(new_id));
             assert_eq!(panel.visible_overview_id(cx), None);
         });
     }
@@ -11729,7 +11896,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -11809,7 +11976,7 @@ mod tests {
             init_command: Some("selected-agent --resume".to_string()),
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -11877,7 +12044,6 @@ mod tests {
                 true,
                 Some("printf 'init_ran_%s\\n' 42".to_string()),
                 None,
-                false,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -11964,7 +12130,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -15604,7 +15770,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -15659,7 +15825,7 @@ mod tests {
             init_command: None,
             parent_terminal_id: None,
             overview_enabled: false,
-            shown_in_overview: false,
+            minimized_in_overview: false,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
