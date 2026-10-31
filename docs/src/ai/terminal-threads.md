@@ -66,6 +66,8 @@ To choose from multiple CLIs in the new-thread menu, configure named commands:
 
 Set `kind` to `main` (the default) for commands that start top-level Terminal Threads, or `sub` for commands offered under **New Sub Terminal**. A plain `terminal_init_command` string is a `main` command. New Sub Terminal options appear only when at least one `sub` command is configured.
 
+In the Threads Sidebar, the project `+` menu lists each open workspace with its `main` commands, so you can choose which command starts the Terminal Thread. If a command list has no `main` entry, the menu says so, and a Terminal Thread started another way runs a plain shell.
+
 Zed shows each name with the Terminal icon. It remembers the selected command for that Terminal Thread and uses the same command when it recreates the thread.
 
 ## Terminal Thread Titles {#terminal-thread-titles}

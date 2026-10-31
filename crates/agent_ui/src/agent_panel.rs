@@ -2170,7 +2170,7 @@ impl AgentPanel {
         );
     }
 
-    fn new_terminal_with_init_command(
+    pub fn new_terminal_with_init_command(
         &mut self,
         workspace: Option<&Workspace>,
         init_command: Option<String>,

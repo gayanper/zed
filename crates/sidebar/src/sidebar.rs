@@ -644,6 +644,91 @@ impl WorkspaceMenuWorktreeLabel {
                     .child(Label::new(secondary_name).truncate())
             })
     }
+
+    fn text(&self) -> String {
+        match &self.secondary_name {
+            Some(secondary_name) => format!("{} / {}", self.primary_name, secondary_name),
+            None => self.primary_name.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NewEntryOption {
+    AgentThread,
+    Separator,
+    Terminal {
+        name: SharedString,
+        init_command: Option<String>,
+    },
+    NoMainTerminalProfiles,
+}
+
+fn new_entry_options(
+    agent_threads_enabled: bool,
+    supports_terminal: bool,
+    main_terminal_profiles: Vec<(SharedString, Option<String>)>,
+) -> Vec<NewEntryOption> {
+    let mut options = Vec::new();
+    if agent_threads_enabled {
+        options.push(NewEntryOption::AgentThread);
+    }
+    if !supports_terminal {
+        return options;
+    }
+    if agent_threads_enabled {
+        options.push(NewEntryOption::Separator);
+    }
+    if main_terminal_profiles.is_empty() {
+        options.push(NewEntryOption::NoMainTerminalProfiles);
+    }
+    options.extend(
+        main_terminal_profiles
+            .into_iter()
+            .map(|(name, init_command)| NewEntryOption::Terminal { name, init_command }),
+    );
+    options
+}
+
+fn render_new_entry_option(
+    menu: ContextMenu,
+    option: NewEntryOption,
+    this: WeakEntity<Sidebar>,
+    key: ProjectGroupKey,
+    workspace: Entity<Workspace>,
+) -> ContextMenu {
+    match option {
+        NewEntryOption::AgentThread => menu.entry("Agent Thread", None, move |window, cx| {
+            this.update(cx, |sidebar, cx| {
+                sidebar.set_group_expanded(&key, true, cx);
+                sidebar.selection = None;
+                sidebar.create_new_thread(&workspace, window, cx);
+            })
+            .ok();
+        }),
+        NewEntryOption::Separator => menu.separator(),
+        NewEntryOption::Terminal { name, init_command } => menu.item(
+            ContextMenuEntry::new(name)
+                .icon(IconName::Terminal)
+                .icon_color(Color::Muted)
+                .handler(move |window, cx| {
+                    this.update(cx, |sidebar, cx| {
+                        sidebar.set_group_expanded(&key, true, cx);
+                        sidebar.selection = None;
+                        sidebar.create_new_terminal_with_init_command(
+                            &workspace,
+                            init_command.clone(),
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                }),
+        ),
+        NewEntryOption::NoMainTerminalProfiles => {
+            menu.label("No main terminal profiles configured")
+        }
+    }
 }
 
 fn workspace_menu_worktree_labels(
@@ -2692,8 +2777,15 @@ impl Sidebar {
                 .flatten();
             let workspace_labels: Vec<_> = open_workspaces
                 .iter()
-                .map(|workspace| workspace_menu_worktree_labels(workspace, cx))
+                .map(|workspace| {
+                    workspace_menu_worktree_labels(workspace, cx)
+                        .iter()
+                        .map(WorkspaceMenuWorktreeLabel::text)
+                        .collect::<Vec<_>>()
+                        .join(" • ")
+                })
                 .collect();
+            let main_terminal_profiles = AgentPanel::main_terminal_profiles(cx);
 
             Some(ContextMenu::build(
                 window,
@@ -2701,52 +2793,51 @@ impl Sidebar {
                 move |mut menu, _window, cx| {
                     menu = menu.header("New Thread In…");
 
-                    for (workspace, labels) in open_workspaces
+                    for (workspace, label) in open_workspaces
                         .iter()
                         .cloned()
                         .zip(workspace_labels.iter().cloned())
                     {
                         let is_active_workspace = active_workspace.as_ref() == Some(&workspace);
-                        menu = menu.custom_entry(
-                            move |_window, _cx| {
-                                h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .justify_between()
-                                    .child(h_flex().min_w_0().gap_1().children(
-                                        labels.iter().enumerate().map(|(label_ix, label)| {
-                                            h_flex()
-                                                .gap_1()
-                                                .when(label_ix > 0, |this| {
-                                                    this.child(Label::new("•").alpha(0.25))
-                                                })
-                                                .child(label.render())
-                                                .into_any_element()
-                                        }),
-                                    ))
-                                    .when(is_active_workspace, |this| {
-                                        this.child(
-                                            Icon::new(IconName::Check)
-                                                .size(IconSize::Small)
-                                                .color(Color::Accent),
-                                        )
-                                    })
-                                    .into_any_element()
-                            },
-                            {
-                                let this = this.clone();
-                                let key = key.clone();
-                                let workspace = workspace.clone();
-                                move |window, cx| {
-                                    this.update(cx, |sidebar, cx| {
-                                        sidebar.set_group_expanded(&key, true, cx);
-                                        sidebar.selection = None;
-                                        sidebar.create_new_entry(&workspace, window, cx);
-                                    })
-                                    .ok();
-                                }
-                            },
+                        let supports_terminal = workspace
+                            .read(cx)
+                            .panel::<AgentPanel>(cx)
+                            .is_some_and(|panel| panel.read(cx).supports_terminal(cx));
+                        let options = new_entry_options(
+                            agent_ui::agent_threads_enabled(),
+                            supports_terminal,
+                            main_terminal_profiles.clone(),
                         );
+                        if options.is_empty() {
+                            continue;
+                        }
+                        let build_submenu = {
+                            let this = this.clone();
+                            let key = key.clone();
+                            move |submenu: ContextMenu,
+                                  _window: &mut Window,
+                                  _cx: &mut Context<ContextMenu>| {
+                                options.iter().cloned().fold(submenu, |submenu, option| {
+                                    render_new_entry_option(
+                                        submenu,
+                                        option,
+                                        this.clone(),
+                                        key.clone(),
+                                        workspace.clone(),
+                                    )
+                                })
+                            }
+                        };
+                        menu = if is_active_workspace {
+                            menu.submenu_with_colored_icon(
+                                label,
+                                IconName::Check,
+                                Color::Accent,
+                                build_submenu,
+                            )
+                        } else {
+                            menu.submenu(label, build_submenu)
+                        };
                     }
 
                     let base_workspace = active_workspace
@@ -7321,6 +7412,41 @@ impl Sidebar {
             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                 panel.update(cx, |panel, cx| {
                     panel.new_terminal(Some(workspace), AgentThreadSource::Sidebar, window, cx);
+                });
+            }
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+    }
+
+    fn create_new_terminal_with_init_command(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        init_command: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if workspace_path_list(workspace, cx).paths().is_empty() {
+            return;
+        }
+
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace.clone(), None, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.new_terminal_with_init_command(
+                        Some(workspace),
+                        init_command,
+                        AgentThreadSource::Sidebar,
+                        window,
+                        cx,
+                    );
                 });
             }
             workspace.focus_panel::<AgentPanel>(window, cx);

@@ -16390,3 +16390,48 @@ fn test_apply_worktree_label_mode() {
         ]
     );
 }
+
+#[test]
+fn test_new_entry_options_lists_main_profiles_after_agent_thread() {
+    let profiles = vec![(SharedString::from("Claude"), Some("claude".to_string()))];
+    assert_eq!(
+        new_entry_options(true, true, profiles.clone()),
+        vec![
+            NewEntryOption::AgentThread,
+            NewEntryOption::Separator,
+            NewEntryOption::Terminal {
+                name: "Claude".into(),
+                init_command: Some("claude".to_string()),
+            },
+        ]
+    );
+    assert_eq!(
+        new_entry_options(false, true, profiles),
+        vec![NewEntryOption::Terminal {
+            name: "Claude".into(),
+            init_command: Some("claude".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn test_new_entry_options_reports_missing_main_profiles() {
+    assert_eq!(
+        new_entry_options(true, true, Vec::new()),
+        vec![
+            NewEntryOption::AgentThread,
+            NewEntryOption::Separator,
+            NewEntryOption::NoMainTerminalProfiles,
+        ]
+    );
+}
+
+#[test]
+fn test_new_entry_options_omits_terminals_when_unsupported() {
+    let profiles = vec![(SharedString::from("Claude"), Some("claude".to_string()))];
+    assert_eq!(
+        new_entry_options(true, false, profiles),
+        vec![NewEntryOption::AgentThread]
+    );
+    assert_eq!(new_entry_options(false, false, Vec::new()), Vec::new());
+}
