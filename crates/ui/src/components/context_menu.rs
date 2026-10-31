@@ -188,6 +188,20 @@ impl ContextMenuEntry {
         self
     }
 
+    /// Adds a button at the end of the entry, shown while the entry is hovered.
+    pub fn end_slot(
+        mut self,
+        icon: IconName,
+        title: SharedString,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.end_slot_icon = Some(icon);
+        self.end_slot_title = Some(title);
+        self.end_slot_handler = Some(Rc::new(move |_, window, cx| handler(window, cx)));
+        self.show_end_slot_on_hover = true;
+        self
+    }
+
     pub fn documentation_aside(
         mut self,
         side: DocumentationSide,

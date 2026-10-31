@@ -384,15 +384,7 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
-    is_loaded: bool,
-    is_nested_sub_terminal: bool,
     highlight_positions: Vec<usize>,
-}
-
-impl TerminalEntry {
-    fn can_start_sub_terminal(&self) -> bool {
-        self.is_loaded && self.metadata.parent_terminal_id.is_none()
-    }
 }
 
 impl ThreadEntry {
@@ -935,7 +927,6 @@ pub struct Sidebar {
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
-    sub_terminal_menu_handles: HashMap<TerminalId, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -1087,7 +1078,6 @@ impl Sidebar {
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
             project_header_new_thread_menu_handles: HashMap::new(),
-            sub_terminal_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
             _subscriptions: Vec::new(),
@@ -1564,13 +1554,12 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
-        let mut live_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 for terminal in agent_panel.read(cx).terminals(cx) {
-                    live_terminal_ids.insert(terminal.id);
                     if terminal.has_notification {
                         live_notified_terminal_ids.insert(terminal.id);
+                        live_notified_terminal_ids.extend(terminal.parent_terminal_id);
                     }
                 }
             }
@@ -1636,14 +1625,11 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
-                    let is_loaded = live_terminal_ids.contains(&metadata.terminal_id);
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
-                        is_loaded,
-                        is_nested_sub_terminal: false,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -1654,6 +1640,14 @@ impl Sidebar {
             let mut push_terminal_metadata =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
                     if !seen_terminal_ids.insert(metadata.terminal_id) {
+                        return;
+                    }
+                    // Sub terminals live in their parent's overview. Without a
+                    // parent, a row is the only way left to reach them.
+                    if metadata
+                        .parent_terminal_id
+                        .is_some_and(|parent_id| terminal_store.read(cx).entry(parent_id).is_some())
+                    {
                         return;
                     }
                     terminals.push(make_terminal_entry(metadata, workspace));
@@ -2181,17 +2175,6 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
-        let listed_terminal_ids: HashSet<TerminalId> = self
-            .contents
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                ListEntry::Terminal(terminal) => Some(terminal.metadata.terminal_id),
-                _ => None,
-            })
-            .collect();
-        self.sub_terminal_menu_handles
-            .retain(|terminal_id, _| listed_terminal_ids.contains(terminal_id));
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -2405,11 +2388,6 @@ impl Sidebar {
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
-                if terminal.can_start_sub_terminal() {
-                    self.sub_terminal_menu_handles
-                        .entry(terminal.metadata.terminal_id)
-                        .or_default();
-                }
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
@@ -4769,7 +4747,6 @@ impl Sidebar {
         workspace: &Entity<Workspace>,
         metadata: &TerminalThreadMetadata,
         focus: bool,
-        restore_sub_terminals: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -4780,6 +4757,11 @@ impl Sidebar {
                                      window: &mut Window,
                                      cx: &mut App| {
             agent_panel.update(cx, |panel, cx| {
+                if metadata.parent_terminal_id.is_none()
+                    && !panel.has_terminal(metadata.terminal_id)
+                {
+                    panel.show_overview_on_restore(metadata.terminal_id, cx);
+                }
                 panel.restore_terminal(
                     metadata.clone(),
                     focus,
@@ -4788,20 +4770,6 @@ impl Sidebar {
                     window,
                     cx,
                 );
-                // A parent with its overview on restores only the sub terminals
-                // selected for it once it lands.
-                if restore_sub_terminals
-                    && metadata.parent_terminal_id.is_none()
-                    && !metadata.overview_enabled
-                {
-                    panel.restore_sub_terminals(
-                        metadata.terminal_id,
-                        AgentThreadSource::Sidebar,
-                        workspace,
-                        window,
-                        cx,
-                    );
-                }
             });
         };
 
@@ -4874,7 +4842,7 @@ impl Sidebar {
             }
         });
 
-        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, true, window, cx);
+        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, window, cx);
 
         self.update_entries(cx);
     }
@@ -6093,56 +6061,20 @@ impl Sidebar {
             }
         }
 
-        let terminal_ids: HashSet<TerminalId> = terminals
-            .iter()
-            .map(|terminal| terminal.metadata.terminal_id)
-            .collect();
-        let (sub_terminals, top_level_terminals): (Vec<_>, Vec<_>) =
-            terminals.into_iter().partition(|terminal| {
-                terminal
-                    .metadata
-                    .parent_terminal_id
-                    .is_some_and(|parent_id| terminal_ids.contains(&parent_id))
-            });
-        let mut sub_terminals_by_parent: HashMap<TerminalId, Vec<TerminalEntry>> = HashMap::new();
-        for terminal in sub_terminals
-            .into_iter()
-            .sorted_by_key(|terminal| terminal.metadata.created_at)
-        {
-            if let Some(parent_id) = terminal.metadata.parent_terminal_id {
-                let terminal = TerminalEntry {
-                    is_nested_sub_terminal: true,
-                    ..terminal
-                };
-                sub_terminals_by_parent
-                    .entry(parent_id)
-                    .or_default()
-                    .push(terminal);
-            }
-        }
-
-        let row_entries = top_level_terminals
+        let row_entries = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
 
         for entry in row_entries {
-            let sub_terminals = match &entry {
-                ListEntry::Thread(thread) => {
-                    if let Some(session_id) = &thread.metadata.session_id {
-                        current_session_ids.insert(session_id.clone());
-                    }
-                    current_thread_ids.insert(thread.metadata.thread_id);
-                    None
+            if let ListEntry::Thread(thread) = &entry {
+                if let Some(session_id) = &thread.metadata.session_id {
+                    current_session_ids.insert(session_id.clone());
                 }
-                ListEntry::Terminal(terminal) => {
-                    sub_terminals_by_parent.remove(&terminal.metadata.terminal_id)
-                }
-                ListEntry::ProjectHeader { .. } => None,
-            };
+                current_thread_ids.insert(thread.metadata.thread_id);
+            }
             entries.push(entry);
-            entries.extend(sub_terminals.into_iter().flatten().map(ListEntry::Terminal));
         }
     }
 
@@ -6317,9 +6249,7 @@ impl Sidebar {
                         workspace: workspace.clone(),
                     });
                     self.update_entries(cx);
-                    Self::load_agent_terminal_in_workspace(
-                        workspace, metadata, false, false, window, cx,
-                    );
+                    Self::load_agent_terminal_in_workspace(workspace, metadata, false, window, cx);
                 }
             }
         }
@@ -6908,20 +6838,7 @@ impl Sidebar {
         let is_renaming =
             self.rename_target == Some(RenameTarget::Terminal(terminal.metadata.terminal_id));
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
-        let sub_terminal_workspace = match &terminal.workspace {
-            ThreadEntryWorkspace::Open(workspace) if terminal.can_start_sub_terminal() => {
-                Some(workspace.clone())
-            }
-            _ => None,
-        };
-        let is_sub_terminal_menu_open = self
-            .sub_terminal_menu_handles
-            .get(&terminal.metadata.terminal_id)
-            .is_some_and(|handle| handle.is_deployed());
-        let show_actions = (is_hovered || is_sub_terminal_menu_open) && !is_renaming;
-        let new_sub_terminal_button = sub_terminal_workspace
-            .filter(|_| show_actions && !AgentPanel::sub_terminal_profiles(cx).is_empty())
-            .map(|workspace| self.render_new_sub_terminal_button(terminal, workspace, cx));
+        let show_actions = is_hovered && !is_renaming;
 
         let display_title = terminal.metadata.display_title();
         let (icon_char, title, highlight_positions) =
@@ -6942,9 +6859,7 @@ impl Sidebar {
             .highlight_positions(highlight_positions)
             .selected(is_active)
             .focused(is_focused)
-            // ThreadItem drops its action slot when not hovered, which would unmount
-            // the open sub terminal menu as soon as the mouse moves onto it.
-            .hovered(is_hovered || is_sub_terminal_menu_open)
+            .hovered(is_hovered)
             .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
                 if *is_hovered {
                     this.hovered_thread_index = Some(ix);
@@ -6955,9 +6870,6 @@ impl Sidebar {
             }))
             .when_some(rename_title_editor, |this, title_editor| {
                 this.is_truncated(false).title_slot(title_editor)
-            })
-            .when_some(new_sub_terminal_button, |this, button| {
-                this.secondary_action_slot(button)
             })
             .when(show_actions, |this| {
                 this.action_slot(
@@ -7001,10 +6913,6 @@ impl Sidebar {
         let terminal_id = terminal.metadata.terminal_id;
         let rename_title = terminal.metadata.editable_title();
         let sidebar = cx.weak_entity();
-
-        let terminal_item = div()
-            .when(terminal.is_nested_sub_terminal, |this| this.pl_4())
-            .child(terminal_item);
 
         right_click_menu(context_menu_id)
             .trigger(move |_, _, _| terminal_item)
@@ -7451,112 +7359,6 @@ impl Sidebar {
             }
             workspace.focus_panel::<AgentPanel>(window, cx);
         });
-    }
-
-    fn create_new_sub_terminal(
-        &mut self,
-        workspace: &Entity<Workspace>,
-        parent_id: TerminalId,
-        init_command: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
-            return;
-        };
-
-        multi_workspace.update(cx, |multi_workspace, cx| {
-            multi_workspace.activate(workspace.clone(), None, window, cx);
-        });
-
-        workspace.update(cx, |workspace, cx| {
-            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                panel.update(cx, |panel, cx| {
-                    panel.new_sub_terminal(
-                        parent_id,
-                        init_command,
-                        AgentThreadSource::Sidebar,
-                        window,
-                        cx,
-                    );
-                });
-            }
-            workspace.focus_panel::<AgentPanel>(window, cx);
-        });
-    }
-
-    fn render_new_sub_terminal_button(
-        &self,
-        terminal: &TerminalEntry,
-        workspace: Entity<Workspace>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let parent_id = terminal.metadata.terminal_id;
-        let menu_handle = self
-            .sub_terminal_menu_handles
-            .get(&parent_id)
-            .cloned()
-            .unwrap_or_default();
-        let color = cx.theme().colors();
-        let button = IconButton::new(
-            SharedString::from(format!("new-sub-terminal-{parent_id}")),
-            IconName::Plus,
-        )
-        .hover_background(color.element_background)
-        .active_background(color.element_active)
-        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-        .size(ButtonSize::Compact)
-        .icon_size(IconSize::Small)
-        .icon_color(Color::Muted);
-
-        let this = cx.weak_entity();
-        PopoverMenu::new(SharedString::from(format!(
-            "new-sub-terminal-menu-{parent_id}"
-        )))
-        .with_handle(menu_handle)
-        .trigger_with_tooltip(button, Tooltip::text("New Sub Terminal"))
-        .anchor(gpui::Anchor::TopLeft)
-        .on_open(Rc::new({
-            let this = this.clone();
-            move |_window, cx| {
-                this.update(cx, |_sidebar, cx| cx.notify()).ok();
-            }
-        }))
-        .menu(move |window, cx| {
-            let this = this.clone();
-            let workspace = workspace.clone();
-            let terminal_profiles = AgentPanel::sub_terminal_profiles(cx);
-            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                terminal_profiles.into_iter().fold(
-                    menu.header("New Sub Terminal"),
-                    |menu, (name, init_command)| {
-                        menu.item(
-                            ContextMenuEntry::new(name)
-                                .icon(IconName::Terminal)
-                                .icon_color(Color::Muted)
-                                .handler({
-                                    let this = this.clone();
-                                    let workspace = workspace.clone();
-                                    move |window, cx| {
-                                        this.update(cx, |sidebar, cx| {
-                                            sidebar.selection = None;
-                                            sidebar.create_new_sub_terminal(
-                                                &workspace,
-                                                parent_id,
-                                                init_command.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                        .ok();
-                                    }
-                                }),
-                        )
-                    },
-                )
-            }))
-        })
-        .into_any_element()
     }
 
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {
