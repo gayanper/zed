@@ -6829,7 +6829,7 @@ impl Sidebar {
             .is_some_and(|handle| handle.is_deployed());
         let show_actions = (is_hovered || is_sub_terminal_menu_open) && !is_renaming;
         let new_sub_terminal_button = sub_terminal_workspace
-            .filter(|_| show_actions)
+            .filter(|_| show_actions && !AgentPanel::sub_terminal_profiles(cx).is_empty())
             .map(|workspace| self.render_new_sub_terminal_button(terminal, workspace, cx));
 
         let display_title = terminal.metadata.display_title();
@@ -7399,7 +7399,7 @@ impl Sidebar {
         .menu(move |window, cx| {
             let this = this.clone();
             let workspace = workspace.clone();
-            let terminal_profiles = AgentPanel::terminal_profiles(cx);
+            let terminal_profiles = AgentPanel::sub_terminal_profiles(cx);
             Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
                 terminal_profiles.into_iter().fold(
                     menu.header("New Sub Terminal"),

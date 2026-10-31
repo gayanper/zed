@@ -2240,25 +2240,50 @@ impl AgentPanel {
         );
     }
 
-    pub fn terminal_profiles(cx: &App) -> Vec<(SharedString, Option<String>)> {
+    pub fn main_terminal_profiles(cx: &App) -> Vec<(SharedString, Option<String>)> {
         match &AgentSettings::get_global(cx).terminal_init_command {
-            Some(TerminalInitCommand::Profiles(profiles)) => profiles
-                .iter()
-                .filter(|profile| {
-                    !profile.name.trim().is_empty() && !profile.command.trim().is_empty()
-                })
-                .map(|profile| {
-                    (
-                        SharedString::from(profile.name.clone()),
-                        Some(profile.command.clone()),
-                    )
-                })
-                .collect(),
+            Some(TerminalInitCommand::Profiles(profiles)) => {
+                Self::terminal_profiles_of_kind(profiles, settings::TerminalProfileKind::Main)
+            }
             _ => vec![(
                 SharedString::from("Terminal"),
                 Self::default_terminal_init_command(cx),
             )],
         }
+    }
+
+    pub fn sub_terminal_profiles(cx: &App) -> Vec<(SharedString, Option<String>)> {
+        match &AgentSettings::get_global(cx).terminal_init_command {
+            Some(TerminalInitCommand::Profiles(profiles)) => {
+                Self::terminal_profiles_of_kind(profiles, settings::TerminalProfileKind::Sub)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn terminal_profiles_of_kind(
+        profiles: &[settings::TerminalInitCommandProfile],
+        kind: settings::TerminalProfileKind,
+    ) -> Vec<(SharedString, Option<String>)> {
+        profiles
+            .iter()
+            .filter(|profile| Self::is_terminal_profile_of_kind(profile, kind))
+            .map(|profile| {
+                (
+                    SharedString::from(profile.name.clone()),
+                    Some(profile.command.clone()),
+                )
+            })
+            .collect()
+    }
+
+    fn is_terminal_profile_of_kind(
+        profile: &settings::TerminalInitCommandProfile,
+        kind: settings::TerminalProfileKind,
+    ) -> bool {
+        profile.kind == kind
+            && !profile.name.trim().is_empty()
+            && !profile.command.trim().is_empty()
     }
 
     fn terminal_working_directory(
@@ -2408,9 +2433,12 @@ impl AgentPanel {
             .as_ref()?
         {
             TerminalInitCommand::Command(command) => Some(command.clone()),
-            TerminalInitCommand::Profiles(profiles) => {
-                profiles.first().map(|profile| profile.command.clone())
-            }
+            TerminalInitCommand::Profiles(profiles) => profiles
+                .iter()
+                .find(|profile| {
+                    Self::is_terminal_profile_of_kind(profile, settings::TerminalProfileKind::Main)
+                })
+                .map(|profile| profile.command.clone()),
         }
         .filter(|command| !command.trim().is_empty())
     }
@@ -6907,8 +6935,12 @@ impl AgentPanel {
                             )
                         })
                         .when(supports_terminal, |menu| {
-                            let terminal_profiles = Self::terminal_profiles(cx);
-                            let menu = if showing_terminal {
+                            let terminal_profiles = if showing_terminal {
+                                Self::sub_terminal_profiles(cx)
+                            } else {
+                                Self::main_terminal_profiles(cx)
+                            };
+                            let menu = if showing_terminal && !terminal_profiles.is_empty() {
                                 menu.when(crate::agent_threads_enabled(), |menu| menu.separator())
                                     .header("New Sub Terminal")
                             } else {
@@ -6928,31 +6960,26 @@ impl AgentPanel {
                                                 if let Some(workspace) = workspace.upgrade() {
                                                     workspace.update(cx, |workspace, cx| {
                                                         if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                                                            let top_level =
-                                                                window.modifiers().secondary();
                                                             panel.update(cx, |panel, cx| {
-                                                                match panel
+                                                                if !showing_terminal {
+                                                                    panel.new_terminal_with_init_command(
+                                                                        Some(workspace),
+                                                                        init_command.clone(),
+                                                                        AgentThreadSource::AgentPanel,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                } else if let Some(parent_id) = panel
                                                                     .active_terminal_id()
                                                                     .filter(|id| panel.has_terminal(*id))
                                                                 {
-                                                                    Some(parent_id) if !top_level => {
-                                                                        panel.new_sub_terminal(
-                                                                            parent_id,
-                                                                            init_command.clone(),
-                                                                            AgentThreadSource::AgentPanel,
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    }
-                                                                    _ => {
-                                                                        panel.new_terminal_with_init_command(
-                                                                            Some(workspace),
-                                                                            init_command.clone(),
-                                                                            AgentThreadSource::AgentPanel,
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    }
+                                                                    panel.new_sub_terminal(
+                                                                        parent_id,
+                                                                        init_command.clone(),
+                                                                        AgentThreadSource::AgentPanel,
+                                                                        window,
+                                                                        cx,
+                                                                    );
                                                                 }
                                                             });
                                                         }
@@ -7176,27 +7203,12 @@ impl AgentPanel {
                         .icon_size(IconSize::Small),
                     {
                         move |_window, cx| {
-                            if showing_terminal {
-                                let modifier = if cfg!(target_os = "macos") {
-                                    "\u{2318}"
-                                } else {
-                                    "Ctrl"
-                                };
-                                Tooltip::with_meta_in(
-                                    "New Thread\u{2026}",
-                                    Some(&ToggleNewThreadMenu),
-                                    format!("{modifier}-click a terminal for a top-level terminal"),
-                                    &focus_handle,
-                                    cx,
-                                )
-                            } else {
-                                Tooltip::for_action_in(
-                                    "New Thread\u{2026}",
-                                    &ToggleNewThreadMenu,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            }
+                            Tooltip::for_action_in(
+                                "New Thread\u{2026}",
+                                &ToggleNewThreadMenu,
+                                &focus_handle,
+                                cx,
+                            )
                         }
                     },
                 )
@@ -11322,7 +11334,10 @@ mod tests {
         panel.update_in(&mut cx, |panel, window, cx| {
             assert_eq!(panel.active_terminal_id(), Some(parent_id));
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
-            assert_eq!(panel.visible_overview_sub_terminal_ids(parent_id), vec![new_id]);
+            assert_eq!(
+                panel.visible_overview_sub_terminal_ids(parent_id),
+                vec![new_id]
+            );
             assert!(
                 panel.terminals[&parent_id]
                     .view
@@ -11352,9 +11367,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_sub_terminal_on_narrow_panel_keeps_overview_hidden(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_new_sub_terminal_on_narrow_panel_keeps_overview_hidden(cx: &mut TestAppContext) {
         let (panel, mut cx, parent_id, _) = setup_test_overview_selection(cx, 0).await;
         set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
 
@@ -11376,33 +11389,74 @@ mod tests {
                 Some(TerminalInitCommand::Command("claude".to_string()));
             AgentSettings::override_global(settings, cx);
             assert_eq!(
-                AgentPanel::terminal_profiles(cx),
+                AgentPanel::main_terminal_profiles(cx),
                 vec![(SharedString::from("Terminal"), Some("claude".to_string()))]
             );
+            assert_eq!(AgentPanel::sub_terminal_profiles(cx), Vec::new());
 
             let mut settings = AgentSettings::get_global(cx).clone();
             settings.terminal_init_command = Some(TerminalInitCommand::Profiles(vec![
                 settings::TerminalInitCommandProfile {
+                    name: "Reviewer".to_string(),
+                    command: "claude --agent reviewer".to_string(),
+                    kind: settings::TerminalProfileKind::Sub,
+                },
+                settings::TerminalInitCommandProfile {
                     name: "Claude".to_string(),
                     command: "claude --resume".to_string(),
+                    kind: settings::TerminalProfileKind::Main,
                 },
                 settings::TerminalInitCommandProfile {
                     name: " ".to_string(),
                     command: "unnamed".to_string(),
+                    kind: settings::TerminalProfileKind::Main,
                 },
                 settings::TerminalInitCommandProfile {
                     name: "Empty".to_string(),
                     command: "".to_string(),
+                    kind: settings::TerminalProfileKind::Sub,
                 },
             ]));
             AgentSettings::override_global(settings, cx);
             assert_eq!(
-                AgentPanel::terminal_profiles(cx),
+                AgentPanel::main_terminal_profiles(cx),
                 vec![(
                     SharedString::from("Claude"),
                     Some("claude --resume".to_string())
                 )]
             );
+            assert_eq!(
+                AgentPanel::sub_terminal_profiles(cx),
+                vec![(
+                    SharedString::from("Reviewer"),
+                    Some("claude --agent reviewer".to_string())
+                )]
+            );
+            assert_eq!(
+                AgentPanel::default_terminal_init_command(cx).as_deref(),
+                Some("claude --resume")
+            );
+
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = Some(TerminalInitCommand::Profiles(vec![
+                settings::TerminalInitCommandProfile {
+                    name: "Reviewer".to_string(),
+                    command: "claude --agent reviewer".to_string(),
+                    kind: settings::TerminalProfileKind::Sub,
+                },
+            ]));
+            AgentSettings::override_global(settings, cx);
+            assert_eq!(AgentPanel::main_terminal_profiles(cx), Vec::new());
+            assert_eq!(AgentPanel::default_terminal_init_command(cx), None);
+
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = None;
+            AgentSettings::override_global(settings, cx);
+            assert_eq!(
+                AgentPanel::main_terminal_profiles(cx),
+                vec![(SharedString::from("Terminal"), None)]
+            );
+            assert_eq!(AgentPanel::sub_terminal_profiles(cx), Vec::new());
         });
     }
 

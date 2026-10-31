@@ -1453,7 +1453,7 @@ mod tests {
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_user_settings(
-                    r#"{ "agent": { "terminal_init_command": [{ "name": "Claude", "command": "claude --resume" }, { "name": "Codex", "command": "codex" }] } }"#,
+                    r#"{ "agent": { "terminal_init_command": [{ "name": "Claude", "command": "claude --resume" }, { "name": "Codex", "command": "codex", "kind": "sub" }] } }"#,
                     cx,
                 )
                 .unwrap();
@@ -1465,10 +1465,12 @@ mod tests {
                 settings::TerminalInitCommandProfile {
                     name: "Claude".to_string(),
                     command: "claude --resume".to_string(),
+                    kind: settings::TerminalProfileKind::Main,
                 },
                 settings::TerminalInitCommandProfile {
                     name: "Codex".to_string(),
                     command: "codex".to_string(),
+                    kind: settings::TerminalProfileKind::Sub,
                 },
             ]))
         );

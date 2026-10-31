@@ -1396,6 +1396,9 @@
     //
     // Examples: "terminal_init_command": "claude"
     //           "terminal_init_command": [{ "name": "Claude", "command": "claude" }]
+    //
+    // A named command with "kind": "sub" is offered only under New Sub Terminal.
+    // Other named commands, and a plain command, start top-level terminals only.
     "terminal_init_command": "",
     // How thinking blocks should be displayed by default in the agent panel.
     //

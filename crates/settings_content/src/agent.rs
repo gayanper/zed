@@ -23,6 +23,21 @@ pub enum TerminalInitCommand {
 pub struct TerminalInitCommandProfile {
     pub name: String,
     pub command: String,
+    /// Whether the profile starts top-level terminals or sub terminals.
+    ///
+    /// Default: main
+    #[serde(default)]
+    pub kind: TerminalProfileKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalProfileKind {
+    #[default]
+    Main,
+    Sub,
 }
 
 /// Where to position the threads sidebar.
@@ -390,7 +405,8 @@ pub struct AgentSettingsContent {
     /// Default: true
     pub expand_terminal_card: Option<bool>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel,
-    /// or named commands to offer in the new-thread menu.
+    /// or named commands to offer in the new-thread menu. Named commands with kind "sub" are
+    /// offered only for sub terminals; all other commands start top-level terminals only.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
     /// An empty string disables this behavior.
