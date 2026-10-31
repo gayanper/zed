@@ -423,6 +423,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
         } else {
             None
         },
+        use_display_p3: WorkspaceSettings::get_global(cx).use_display_p3,
         ..Default::default()
     }
 }
@@ -4885,7 +4886,7 @@ mod tests {
         let initial_font_size =
             cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
@@ -4913,7 +4914,7 @@ mod tests {
             window.draw(cx).clear(cx);
         });
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
@@ -4932,7 +4933,7 @@ mod tests {
             window.draw(cx).clear(cx);
         });
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1.))),
             modifiers: event_modifiers,
@@ -4963,7 +4964,7 @@ mod tests {
             window.draw(cx).clear(cx);
         });
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
