@@ -130,7 +130,7 @@ struct TerminalOverviewButtonState {
     toggled: bool,
     disabled: bool,
     tooltip: &'static str,
-    sub_terminal_count: usize,
+    sub_terminal_badge_count: Option<usize>,
 }
 
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
@@ -7480,7 +7480,8 @@ impl AgentPanel {
             toggled: overview,
             disabled: !fits && !overview,
             tooltip,
-            sub_terminal_count: self.sub_terminal_count(terminal_id, cx),
+            sub_terminal_badge_count: (self.visible_overview_id(cx) != Some(terminal_id))
+                .then(|| self.sub_terminal_count(terminal_id, cx)),
         })
     }
 
@@ -7511,16 +7512,18 @@ impl AgentPanel {
             div()
                 .relative()
                 .child(toggle_button)
-                .child(
-                    // `CountBadge` pins itself to its parent's corner, so this
-                    // offset parent moves it clear of the icon.
-                    div()
-                        .absolute()
-                        .top(px(-4.))
-                        .right(px(-4.))
-                        .size_3p5()
-                        .child(CountBadge::new(state.sub_terminal_count)),
-                )
+                .when_some(state.sub_terminal_badge_count, |this, count| {
+                    this.child(
+                        // `CountBadge` pins itself to its parent's corner, so this
+                        // offset parent moves it clear of the icon.
+                        div()
+                            .absolute()
+                            .top(px(-4.))
+                            .right(px(-4.))
+                            .size_3p5()
+                            .child(CountBadge::new(count)),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -11376,7 +11379,7 @@ mod tests {
         let count = panel.read_with(&cx, |panel, cx| {
             panel
                 .terminal_overview_button_state(cx)
-                .map(|state| state.sub_terminal_count)
+                .and_then(|state| state.sub_terminal_badge_count)
         });
         assert_eq!(count, Some(2));
     }
@@ -11464,7 +11467,7 @@ mod tests {
                 toggled: false,
                 disabled: true,
                 tooltip: "Widen or zoom the panel to show sub terminals",
-                sub_terminal_count: 1,
+                sub_terminal_badge_count: Some(1),
             })
         );
 
@@ -11476,7 +11479,7 @@ mod tests {
                 toggled: false,
                 disabled: false,
                 tooltip: "Show Sub Terminals",
-                sub_terminal_count: 1,
+                sub_terminal_badge_count: Some(1),
             })
         );
 
@@ -11486,14 +11489,20 @@ mod tests {
             toggled: true,
             disabled: false,
             tooltip: "Hide Sub Terminals",
-            sub_terminal_count: 1,
+            sub_terminal_badge_count: None,
         });
         assert_eq!(button_state(&mut cx), hide);
 
         set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
         assert_eq!(
             button_state(&mut cx),
-            hide,
+            Some(TerminalOverviewButtonState {
+                terminal_id: parent_id,
+                toggled: true,
+                disabled: false,
+                tooltip: "Hide Sub Terminals",
+                sub_terminal_badge_count: Some(1),
+            }),
             "the overview should stay possible to turn off while the panel is too narrow"
         );
 
