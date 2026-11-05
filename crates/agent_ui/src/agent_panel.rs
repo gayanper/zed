@@ -5529,9 +5529,11 @@ impl AgentPanel {
     /// leave them out, while buffer comments apply to every thread.
     fn visible_comment_terminal(&self, cx: &App) -> Option<EntityId> {
         match self.visible_surface() {
-            VisibleSurface::Terminal(terminal_view) => {
-                Some(terminal_view.read(cx).terminal().entity_id())
-            }
+            // A zoomed sub terminal replaces its parent on screen, so its
+            // comments are the visible ones.
+            VisibleSurface::Terminal(_) => self
+                .target_terminal_view(cx)
+                .map(|terminal_view| terminal_view.read(cx).terminal().entity_id()),
             VisibleSurface::Uninitialized | VisibleSurface::AgentThread(_) => None,
         }
     }
@@ -7952,7 +7954,9 @@ impl AgentPanel {
         if self.terminal_comment.take().is_none() {
             return;
         }
-        if let VisibleSurface::Terminal(terminal_view) = self.visible_surface() {
+        if let VisibleSurface::Terminal(_) = self.visible_surface()
+            && let Some(terminal_view) = self.target_terminal_view(cx)
+        {
             window.focus(&terminal_view.focus_handle(cx), cx);
         }
         cx.notify();
@@ -8012,18 +8016,21 @@ impl AgentPanel {
                 message_editor.update(cx, |editor, cx| editor.insert_text(&text, window, cx));
                 window.focus(&message_editor.focus_handle(cx), cx);
             }
-            VisibleSurface::Terminal(terminal_view) => {
-                let terminal_view = terminal_view.clone();
+            VisibleSurface::Terminal(_) => {
+                // A zoomed sub terminal is the visible surface, not its parent.
+                let Some(terminal) = self
+                    .target_terminal_id(cx)
+                    .and_then(|terminal_id| self.terminals.get(&terminal_id))
+                else {
+                    return;
+                };
+                let terminal_view = terminal.view.clone();
                 let working_directory = terminal_view
                     .read(cx)
                     .terminal()
                     .read(cx)
                     .working_directory()
-                    .or_else(|| {
-                        self.active_terminal_id()
-                            .and_then(|terminal_id| self.terminals.get(&terminal_id))
-                            .and_then(|terminal| terminal.working_directory.clone())
-                    });
+                    .or_else(|| terminal.working_directory.clone());
                 let project = self.project.clone();
                 let path_style = project.read(cx).path_style(cx);
                 let comments = store.update(cx, |store, cx| {
@@ -15103,6 +15110,82 @@ mod tests {
             "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear.\r\r`file.txt:1`\rTwo."
         );
         assert!(!pasted.ends_with('\r'));
+        store.read_with(&cx, |store, _| assert!(store.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_insert_agent_comments_pastes_into_zoomed_sub_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        // The overview needs room for its sub terminal column.
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().default_width =
+                        Some(settings::PixelSetting(3000.));
+                });
+            });
+        });
+        cx.simulate_resize(size(px(4000.), px(1200.)));
+        let (parent_id, _) = open_terminal_with_output(&panel, "alpha\r\n", &mut cx);
+        let sub_terminal_id =
+            insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        toggle_test_terminal_overview(&panel, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.zoomed_overview_terminal = Some(sub_terminal_id);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(&cx, |panel, cx| panel.target_terminal_id(cx)),
+            Some(sub_terminal_id)
+        );
+
+        let store = visible_comment_store(&panel, &mut cx);
+        let terminal_for = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.terminals[&terminal_id].view.read(cx).terminal().clone()
+            })
+        };
+        let parent_terminal = terminal_for(parent_id, &mut cx);
+        let sub_terminal = terminal_for(sub_terminal_id, &mut cx);
+        write_terminal_output(&sub_terminal, "beta\r\n", &mut cx);
+        comment_in_terminal(
+            &panel,
+            sub_terminal_id,
+            (terminal::Point::new(0, 0), terminal::Point::new(0, 3)),
+            "beta",
+            "Fix beta.",
+            &mut cx,
+        );
+        assert!(comments_button_shown(&panel, &mut cx));
+        let visible_count = panel.read_with(&cx, |panel, cx| {
+            store.read(cx).visible_len(panel.visible_comment_terminal(cx))
+        });
+        assert_eq!(visible_count, 1);
+        for terminal in [&parent_terminal, &sub_terminal] {
+            terminal.update(&mut cx, |terminal, _| {
+                terminal.take_input_log();
+            });
+        }
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_agent_comments(window, cx)
+        });
+        cx.run_until_parked();
+
+        let parent_input = parent_terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert!(parent_input.is_empty());
+        let pasted: String = sub_terminal
+            .update(&mut cx, |terminal, _| terminal.take_input_log())
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes).expect("pasted bytes should be valid UTF-8"))
+            .collect();
+        assert!(pasted.ends_with("> beta\rFix beta."), "pasted: {pasted:?}");
         store.read_with(&cx, |store, _| assert!(store.is_empty()));
     }
 
