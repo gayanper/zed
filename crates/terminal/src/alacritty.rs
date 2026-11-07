@@ -36,7 +36,7 @@ use vte::ansi::Handler;
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
-    Cell, Color, Content, Cursor, CursorShape, GridLinesChange, HoveredWord, Hyperlink,
+    Cell, Color, Content, Cursor, CursorShape, GridLinesChange, GridRow, HoveredWord, Hyperlink,
     HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
@@ -955,6 +955,57 @@ pub(super) fn content_text(term: &Term<ZedListener>) -> String {
     let start = AlacPoint::new(term.topmost_line(), Column(0));
     let end = AlacPoint::new(term.bottommost_line(), term.last_column());
     term.bounds_to_string(start, end)
+}
+
+pub(super) fn grid_rows(term: &Term<ZedListener>, lines: RangeInclusive<i32>) -> Vec<GridRow> {
+    let grid = term.grid();
+    let first_line = (*lines.start()).max(grid.topmost_line().0);
+    let last_line = (*lines.end()).min(grid.bottommost_line().0);
+    (first_line..=last_line)
+        .map(|line| {
+            let row = &grid[Line(line)];
+            let characters = row[..Column(row.len())]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<Vec<_>>();
+            let wide_char_spacers = row[..Column(row.len())]
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    cell.flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                })
+                .map(|(column, _)| column)
+                .collect();
+            let wraps = row.len() > 0 && row[Column(row.len() - 1)].flags.contains(Flags::WRAPLINE);
+            GridRow {
+                line,
+                characters,
+                wide_char_spacers,
+                wraps,
+            }
+        })
+        .collect()
+}
+
+pub(super) fn row_text(
+    term: &Term<ZedListener>,
+    line: i32,
+    columns: &RangeInclusive<usize>,
+) -> String {
+    let grid = term.grid();
+    if line < grid.topmost_line().0 || line > grid.bottommost_line().0 || grid.columns() == 0 {
+        return String::new();
+    }
+    let last_column = grid.columns() - 1;
+    let start = AlacPoint::new(Line(line), Column((*columns.start()).min(last_column)));
+    let end = AlacPoint::new(Line(line), Column((*columns.end()).min(last_column)));
+    let mut text = term.bounds_to_string(start, end);
+    // A range reaching the last column of an unwrapped row ends in a newline.
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }
 
 pub(super) fn total_lines(term: &Term<ZedListener>) -> usize {

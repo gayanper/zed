@@ -3,7 +3,7 @@ use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Element,
     ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement,
-    LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
+    LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
     Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
     UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
     size,
@@ -21,10 +21,7 @@ use terminal::{
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
-use ui::{
-    ButtonCommon as _, ButtonStyle, IconButton, IconButtonShape, IconName, IconSize, ParentElement,
-    Tooltip,
-};
+use ui::{IconSize, ParentElement, Tooltip};
 use util::ResultExt;
 use workspace::Workspace;
 
@@ -32,7 +29,7 @@ use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
 use crate::{
-    BlockContext, BlockProperties, ContentMode, SelectionAction, TerminalMode, TerminalView,
+    BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView,
 };
 
 /// The information generated during layout that is necessary for painting.
@@ -49,7 +46,6 @@ pub struct LayoutState {
     display_offset: usize,
     hyperlink_tooltip: Option<AnyElement>,
     block_below_cursor_element: Option<AnyElement>,
-    selection_action_button: Option<AnyElement>,
     gutter_markers: Vec<(RangeInclusive<usize>, Hsla)>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
@@ -449,62 +445,6 @@ impl TerminalElement {
             interactivity: Default::default(),
         }
         .track_focus(&focus)
-    }
-
-    /// Lays out the selection action's button one cell after the end of a
-    /// finished selection.
-    fn layout_selection_action_button(
-        terminal: &Entity<Terminal>,
-        terminal_view: &Entity<TerminalView>,
-        dimensions: TerminalBounds,
-        scroll_top: Pixels,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<AnyElement> {
-        let SelectionAction { tooltip, handler } =
-            terminal_view.read(cx).selection_action.clone()?;
-        let terminal = terminal.read(cx);
-        if terminal.selection_started() {
-            return None;
-        }
-        let content = terminal.last_content();
-        let selection = content.selection?;
-        // Captured now because clicking the button may change the selection
-        // before its handler runs.
-        let text = content
-            .selection_text
-            .clone()
-            .filter(|text| !text.is_empty())?;
-        let row = selection.end.line + i32::try_from(content.display_offset).ok()?;
-        if row < 0 || row as usize >= dimensions.num_lines() {
-            return None;
-        }
-
-        let origin = selection_action_origin(
-            selection.end.column,
-            row as usize,
-            dimensions,
-            scroll_top,
-            window,
-            cx,
-        );
-        let range = selection.point_range();
-        let mut button = div()
-            .occlude()
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                cx.stop_propagation();
-                handler(range, text.clone(), origin, window, cx);
-            })
-            .child(
-                IconButton::new("terminal-selection-action", IconName::Chat)
-                    .icon_size(SELECTION_ACTION_ICON_SIZE)
-                    .shape(IconButtonShape::Square)
-                    .style(ButtonStyle::Filled)
-                    .tooltip(Tooltip::text(tooltip)),
-            )
-            .into_any_element();
-        button.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
-        Some(button)
     }
 
     pub fn layout_grid<T: TerminalLayoutCell>(
@@ -1030,6 +970,17 @@ impl TerminalElement {
 
             move |e, window, cx| {
                 window.focus(&focus, cx);
+                terminal_view.update(cx, |terminal_view, _| {
+                    terminal_view.swallow_left_mouse_up = false;
+                });
+
+                if terminal_view.read(cx).takes_mouse_for_text_block_pick() {
+                    terminal_view.update(cx, |terminal_view, _| {
+                        terminal_view.swallow_left_mouse_up = true;
+                    });
+                    pick_text_block(&terminal_view.downgrade(), e.modifiers.shift, window, cx);
+                    return;
+                }
 
                 let view = terminal_view.read(cx);
                 let scroll_top = view.scroll_top;
@@ -1046,6 +997,7 @@ impl TerminalElement {
 
         window.on_mouse_event({
             let terminal = self.terminal.clone();
+            let terminal_view = terminal_view.clone();
             let hitbox = hitbox.clone();
             let focus = focus.clone();
             move |e: &MouseMoveEvent, phase, window, cx| {
@@ -1053,7 +1005,11 @@ impl TerminalElement {
                     return;
                 }
 
-                if e.pressed_button.is_some() && !cx.has_active_drag() && focus.is_focused(window) {
+                if e.pressed_button.is_some()
+                    && !cx.has_active_drag()
+                    && focus.is_focused(window)
+                    && !terminal_view.read(cx).swallow_left_mouse_up
+                {
                     let hovered = hitbox.is_hovered(window);
 
                     let scroll_top = terminal_view.read(cx).scroll_top;
@@ -1074,6 +1030,23 @@ impl TerminalElement {
                     })
                 }
 
+                let pointer_cell = if hitbox.is_hovered(window) {
+                    let terminal = terminal.read(cx);
+                    let mut position = e.position;
+                    position.y += terminal_view.read(cx).scroll_top;
+                    let point = terminal.grid_point_at(position);
+                    i32::try_from(terminal.last_content().display_offset)
+                        .ok()
+                        .and_then(|display_offset| point.line.checked_add(display_offset))
+                        .and_then(|row| usize::try_from(row).ok())
+                        .map(|row| (row, point.column))
+                } else {
+                    None
+                };
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.set_pointer_cell(pointer_cell, cx)
+                });
+
                 if hitbox.is_hovered(window) {
                     terminal.update(cx, |terminal, cx| {
                         terminal.mouse_move(e, mouse_input_mode, cx);
@@ -1082,11 +1055,37 @@ impl TerminalElement {
             }
         });
 
+        // A release off the terminal never reaches its mouse up listener,
+        // and would otherwise leave the next release swallowed. Capture runs
+        // before an overlay can stop the release from propagating.
+        window.on_mouse_event({
+            let terminal_view = terminal_view.clone();
+            let hitbox = hitbox.clone();
+            move |e: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture
+                    && e.button == MouseButton::Left
+                    && !hitbox.is_hovered(window)
+                    && terminal_view.read(cx).swallow_left_mouse_up
+                {
+                    terminal_view.update(cx, |terminal_view, _| {
+                        terminal_view.swallow_left_mouse_up = false;
+                    });
+                }
+            }
+        });
+
         for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
             self.interactivity.on_mouse_up(button, {
                 let terminal = terminal.clone();
+                let terminal_view = terminal_view.clone();
                 let focus = focus.clone();
                 move |event, window, cx| {
+                    if button == MouseButton::Left && terminal_view.read(cx).swallow_left_mouse_up {
+                        terminal_view.update(cx, |terminal_view, _| {
+                            terminal_view.swallow_left_mouse_up = false;
+                        });
+                        return;
+                    }
                     if !focus.is_focused(window) {
                         return;
                     }
@@ -1430,6 +1429,16 @@ impl Element for TerminalElement {
                     }
                 });
 
+                self.terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.update_picked_text_block(window, cx)
+                });
+                let text_block = self
+                    .terminal_view
+                    .read(cx)
+                    .picked_text_block
+                    .as_ref()
+                    .map(|picked| (picked.block.clone(), picked.anchor));
+
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
                     let offset = dimensions.bounds.origin - point(px(0.), scroll_top);
@@ -1460,6 +1469,19 @@ impl Element for TerminalElement {
                 if let Some(selection) = selection {
                     relative_highlighted_ranges
                         .push((selection.point_range(), player_color.selection));
+                }
+                let text_block_marker_color = theme.colors().text_accent;
+                if let Some((block, _)) = &text_block {
+                    let tint = theme.colors().ghost_element_hover;
+                    for (line, columns) in &block.rows {
+                        relative_highlighted_ranges.push((
+                            Range::new(
+                                Point::new(*line, *columns.start()),
+                                Point::new(*line, *columns.end()),
+                            ),
+                            tint,
+                        ));
+                    }
                 }
 
                 // then have that representation be converted to the appropriate highlight data structure
@@ -1630,22 +1652,18 @@ impl Element for TerminalElement {
                     Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
                     None => Vec::new(),
                 };
+                let text_block_marker = text_block
+                    .as_ref()
+                    .and_then(|(block, _)| Some((block.lines()?, text_block_marker_color)));
                 let gutter_markers = gutter_markers
                     .iter()
+                    .chain(text_block_marker.as_ref())
                     .filter_map(|(lines, color)| {
                         let rows =
                             gutter_marker_rows(lines, display_offset, dimensions.num_lines())?;
                         Some((rows, *color))
                     })
                     .collect();
-                let selection_action_button = Self::layout_selection_action_button(
-                    &self.terminal,
-                    &self.terminal_view,
-                    dimensions,
-                    scroll_top,
-                    window,
-                    cx,
-                );
 
                 LayoutState {
                     hitbox,
@@ -1660,7 +1678,6 @@ impl Element for TerminalElement {
                     display_offset,
                     hyperlink_tooltip,
                     block_below_cursor_element,
-                    selection_action_button,
                     gutter_markers,
                     base_text_style: text_style,
                     content_mode,
@@ -1714,6 +1731,8 @@ impl Element for TerminalElement {
                 && self.terminal_view.read(cx).hover.is_some()
             {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
+            } else if self.terminal_view.read(cx).takes_mouse_for_text_block_pick() {
+                window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
             } else {
                 window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
             }
@@ -1721,7 +1740,6 @@ impl Element for TerminalElement {
             let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
-            let selection_action_button = layout.selection_action_button.take();
             self.interactivity.paint(
                 global_id,
                 inspector_id,
@@ -1844,10 +1862,6 @@ impl Element for TerminalElement {
                     }
 
                     if let Some(mut element) = block_below_cursor_element {
-                        element.paint(window, cx);
-                    }
-
-                    if let Some(mut element) = selection_action_button {
                         element.paint(window, cx);
                     }
 
@@ -2133,9 +2147,64 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
-const SELECTION_ACTION_ICON_SIZE: IconSize = IconSize::Small;
+/// The size of the square that the selection action's popover opens at,
+/// which keeps it clear of the text it's for.
+fn action_anchor_size(window: &mut Window, cx: &mut App) -> Pixels {
+    IconSize::Small.square(window, cx) + px(6.)
+}
 
-/// The window position of the selection action button for a selection
+/// Runs the selection action on the picked text block, and keeps picking
+/// when `keep_picking` is set.
+fn pick_text_block(
+    terminal_view: &WeakEntity<TerminalView>,
+    keep_picking: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Ok(Some((target, action))) = terminal_view.update(cx, |terminal_view, cx| {
+        let action = terminal_view.selection_action.clone()?;
+        let target = terminal_view.take_text_block_pick_target(keep_picking, window, cx)?;
+        Some((target, action))
+    }) else {
+        return;
+    };
+    let (range, text, origin) = target;
+    (action.handler)(range, text, origin, window, cx);
+}
+
+/// Where the selection action's popover opens for a text block: just below the cell the
+/// pick points at, like a tooltip, so it's next to where the
+/// user is looking. On the last row it goes above the cell instead.
+pub(crate) fn text_block_action_origin(
+    anchor: Point,
+    display_offset: usize,
+    dimensions: TerminalBounds,
+    scroll_top: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<GpuiPoint<Pixels>> {
+    let row = anchor
+        .line
+        .checked_add(i32::try_from(display_offset).ok()?)?;
+    let row = usize::try_from(row).ok()?;
+    if row >= dimensions.num_lines() {
+        return None;
+    }
+    let anchor_size = action_anchor_size(window, cx);
+    let bounds = dimensions.bounds;
+    let x = (bounds.origin.x + (anchor.column as f32 + 0.5) * dimensions.cell_width)
+        .min(bounds.right() - anchor_size)
+        .max(bounds.origin.x);
+    let row_top = bounds.origin.y + row as f32 * dimensions.line_height - scroll_top;
+    let y = if row + 1 < dimensions.num_lines() {
+        row_top + dimensions.line_height
+    } else {
+        row_top - anchor_size
+    };
+    Some(point(x, y))
+}
+
+/// Where the selection action's popover opens for a selection
 /// ending at `column` on viewport `row`.
 pub(crate) fn selection_action_origin(
     column: usize,
@@ -2145,12 +2214,12 @@ pub(crate) fn selection_action_origin(
     window: &mut Window,
     cx: &mut App,
 ) -> GpuiPoint<Pixels> {
-    let button_size = SELECTION_ACTION_ICON_SIZE.square(window, cx) + px(4.);
+    let anchor_size = action_anchor_size(window, cx);
     let x = (dimensions.bounds.origin.x + (column + 2) as f32 * dimensions.cell_width)
-        .min(dimensions.bounds.right() - button_size);
+        .min(dimensions.bounds.right() - anchor_size);
     let y = dimensions.bounds.origin.y
         + row as f32 * dimensions.line_height
-        + (dimensions.line_height - button_size) / 2.
+        + (dimensions.line_height - anchor_size) / 2.
         - scroll_top;
     point(x, y)
 }

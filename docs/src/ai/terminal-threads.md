@@ -112,6 +112,36 @@ While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb age
 
 {#kb agent::ToggleZoomOverviewTerminal} zooms the focused sub terminal: it swaps places with the parent, which moves into the sub terminal column with a highlighted header. Search and comments then act on the zoomed sub terminal. Press the same keys again, or select a thread in the sidebar, to undo the zoom.
 
+## Commenting on Terminal Output {#terminal-comments}
+
+Comments for the agent quote text from a terminal thread, and are added to the prompt with {#action agent_comments::InsertPendingComments}. A bar in the gutter marks the commented lines.
+
+To comment on a list item, a question, or a line, pick it:
+
+1. Press {#kb agent_comments::CommentTerminalSelection} in the terminal, or click the comment button in the terminal's header. A border and a hint show while picking. The hint says Edit Comment when the picked block already has a comment.
+2. The pick starts at the vi cursor in vi mode, else under the pointer, else at the last block on screen. Hover over a block, or press {#kb agent_comments::SelectPreviousTerminalCommentTarget} and {#kb agent_comments::SelectNextTerminalCommentTarget} (or `k` and `j`), to move it.
+3. Click the block, or press {#kb agent_comments::ConfirmTerminalCommentTarget}, to write a comment on it. The pick ends then. Shift-click, or {#kb agent_comments::ConfirmTerminalCommentTargetAndContinue}, keeps picking once the comment is closed, for commenting on several blocks in a row.
+
+{#kb agent_comments::CancelTerminalCommentPick}, any other key, including shortcuts such as `ctrl-c`, or moving focus away ends the pick, and the key goes to the terminal as usual. A block that scrolls off screen can't be commented on until it's back in view. Nothing is highlighted outside a pick, and while picking clicks and pointer moves stay in Zed instead of going to the program.
+
+Selecting text stays for copying. To comment on a selection, press {#kb agent_comments::CommentTerminalSelection} with the text selected, or choose Comment for Agent from the right-click menu.
+
+Blocks follow common list markers, and the numbered questions agent skills ask, such as `Q1 - Title` and `Question 2:`. To recognize other formats, set `agent.terminal_comment_patterns` to a list of regexes, tried in order:
+
+```json [settings]
+{
+  "agent": {
+    "terminal_comment_patterns": [
+      { "start": "^(⏺\\s+)?(❓\\s*)?(\\*\\*)?Q\\d+(\\*\\*)?\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
+      { "start": "^(⏺\\s+)?(\\*\\*)?Question\\s+\\d+\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
+      { "start": "^### \\d+\\.", "case_sensitive": false }
+    ]
+  }
+}
+```
+
+A block starts at a line matching `start` and ends before a line matching `end`, the next block, a less indented line, or an agent message. Setting the list replaces the defaults, so keep the first two entries to keep recognizing skill questions. Invalid patterns are skipped and reported in a notification.
+
 ## CLI/TUI Setup Notes {#cli-setup}
 
 Some agent CLIs and TUIs can send terminal signals, such as bell notifications or title updates, that Zed uses to show useful context in the sidebar.

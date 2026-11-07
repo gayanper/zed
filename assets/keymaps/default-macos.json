@@ -1812,9 +1812,21 @@
     },
   },
   {
-    "context": "AgentTerminalThread > Terminal && vi_mode && selection",
+    "context": "AgentTerminalThread > Terminal",
     "bindings": {
       "ctrl-alt-m": "agent_comments::CommentTerminalSelection",
+    },
+  },
+  {
+    "context": "AgentTerminalThread > Terminal && text_block_pick",
+    "bindings": {
+      "up": "agent_comments::SelectPreviousTerminalCommentTarget",
+      "k": "agent_comments::SelectPreviousTerminalCommentTarget",
+      "down": "agent_comments::SelectNextTerminalCommentTarget",
+      "j": "agent_comments::SelectNextTerminalCommentTarget",
+      "enter": "agent_comments::ConfirmTerminalCommentTarget",
+      "shift-enter": "agent_comments::ConfirmTerminalCommentTargetAndContinue",
+      "escape": "agent_comments::CancelTerminalCommentPick",
     },
   },
   {

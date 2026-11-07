@@ -47,10 +47,21 @@ actions!(
         InsertPendingComments,
         /// Removes the workspace's pending agent comments without inserting them.
         ClearPendingComments,
-        /// Toggles selecting terminal text without holding shift, for commenting.
-        ToggleTerminalCommentMode,
-        /// Comments for the agent on the text selected in a terminal thread.
+        /// Comments for the agent on the text selected in a terminal thread, or
+        /// else starts picking a list item, question or line to comment on, or
+        /// comments on the picked one while picking.
         CommentTerminalSelection,
+        /// Moves the terminal comment pick to the previous block on screen.
+        SelectPreviousTerminalCommentTarget,
+        /// Moves the terminal comment pick to the next block on screen.
+        SelectNextTerminalCommentTarget,
+        /// Comments on the picked terminal block and ends the pick.
+        ConfirmTerminalCommentTarget,
+        /// Comments on the picked terminal block and keeps picking once the
+        /// comment is closed.
+        ConfirmTerminalCommentTargetAndContinue,
+        /// Ends the terminal comment pick.
+        CancelTerminalCommentPick,
     ]
 );
 

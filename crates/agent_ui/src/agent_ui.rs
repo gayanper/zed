@@ -26,6 +26,7 @@ mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
 mod terminal_codegen;
+mod terminal_comment_target;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
@@ -1135,6 +1136,7 @@ mod tests {
             enable_feedback: false,
             enable_comments: false,
             comments_preamble: String::new(),
+            terminal_comment_patterns: Default::default(),
             expand_edit_card: true,
             expand_terminal_card: true,
             terminal_init_command: None,

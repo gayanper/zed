@@ -242,6 +242,7 @@ pub struct AgentSettings {
     pub enable_feedback: bool,
     pub enable_comments: bool,
     pub comments_preamble: String,
+    pub terminal_comment_patterns: TerminalCommentPatterns,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<TerminalInitCommand>,
@@ -524,6 +525,80 @@ pub struct ToolRules {
     pub invalid_patterns: Vec<InvalidRegexPattern>,
 }
 
+/// A block in an agent terminal that a comment can target, from the
+/// `terminal_comment_patterns` setting.
+#[derive(Clone, Debug)]
+pub struct TerminalCommentPattern {
+    pub start: CompiledRegex,
+    pub end: Option<CompiledRegex>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalCommentPatterns {
+    pub patterns: Arc<[TerminalCommentPattern]>,
+    /// Entries left out because a regex didn't compile, with the setting's
+    /// path in `rule_type`.
+    pub invalid_patterns: Vec<InvalidRegexPattern>,
+}
+
+/// Bounds the memory a compiled pattern takes, which matters because the
+/// patterns run while the terminal paints.
+const TERMINAL_COMMENT_PATTERN_SIZE_LIMIT: usize = 1 << 20;
+
+fn compile_terminal_comment_patterns(
+    entries: Vec<settings::TerminalCommentPatternContent>,
+) -> TerminalCommentPatterns {
+    let mut patterns = Vec::new();
+    let mut invalid_patterns = Vec::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        let case_sensitive = entry.case_sensitive.unwrap_or(true);
+        let compile = |pattern: &str, field: &str| {
+            let error = if pattern.is_empty() {
+                "empty regex patterns are not allowed".to_string()
+            } else {
+                match CompiledRegex::try_new_with_size_limit(
+                    pattern,
+                    case_sensitive,
+                    TERMINAL_COMMENT_PATTERN_SIZE_LIMIT,
+                ) {
+                    Ok(regex) => return Ok(regex),
+                    Err(error) => error.to_string(),
+                }
+            };
+            Err(InvalidRegexPattern {
+                pattern: pattern.to_string(),
+                rule_type: format!("agent.terminal_comment_patterns[{index}].{field}"),
+                error,
+            })
+        };
+        let start = compile(&entry.start, "start");
+        let end = entry
+            .end
+            .as_deref()
+            .map(|end| compile(end, "end"))
+            .transpose();
+        match (start, end) {
+            (Ok(start), Ok(end)) => patterns.push(TerminalCommentPattern { start, end }),
+            (start, end) => {
+                invalid_patterns.extend(start.err());
+                invalid_patterns.extend(end.err());
+            }
+        }
+    }
+    for invalid in &invalid_patterns {
+        log::error!(
+            "Invalid regex pattern in {}: '{}' - {}",
+            invalid.rule_type,
+            invalid.pattern,
+            invalid.error,
+        );
+    }
+    TerminalCommentPatterns {
+        patterns: patterns.into(),
+        invalid_patterns,
+    }
+}
+
 #[derive(Clone)]
 pub struct CompiledRegex {
     pub pattern: String,
@@ -546,13 +621,36 @@ impl CompiledRegex {
     }
 
     pub fn try_new(pattern: &str, case_sensitive: bool) -> Result<Self, regex::Error> {
-        let regex = regex::RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()?;
+        Self::build(
+            regex::RegexBuilder::new(pattern).case_insensitive(!case_sensitive),
+            pattern,
+            case_sensitive,
+        )
+    }
+
+    pub fn try_new_with_size_limit(
+        pattern: &str,
+        case_sensitive: bool,
+        size_limit: usize,
+    ) -> Result<Self, regex::Error> {
+        Self::build(
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(!case_sensitive)
+                .size_limit(size_limit),
+            pattern,
+            case_sensitive,
+        )
+    }
+
+    fn build(
+        builder: &regex::RegexBuilder,
+        pattern: &str,
+        case_sensitive: bool,
+    ) -> Result<Self, regex::Error> {
         Ok(Self {
             pattern: pattern.to_string(),
             case_sensitive,
-            regex,
+            regex: builder.build()?,
         })
     }
 
@@ -839,6 +937,9 @@ impl Settings for AgentSettings {
             enable_feedback: agent.enable_feedback.unwrap(),
             enable_comments: agent.enable_comments.unwrap(),
             comments_preamble: agent.comments_preamble.unwrap(),
+            terminal_comment_patterns: compile_terminal_comment_patterns(
+                agent.terminal_comment_patterns.unwrap_or_default(),
+            ),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             terminal_init_command: agent
@@ -1028,6 +1129,35 @@ fn compile_regex_rules(
 mod tests {
     use super::*;
     use gpui::{TestAppContext, UpdateGlobal, px};
+
+    #[test]
+    fn test_invalid_terminal_comment_patterns_are_skipped() {
+        let entry = |start: &str, end: Option<&str>| settings::TerminalCommentPatternContent {
+            start: start.to_string(),
+            end: end.map(str::to_string),
+            case_sensitive: None,
+        };
+        let compiled = compile_terminal_comment_patterns(vec![
+            entry("", None),
+            entry("^Q\\d", Some("(")),
+            entry("^Question", Some("^---$")),
+        ]);
+        assert_eq!(compiled.patterns.len(), 1);
+        assert_eq!(compiled.patterns[0].start.pattern, "^Question");
+        assert!(compiled.patterns[0].start.case_sensitive);
+        let paths = compiled
+            .invalid_patterns
+            .iter()
+            .map(|invalid| invalid.rule_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "agent.terminal_comment_patterns[0].start",
+                "agent.terminal_comment_patterns[1].end",
+            ]
+        );
+    }
     use serde_json::json;
     use settings::{ToolPermissionMode, ToolPermissionsContent};
     use std::path::PathBuf;

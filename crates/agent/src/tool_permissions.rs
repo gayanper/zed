@@ -601,6 +601,7 @@ mod tests {
             enable_feedback: false,
             enable_comments: false,
             comments_preamble: String::new(),
+            terminal_comment_patterns: Default::default(),
             expand_edit_card: true,
             expand_terminal_card: true,
             terminal_init_command: None,

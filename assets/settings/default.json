@@ -1307,6 +1307,21 @@
     // Text inserted before agent comments when they are added to a prompt.
     // Set to "" to disable.
     "comments_preamble": "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear.",
+    // Patterns for the blocks that can be picked for a comment in an agent
+    // terminal thread, tried in order before the built-in
+    // list markers (`- * • ◦ ▪ ● ⏺ ⎿ > ❯`, and a number or letter followed by
+    // `.` or `)`). `start` and `end` are regexes matched against a line's
+    // text with surrounding whitespace and box borders trimmed and emoji
+    // without their variation selector. A block ends before the next block
+    // start, a line matching `end`, a line indented less than its start, or
+    // an agent message or prompt (`⏺ `, `❯ `, `> `) at its indentation.
+    // `case_sensitive` defaults to true. The defaults match numbered agent
+    // skill questions, such as "❓ Q1 - Title" and "Question 2". Setting
+    // this list replaces the defaults, so copy them to keep them.
+    "terminal_comment_patterns": [
+      { "start": "^(⏺\\s+)?(❓\\s*)?(\\*\\*)?Q\\d+(\\*\\*)?\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
+      { "start": "^(⏺\\s+)?(\\*\\*)?Question\\s+\\d+\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
+    ],
     "default_profile": "write",
     "profiles": {
       "write": {

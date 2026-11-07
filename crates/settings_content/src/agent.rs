@@ -396,6 +396,30 @@ pub struct AgentSettingsContent {
     ///
     /// Default: "Review comments on the referenced code. Answer questions and make the requested changes; ask if something is unclear."
     pub comments_preamble: Option<String>,
+    /// Patterns for the blocks that can be picked for a comment in an agent
+    /// terminal thread, such as the numbered questions
+    /// agent skills ask. They're tried in order, before the built-in list
+    /// markers (`- * • ◦ ▪ ● ⏺ ⎿ > ❯`, and a number or letter followed by
+    /// `.` or `)`), which always apply after them.
+    ///
+    /// Each pattern is a regex matched against the text of a terminal line:
+    /// wrapped rows joined, surrounding whitespace trimmed, and wide
+    /// characters such as emoji without their spacer cell or variation
+    /// selector, and box borders around other text left out. A block starts
+    /// at a line that matches `start` and ends before the next line that
+    /// starts a block, matches `end`, is indented less than the start line,
+    /// or starts an agent message or prompt (`⏺ `, `❯ `, `> `) at the same
+    /// indentation. A list item inside the block is targeted on its own.
+    ///
+    /// Setting this replaces the default list, so copy the defaults to keep
+    /// them.
+    ///
+    /// Default:
+    /// [
+    ///   { "start": "^(⏺\\s+)?(❓\\s*)?(\\*\\*)?Q\\d+(\\*\\*)?\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
+    ///   { "start": "^(⏺\\s+)?(\\*\\*)?Question\\s+\\d+\\s*[-–—:.)]", "end": "^[─━-]{3,}$" }
+    /// ]
+    pub terminal_comment_patterns: Option<Vec<TerminalCommentPatternContent>>,
     /// Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     ///
     /// Default: true
@@ -1160,6 +1184,22 @@ pub struct ToolRulesContent {
     /// removed by a higher-priority layer—only new patterns can be added.
     /// Default: []
     pub always_confirm: Option<ExtendingVec<ToolRegexRule>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct TerminalCommentPatternContent {
+    /// The regex that a line starting a block matches.
+    #[serde(default)]
+    pub start: String,
+
+    /// The regex that a line ending a block matches. The matching line isn't
+    /// part of the block.
+    pub end: Option<String>,
+
+    /// Whether the regexes are case-sensitive.
+    /// Default: true
+    pub case_sensitive: Option<bool>,
 }
 
 #[with_fallible_options]

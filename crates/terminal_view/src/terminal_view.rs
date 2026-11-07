@@ -80,8 +80,53 @@ pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<(RangeInclusive
 
 #[derive(Clone)]
 pub(crate) struct SelectionAction {
-    pub(crate) tooltip: SharedString,
+    pub(crate) label: SharedString,
     pub(crate) handler: Rc<dyn Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App)>,
+}
+
+/// A block of text in the grid that can be picked for the selection action.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextBlock {
+    /// Grid lines, top to bottom, each with the columns its text spans.
+    pub rows: Vec<(i32, RangeInclusive<usize>)>,
+    /// The text the block's action receives, which may reach past `rows`.
+    pub text: String,
+    /// Replaces the selection action's label in the pick's hint, for
+    /// example when the action on this block differs.
+    pub label: Option<SharedString>,
+}
+
+impl TextBlock {
+    fn lines(&self) -> Option<RangeInclusive<i32>> {
+        Some(self.rows.first()?.0..=self.rows.last()?.0)
+    }
+
+    pub fn range(&self) -> Option<Range> {
+        let (first_line, first_columns) = self.rows.first()?;
+        let (last_line, last_columns) = self.rows.last()?;
+        Some(Range::new(
+            Point::new(*first_line, *first_columns.start()),
+            Point::new(*last_line, *last_columns.end()),
+        ))
+    }
+}
+
+pub(crate) type TextBlockProvider = Rc<dyn Fn(&Terminal, Point, &App) -> Option<TextBlock>>;
+
+/// The text block a pick points at.
+pub(crate) struct PickedTextBlock {
+    pub(crate) block: TextBlock,
+    /// Where the pick points on the block, which the action's popover
+    /// opens next to.
+    pub(crate) anchor: Point,
+}
+
+/// Picking a text block for the selection action, which the host starts on
+/// request. Clicks and moves stay local while picking.
+struct TextBlockPick {
+    /// The picked point as a scrollback row and column, which output
+    /// scrolling the screen doesn't change until the scrollback is full.
+    position: Option<(i64, usize)>,
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -156,7 +201,6 @@ pub struct TerminalView {
     background_corner_radii: Option<Corners<Rems>>,
     content_top_padding: Rems,
     read_only: bool,
-    local_selection: bool,
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
     show_workspace_actions: Option<bool>,
@@ -171,6 +215,16 @@ pub struct TerminalView {
     block_below_cursor: Option<Rc<BlockProperties>>,
     selection_action: Option<SelectionAction>,
     gutter_markers: Option<GutterMarkers>,
+    text_block_provider: Option<TextBlockProvider>,
+    text_block_suspended: bool,
+    /// The viewport row and column under the pointer, while it's over the
+    /// terminal.
+    pointer_cell: Option<(usize, usize)>,
+    text_block_pick: Option<TextBlockPick>,
+    pub(crate) picked_text_block: Option<PickedTextBlock>,
+    /// Set when a click picks a block, so its release isn't reported to a
+    /// program that never saw the press.
+    pub(crate) swallow_left_mouse_up: bool,
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
@@ -315,7 +369,6 @@ impl TerminalView {
             background_corner_radii: None,
             content_top_padding: Rems::ZERO,
             read_only: false,
-            local_selection: false,
             show_workspace_actions: None,
             font_scale: None,
             workspace_id,
@@ -323,6 +376,12 @@ impl TerminalView {
             block_below_cursor: None,
             selection_action: None,
             gutter_markers: None,
+            text_block_provider: None,
+            text_block_suspended: false,
+            pointer_cell: None,
+            text_block_pick: None,
+            picked_text_block: None,
+            swallow_left_mouse_up: false,
             scroll_top: Pixels::ZERO,
             scroll_handle,
             needs_serialize: false,
@@ -389,20 +448,8 @@ impl TerminalView {
         self
     }
 
-    pub fn is_local_selection(&self) -> bool {
-        self.local_selection
-    }
-
-    /// Keeps mouse clicks, drags and moves local even when the program captures
-    /// the mouse, as holding shift does, so a drag selects text. Scrolling
-    /// still goes to the program.
-    pub fn set_local_selection(&mut self, local_selection: bool, cx: &mut Context<Self>) {
-        self.local_selection = local_selection;
-        cx.notify();
-    }
-
-    fn mouse_input_mode(&self) -> MouseInputMode {
-        if self.read_only || self.local_selection {
+    pub(crate) fn mouse_input_mode(&self) -> MouseInputMode {
+        if self.read_only || self.takes_mouse_for_text_block_pick() {
             MouseInputMode::LocalSelection
         } else {
             MouseInputMode::ReportToTerminal
@@ -433,16 +480,16 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Shows a button after a finished selection that runs `handler` with
-    /// the selected range, its text and the button's window position.
+    /// Sets the action that a picked text block runs: `handler` gets the
+    /// block's range, its text and the window position to open at.
     pub fn on_selection_action(
         &mut self,
-        tooltip: impl Into<SharedString>,
+        label: impl Into<SharedString>,
         handler: impl Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) {
         self.selection_action = Some(SelectionAction {
-            tooltip: tooltip.into(),
+            label: label.into(),
             handler: Rc::new(handler),
         });
         cx.notify();
@@ -453,8 +500,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// The finished selection, its text and the window position of its
-    /// selection action button. When the selection's end is off screen the
+    /// The finished selection, its text and the window position its action
+    /// opens at. When the selection's end is off screen the
     /// position is clamped to the nearest visible row, since scrolling in vi
     /// mode would move the vi cursor and the selection with it.
     pub fn selection_action_target(
@@ -505,6 +552,261 @@ impl TerminalView {
     pub fn clear_gutter_markers(&mut self, cx: &mut Context<Self>) {
         self.gutter_markers = None;
         cx.notify();
+    }
+
+    /// Finds the text block at a grid point, which a pick highlights and
+    /// runs the selection action on.
+    pub fn set_text_block_provider(
+        &mut self,
+        provider: impl Fn(&Terminal, Point, &App) -> Option<TextBlock> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_block_provider = Some(Rc::new(provider));
+        cx.notify();
+    }
+
+    pub fn clear_text_block_provider(&mut self, cx: &mut Context<Self>) {
+        self.text_block_provider = None;
+        self.cancel_text_block_pick(cx);
+    }
+
+    /// Hides the pick and gives the mouse back to the program without ending
+    /// the pick, for example while the action started from it is in
+    /// progress.
+    pub fn set_text_block_suspended(&mut self, suspended: bool, cx: &mut Context<Self>) {
+        self.text_block_suspended = suspended;
+        cx.notify();
+    }
+
+    pub fn is_picking_text_block(&self) -> bool {
+        self.text_block_pick.is_some()
+    }
+
+    pub(crate) fn takes_mouse_for_text_block_pick(&self) -> bool {
+        self.text_block_pick.is_some() && !self.text_block_suspended
+    }
+
+    /// Starts picking a text block, at the vi cursor in vi mode, else under
+    /// the pointer, else the last block on screen. Typing, losing focus or
+    /// [`Self::cancel_text_block_pick`] ends the pick.
+    pub fn start_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        if self.text_block_provider.is_none() {
+            return;
+        }
+        let terminal = self.terminal.read(cx);
+        let point = if terminal.vi_mode_enabled() {
+            Some(terminal.last_content().cursor.point)
+        } else {
+            self.pointer_point(cx)
+                .or_else(|| self.next_text_block_point(self.visible_lines(cx).rev(), cx))
+        };
+        let position = point.and_then(|point| self.scrollback_position(point, cx));
+        self.text_block_pick = Some(TextBlockPick { position });
+        cx.notify();
+    }
+
+    pub fn cancel_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        if self.text_block_pick.take().is_some() {
+            self.picked_text_block = None;
+            cx.notify();
+        }
+    }
+
+    /// Moves the pick to the next or the previous text block on screen.
+    pub fn move_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(pick) = &self.text_block_pick else {
+            return;
+        };
+        let visible_lines = self.visible_lines(cx);
+        let current_point = pick
+            .position
+            .and_then(|position| self.grid_point(position, cx));
+        let current_lines = current_point
+            .and_then(|point| self.text_block_at(point, cx))
+            .and_then(|block| block.lines());
+        let point = if forward {
+            let first_line = current_lines
+                .map(|lines| lines.end() + 1)
+                .or(current_point.map(|point| point.line + 1))
+                .unwrap_or(*visible_lines.start());
+            self.next_text_block_point(first_line..=*visible_lines.end(), cx)
+        } else {
+            let first_line = current_lines
+                .map(|lines| lines.start() - 1)
+                .or(current_point.map(|point| point.line - 1))
+                .unwrap_or(*visible_lines.end());
+            self.next_text_block_point((*visible_lines.start()..=first_line).rev(), cx)
+        };
+        let Some(position) = point.and_then(|point| self.scrollback_position(point, cx)) else {
+            return;
+        };
+        if let Some(pick) = &mut self.text_block_pick {
+            pick.position = Some(position);
+        }
+        cx.notify();
+    }
+
+    /// The picked block's range, its text and the window position its
+    /// action opens at. Ends the pick unless `keep_picking` is set.
+    pub fn take_text_block_pick_target(
+        &mut self,
+        keep_picking: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Range, String, GpuiPoint<Pixels>)> {
+        if !self.takes_mouse_for_text_block_pick() {
+            return None;
+        }
+        let point = self
+            .text_block_pick
+            .as_ref()?
+            .position
+            .and_then(|position| self.grid_point(position, cx))?;
+        let block = self.text_block_at(point, cx)?;
+        let content = self.terminal.read(cx).last_content();
+        let origin = terminal_element::text_block_action_origin(
+            point,
+            content.display_offset,
+            content.terminal_bounds,
+            self.scroll_top,
+            window,
+            cx,
+        )?;
+        if !keep_picking {
+            self.cancel_text_block_pick(cx);
+        }
+        Some((block.range()?, block.text, origin))
+    }
+
+    /// The first line's text block, as the point that a keyboard pick rests
+    /// on: the end of the block's first row.
+    fn next_text_block_point(
+        &self,
+        mut lines: impl Iterator<Item = i32>,
+        cx: &App,
+    ) -> Option<Point> {
+        lines.find_map(|line| {
+            let block = self.text_block_at(Point::new(line, 0), cx)?;
+            let (first_line, columns) = block.rows.first()?;
+            Some(Point::new(*first_line, *columns.end()))
+        })
+    }
+
+    fn visible_lines(&self, cx: &App) -> RangeInclusive<i32> {
+        let content = self.terminal.read(cx).last_content();
+        let top = -i32::try_from(content.display_offset).unwrap_or(0);
+        let screen_lines = i32::try_from(content.screen_lines).unwrap_or(0);
+        top..=top + screen_lines - 1
+    }
+
+    fn pointer_point(&self, cx: &App) -> Option<Point> {
+        let (row, column) = self.pointer_cell?;
+        let display_offset = self.terminal.read(cx).last_content().display_offset;
+        let line = i32::try_from(row).ok()? - i32::try_from(display_offset).ok()?;
+        Some(Point::new(line, column))
+    }
+
+    fn scrollback_position(&self, point: Point, cx: &App) -> Option<(i64, usize)> {
+        let content = self.terminal.read(cx).last_content();
+        let history_lines =
+            i64::try_from(content.total_lines).ok()? - i64::try_from(content.screen_lines).ok()?;
+        Some((history_lines + i64::from(point.line), point.column))
+    }
+
+    fn grid_point(&self, (row, column): (i64, usize), cx: &App) -> Option<Point> {
+        let content = self.terminal.read(cx).last_content();
+        let history_lines =
+            i64::try_from(content.total_lines).ok()? - i64::try_from(content.screen_lines).ok()?;
+        Some(Point::new(i32::try_from(row - history_lines).ok()?, column))
+    }
+
+    pub(crate) fn set_pointer_cell(
+        &mut self,
+        pointer_cell: Option<(usize, usize)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pointer_cell == pointer_cell {
+            return;
+        }
+        self.pointer_cell = pointer_cell;
+        if !self.takes_mouse_for_text_block_pick() {
+            return;
+        }
+        // A pointer leaving the terminal keeps the pick where it was, so
+        // the keyboard can carry on from there.
+        let Some(position) = self
+            .pointer_point(cx)
+            .and_then(|point| self.scrollback_position(point, cx))
+        else {
+            return;
+        };
+        if let Some(pick) = &mut self.text_block_pick {
+            pick.position = Some(position);
+        }
+        cx.notify();
+    }
+
+    /// What clicking or Enter does to the picked block, and the other keys.
+    /// The block is looked up here rather than at paint, so the hint
+    /// matches the block that this frame highlights.
+    fn text_block_pick_hint(&self, cx: &App) -> Option<SharedString> {
+        if !self.takes_mouse_for_text_block_pick() {
+            return None;
+        }
+        let label = self
+            .text_block_pick
+            .as_ref()?
+            .position
+            .and_then(|position| self.grid_point(position, cx))
+            .and_then(|point| self.text_block_at(point, cx))
+            .map(|block| {
+                block.label.or_else(|| {
+                    self.selection_action
+                        .as_ref()
+                        .map(|action| action.label.clone())
+                })
+            });
+        Some(match label {
+            Some(Some(label)) => format!(
+                "{label}: click or Enter · Shift to keep picking · ↑↓ to move · Esc to cancel"
+            )
+            .into(),
+            _ => "Point at a block · ↑↓ to move · Esc to cancel".into(),
+        })
+    }
+
+    fn text_block_at(&self, point: Point, cx: &App) -> Option<TextBlock> {
+        let provider = self.text_block_provider.as_ref()?;
+        provider(self.terminal.read(cx), point, cx).filter(|block| !block.rows.is_empty())
+    }
+
+    /// Looks the picked block up again, since output may have changed it,
+    /// and ends a pick the terminal lost focus during. Runs before every
+    /// paint.
+    pub(crate) fn update_picked_text_block(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.takes_mouse_for_text_block_pick() && !self.focus_handle.is_focused(window) {
+            self.text_block_pick = None;
+            // This paint already has the pick's border and hint.
+            cx.notify();
+        }
+        self.picked_text_block = None;
+        if !self.takes_mouse_for_text_block_pick() {
+            return;
+        }
+        let Some(point) = self
+            .text_block_pick
+            .as_ref()
+            .and_then(|pick| pick.position)
+            .and_then(|position| self.grid_point(position, cx))
+        else {
+            return;
+        };
+        self.picked_text_block = self
+            .text_block_at(point, cx)
+            .map(|block| PickedTextBlock {
+                block,
+                anchor: point,
+            });
     }
 
     fn shows_workspace_actions(&self) -> bool {
@@ -576,6 +878,7 @@ impl TerminalView {
     /// Commits (sends) the given text to the PTY. Called by InputHandler::replace_text_in_range.
     pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !self.read_only && !text.is_empty() {
+            self.cancel_text_block_pick(cx);
             self.terminal.update(cx, |term, _| {
                 term.input(text.to_string().into_bytes());
             });
@@ -711,6 +1014,11 @@ impl TerminalView {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
+        let selection_action = self
+            .selection_action
+            .clone()
+            .filter(|_| has_selection)
+            .zip(self.selection_action_target(window, cx));
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -722,6 +1030,14 @@ impl TerminalView {
                         .separator()
                 })
                 .action("Copy", Box::new(Copy))
+                .when_some(
+                    selection_action,
+                    |menu, (SelectionAction { label, handler }, (range, text, origin))| {
+                        menu.entry(label, None, move |window, cx| {
+                            handler(range, text.clone(), origin, window, cx)
+                        })
+                    },
+                )
                 .when(
                     !self.read_only && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
@@ -1115,6 +1431,7 @@ impl TerminalView {
         let Some(clipboard) = cx.read_from_clipboard() else {
             return;
         };
+        self.cancel_text_block_pick(cx);
 
         match clipboard.entries().first() {
             Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
@@ -1154,6 +1471,7 @@ impl TerminalView {
         };
 
         if let Some(text) = clipboard.text() {
+            self.cancel_text_block_pick(cx);
             self.terminal
                 .update(cx, |terminal, _cx| terminal.paste(&text));
         }
@@ -1186,6 +1504,7 @@ impl TerminalView {
         if self.read_only {
             return;
         }
+        self.cancel_text_block_pick(cx);
         self.clear_bell(cx);
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
         self.terminal.update(cx, |term, _| {
@@ -1197,6 +1516,7 @@ impl TerminalView {
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
             self.clear_bell(cx);
             self.blink_manager.update(cx, BlinkManager::pause_blinking);
+            self.cancel_text_block_pick(cx);
             self.process_keystroke(&keystroke, cx);
         }
     }
@@ -1280,6 +1600,9 @@ impl TerminalView {
 
         if self.terminal.read(cx).last_content.selection.is_some() {
             dispatch_context.add("selection");
+        }
+        if self.takes_mouse_for_text_block_pick() {
+            dispatch_context.add("text_block_pick");
         }
 
         dispatch_context
@@ -1515,6 +1838,9 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
+        // Keys that picking binds never get here, and any other key types
+        // into the program as usual.
+        self.cancel_text_block_pick(cx);
         self.pause_cursor_blinking(window, cx);
 
         if event.prefer_character_input
@@ -1686,6 +2012,29 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            .when_some(self.text_block_pick_hint(cx), |this, hint| {
+                    let colors = cx.theme().colors();
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .border_1()
+                            .border_color(colors.border_focused),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_1()
+                            .right_3()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.elevated_surface_background)
+                            .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+            })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
@@ -2863,113 +3212,244 @@ mod tests {
         );
     }
 
+    /// Offers a block on each of `lines`, spanning the line's first five
+    /// columns.
+    fn provide_line_blocks(
+        terminal_view: &Entity<TerminalView>,
+        lines: RangeInclusive<i32>,
+        cx: &mut VisualTestContext,
+    ) {
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.set_text_block_provider(
+                move |_, point, _| {
+                    lines.contains(&point.line).then(|| TextBlock {
+                        rows: vec![(point.line, 0..=4)],
+                        text: "hello".into(),
+                        label: None,
+                    })
+                },
+                cx,
+            );
+        });
+    }
+
+    fn start_pick(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) {
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.start_text_block_pick(cx)
+        });
+        cx.run_until_parked();
+    }
+
+    fn move_pick(terminal_view: &Entity<TerminalView>, forward: bool, cx: &mut VisualTestContext) {
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.move_text_block_pick(forward, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    fn picked_line(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Option<i32> {
+        terminal_view.read_with(cx, |terminal_view, _| {
+            let picked = terminal_view.picked_text_block.as_ref()?;
+            Some(picked.block.rows.first()?.0)
+        })
+    }
+
+    fn is_picking(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> bool {
+        terminal_view.read_with(cx, |terminal_view, _| {
+            terminal_view.is_picking_text_block()
+        })
+    }
+
     #[gpui::test]
-    async fn selection_action_button_receives_the_selection(cx: &mut TestAppContext) {
+    async fn hovering_highlights_nothing_until_a_pick_starts(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
-            add_display_only_terminal(&project, window_handle, true, true, cx);
+            add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        let actions = record_selection_actions(&terminal_view, &mut cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
         let cell = write_first_line(&terminal, "hello world\n", &mut cx);
 
-        drag(cell(0.1), cell(4.9), &mut cx);
-        // The button sits one cell after the selection's last cell.
-        click(cell(6.3), &mut cx);
+        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(picked_line(&terminal_view, &mut cx), None);
 
-        let actions = actions.borrow();
-        assert_eq!(actions.len(), 1, "the button should run the action once");
-        let (range, text) = &actions[0];
-        assert_eq!(text, "hello");
-        assert_eq!(range.start(), Point::new(0, 0));
-        assert_eq!(range.end(), Point::new(0, 4));
+        start_pick(&terminal_view, &mut cx);
         assert_eq!(
-            terminal.read_with(&cx, |terminal, _| terminal
-                .last_content
-                .selection_text
-                .clone()),
-            Some("hello".into()),
-            "clicking the button should keep the selection",
+            picked_line(&terminal_view, &mut cx),
+            Some(0),
+            "the pick should start under the pointer, without waiting"
+        );
+        let hint = terminal_view.read_with(&cx, |terminal_view, cx| {
+            terminal_view.text_block_pick_hint(cx)
+        });
+        assert!(
+            hint.is_some_and(|hint| hint.starts_with("Act on Selection: click or Enter")),
+            "the hint should name the action on the picked block"
+        );
+
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        assert!(!is_picking(&terminal_view, &mut cx), "typing should end the pick");
+        assert_eq!(picked_line(&terminal_view, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn keyboard_pick_moves_between_blocks_on_screen(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        provide_line_blocks(&terminal_view, 1..=3, &mut cx);
+        let _cell = write_first_line(&terminal, "a\r\nb\r\nc\r\nd\r\n", &mut cx);
+
+        start_pick(&terminal_view, &mut cx);
+        assert_eq!(
+            picked_line(&terminal_view, &mut cx),
+            Some(3),
+            "without the pointer the pick should start at the last block on screen"
+        );
+        move_pick(&terminal_view, false, &mut cx);
+        assert_eq!(picked_line(&terminal_view, &mut cx), Some(2));
+        move_pick(&terminal_view, false, &mut cx);
+        move_pick(&terminal_view, false, &mut cx);
+        assert_eq!(
+            picked_line(&terminal_view, &mut cx),
+            Some(1),
+            "the pick should stop at the first block"
+        );
+        move_pick(&terminal_view, true, &mut cx);
+        assert_eq!(picked_line(&terminal_view, &mut cx), Some(2));
+    }
+
+    #[gpui::test]
+    async fn pick_starts_at_the_vi_cursor(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        provide_line_blocks(&terminal_view, 0..=3, &mut cx);
+        let cell = write_first_line(&terminal, "a\r\nb\r\nc\r\nd\r\n", &mut cx);
+        cx.simulate_mouse_move(cell(0.5), None, gpui::Modifiers::default());
+        terminal.update(&mut cx, |terminal, _| terminal.toggle_vi_mode());
+        cx.simulate_keystrokes("k k");
+        cx.run_until_parked();
+        let cursor_line =
+            terminal.read_with(&cx, |terminal, _| terminal.last_content().cursor.point.line);
+
+        start_pick(&terminal_view, &mut cx);
+        assert_eq!(picked_line(&terminal_view, &mut cx), Some(cursor_line));
+        assert_ne!(cursor_line, 0, "the vi cursor should win over the pointer");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_picked_block_runs_the_action_without_reporting_the_click(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
+        let cell = write_first_line(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
+            &mut cx,
+        );
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+
+        start_pick(&terminal_view, &mut cx);
+        click(cell(1.5), &mut cx);
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[(Range::new(Point::new(0, 0), Point::new(0, 4)), "hello".into())]
+        );
+        assert!(!is_picking(&terminal_view, &mut cx), "a click should end the pick");
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "the program shouldn't see the click, or its release",
+        );
+
+        drag(cell(0.1), cell(4.9), &mut cx);
+        assert!(
+            !terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "after the pick the program should get the mouse again",
         );
     }
 
     #[gpui::test]
-    async fn selection_action_button_is_hidden_without_a_selection(cx: &mut TestAppContext) {
+    async fn shift_click_keeps_picking(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
-            add_display_only_terminal(&project, window_handle, true, true, cx);
+            add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
         let actions = record_selection_actions(&terminal_view, &mut cx);
+        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
         let cell = write_first_line(&terminal, "hello world\n", &mut cx);
 
-        click(cell(6.3), &mut cx);
-        assert!(actions.borrow().is_empty());
+        start_pick(&terminal_view, &mut cx);
+        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(cell(1.5), MouseButton::Left, gpui::Modifiers::shift());
+        cx.simulate_mouse_up(cell(1.5), MouseButton::Left, gpui::Modifiers::shift());
+        cx.run_until_parked();
 
-        drag(cell(0.1), cell(4.9), &mut cx);
-        terminal_view.update(&mut cx, |terminal_view, cx| {
-            terminal_view.clear_selection_action(cx)
-        });
-        click(cell(6.3), &mut cx);
+        assert_eq!(actions.borrow().len(), 1);
+        assert!(is_picking(&terminal_view, &mut cx));
+    }
+
+    #[gpui::test]
+    async fn a_pick_click_released_off_the_terminal_keeps_later_releases(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
+        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
+        let outside = bounds.bounds.bottom_right() + gpui::point(px(50.), px(50.));
+
+        start_pick(&terminal_view, &mut cx);
+        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(cell(1.5), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
         assert!(
-            actions.borrow().is_empty(),
-            "a cleared action should hide the button",
+            !terminal_view.read_with(&cx, |terminal_view, _| terminal_view.swallow_left_mouse_up),
+            "a release anywhere should end the swallowing"
+        );
+        drag(cell(0.1), cell(4.9), &mut cx);
+        assert_eq!(
+            terminal.read_with(&cx, |terminal, _| terminal.last_content.selection_text.clone()),
+            Some("hello".into()),
+            "a later drag should select again"
         );
     }
 
     const ENABLE_MOUSE_REPORTING: &str = "\x1b[?1002h\x1b[?1006h";
 
     #[gpui::test]
-    async fn local_selection_drag_selects_in_mouse_mode(cx: &mut TestAppContext) {
+    async fn picking_keeps_scroll_reports(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
         let cell = write_first_line(
             &terminal,
             &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
             &mut cx,
         );
-        let selection_text = |cx: &mut VisualTestContext| {
-            terminal.read_with(cx, |terminal, _| {
-                terminal.last_content.selection_text.clone()
-            })
-        };
-
-        drag(cell(0.1), cell(4.9), &mut cx);
-        assert_eq!(selection_text(&mut cx), None);
-        assert!(
-            !terminal
-                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
-                .is_empty(),
-            "without local selection the drag goes to the program",
-        );
-
-        terminal_view.update(&mut cx, |terminal_view, cx| {
-            terminal_view.set_local_selection(true, cx)
-        });
-        drag(cell(0.1), cell(4.9), &mut cx);
-        assert_eq!(selection_text(&mut cx), Some("hello".into()));
-        assert!(
-            terminal
-                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
-                .is_empty(),
-            "with local selection the drag isn't reported to the program",
-        );
-    }
-
-    #[gpui::test]
-    async fn local_selection_keeps_scroll_reports(cx: &mut TestAppContext) {
-        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
-        let (_pane, terminal, terminal_view) =
-            add_display_only_terminal(&project, window_handle, true, false, cx);
-        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        let cell = write_first_line(
-            &terminal,
-            &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
-            &mut cx,
-        );
-        terminal_view.update(&mut cx, |terminal_view, cx| {
-            terminal_view.set_local_selection(true, cx)
-        });
+        start_pick(&terminal_view, &mut cx);
         terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
 
         cx.simulate_event(ScrollEvent {

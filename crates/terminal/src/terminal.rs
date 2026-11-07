@@ -40,7 +40,7 @@ use std::{
     borrow::Cow,
     cmp::{self, min},
     fmt::{self, Display, Formatter},
-    ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
+    ops::{BitOr, BitOrAssign, Deref, Range as StdRange, RangeInclusive},
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::{
@@ -65,13 +65,13 @@ use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
-    vi_motion,
+    display_only_term_config, find_from_terminal_point, full_content_range, grid_rows,
+    last_non_empty_lines, make_content, new_term, open_pty, pty_options, pty_term_config, resize,
+    row_text, screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -505,6 +505,18 @@ pub struct Content {
     pub scrolled_to_top: bool,
     pub scrolled_to_bottom: bool,
     pub bottom_row_occupied: bool,
+}
+
+/// A row of the grid, history included, with one character per column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridRow {
+    pub line: i32,
+    pub characters: Vec<char>,
+    /// Columns of the cells that only pad a wide character, such as an emoji,
+    /// to two columns. They hold a space that isn't part of the text.
+    pub wide_char_spacers: Vec<usize>,
+    /// The row's text continues on the next row because the terminal wrapped it.
+    pub wraps: bool,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -2529,6 +2541,32 @@ impl Terminal {
     pub fn get_content(&self) -> String {
         let term = self.term.lock_unfair();
         content_text(&term)
+    }
+
+    /// The rows of grid `lines` that exist, from the scrollback history down
+    /// to the bottom of the screen.
+    pub fn grid_rows(&self, lines: RangeInclusive<i32>) -> Vec<GridRow> {
+        let term = self.term.lock_unfair();
+        grid_rows(&term, lines)
+    }
+
+    /// The text of each row's columns, with wide and zero-width characters as
+    /// a selection copies them.
+    pub fn rows_text(&self, rows: &[(i32, RangeInclusive<usize>)]) -> Vec<String> {
+        let term = self.term.lock_unfair();
+        rows.iter()
+            .map(|(line, columns)| row_text(&term, *line, columns))
+            .collect()
+    }
+
+    /// The grid point under a window position.
+    pub fn grid_point_at(&self, position: GpuiPoint<Pixels>) -> Point {
+        let bounds = self.last_content.terminal_bounds;
+        grid_point(
+            position - bounds.bounds.origin,
+            bounds,
+            self.last_content.display_offset,
+        )
     }
 
     pub fn last_n_non_empty_lines(&self, n: usize) -> Vec<String> {
