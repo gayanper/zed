@@ -6488,6 +6488,45 @@ mod tests {
         );
     }
 
+    /// The terminal binds `cmd-k` to `terminal::Clear` on macOS. The sub terminals chord has to
+    /// stay pending in agent panel terminals instead of clearing them.
+    /// Only macOS can regress: Linux and Windows have no terminal `ctrl-k` binding.
+    #[gpui::test]
+    async fn test_toggle_sub_terminals_chord_in_agent_panel_terminals(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _app_state = init_keymap_test(cx);
+        cx.update(load_default_keymap);
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let first = gpui::Keystroke::parse(&format!("{modifier}-k")).unwrap();
+        let second = gpui::Keystroke::parse(&format!("{modifier}-o")).unwrap();
+        cx.update(|cx| {
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            for focused in ["Terminal", "OverviewTerminalHeader", "Editor"] {
+                let context_stack = ["Workspace", "Dock", "AgentPanel", focused]
+                    .map(|context| gpui::KeyContext::parse(context).unwrap());
+                let (_, pending) =
+                    keymap.bindings_for_input(std::slice::from_ref(&first), &context_stack);
+                assert!(
+                    pending,
+                    "{modifier}-k should wait for a second key in {focused}"
+                );
+                let (bindings, _) =
+                    keymap.bindings_for_input(&[first.clone(), second.clone()], &context_stack);
+                assert_eq!(
+                    bindings.first().map(|binding| binding.action().name()),
+                    Some("agent::ToggleSubTerminals"),
+                    "{modifier}-k {modifier}-o in {focused}"
+                );
+            }
+        });
+    }
+
     #[gpui::test]
     async fn test_disable_ai_filters_keybindings(cx: &mut gpui::TestAppContext) {
         let _app_state = init_keymap_test(cx);

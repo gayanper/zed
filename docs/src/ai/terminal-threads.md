@@ -106,7 +106,9 @@ Sub terminals appear only in the overview, not in the sidebar. Opening a termina
 
 To save space, minimize a sub terminal from its header or with {#kb agent::ToggleMinimizeOverviewTerminal}, leaving only the header. The header then takes focus, and the same button or keys restore the sub terminal. A notification from a minimized sub terminal marks its header and its parent in the sidebar until it's restored. A sub terminal that fails to start stays in the overview as a header with a retry button.
 
-## Navigating the Terminal Overview {#terminal-overview-navigation}
+## Showing and Navigating Sub Terminals {#terminal-overview-navigation}
+
+{#kb agent::ToggleSubTerminals} shows or hides a terminal thread's sub terminals, like the button in the panel header. This action was called `agent::ToggleTerminalOverview`, and that name still works in keymaps. If the panel is too narrow to show the sub terminals, a message asks you to widen or zoom the panel, or to widen the window when the panel is already zoomed.
 
 While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb agent::FocusPreviousOverviewTerminal} move focus between the parent terminal and its sub terminals.
 

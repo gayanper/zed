@@ -14,9 +14,9 @@ use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_comments::{
-    AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, ClearPendingComments,
-    CancelTerminalCommentPick, CommentPopover, CommentTerminalSelection,
-    ConfirmTerminalCommentTarget, ConfirmTerminalCommentTargetAndContinue, InsertPendingComments,
+    AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, CancelTerminalCommentPick,
+    ClearPendingComments, CommentPopover, CommentTerminalSelection, ConfirmTerminalCommentTarget,
+    ConfirmTerminalCommentTargetAndContinue, InsertPendingComments,
     SelectNextTerminalCommentTarget, SelectPreviousTerminalCommentTarget, TerminalComment,
 };
 use agent_servers::AgentServer;
@@ -59,7 +59,7 @@ use crate::{
     FocusPreviousOverviewTerminal, Follow, LoadThreadFromClipboard, NewTerminalThread, NewThread,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread, ResetFastModeWarnings,
     ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
-    ToggleMinimizeOverviewTerminal, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalOverview,
+    ToggleMinimizeOverviewTerminal, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleSubTerminals,
     ToggleZoomOverviewTerminal,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
@@ -115,6 +115,7 @@ use workspace::{
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
+    notifications::NotificationId,
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
@@ -3554,9 +3555,9 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn toggle_terminal_overview(
+    fn toggle_sub_terminals(
         &mut self,
-        _: &ToggleTerminalOverview,
+        _: &ToggleSubTerminals,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3574,6 +3575,19 @@ impl AgentPanel {
         // Turning the overview off is always allowed, so it can't get stuck on
         // while the panel is too narrow to show it.
         if !overview && !fits {
+            // The button is disabled here, but a key binding still lands here.
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            NotificationId::unique::<ToggleSubTerminals>(),
+                            self.sub_terminals_too_narrow_message(),
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                })
+                .log_err();
             return;
         }
         // Hiding the column takes a focused sub terminal out of the tree.
@@ -7574,6 +7588,14 @@ impl AgentPanel {
         )
     }
 
+    fn sub_terminals_too_narrow_message(&self) -> &'static str {
+        if self.zoomed {
+            "Widen the window to show sub terminals"
+        } else {
+            "Widen or zoom the panel to show sub terminals"
+        }
+    }
+
     fn terminal_overview_button_state(&self, cx: &App) -> Option<TerminalOverviewButtonState> {
         let terminal_id = self.overview_candidate_id(cx)?;
         let overview = self.terminals.get(&terminal_id)?.overview;
@@ -7583,7 +7605,7 @@ impl AgentPanel {
         } else if fits {
             "Show Sub Terminals"
         } else {
-            "Widen or zoom the panel to show sub terminals"
+            self.sub_terminals_too_narrow_message()
         };
         Some(TerminalOverviewButtonState {
             terminal_id,
@@ -7606,16 +7628,11 @@ impl AgentPanel {
                 if state.disabled {
                     Tooltip::simple(state.tooltip, cx)
                 } else {
-                    Tooltip::for_action_in(
-                        state.tooltip,
-                        &ToggleTerminalOverview,
-                        &focus_handle,
-                        cx,
-                    )
+                    Tooltip::for_action_in(state.tooltip, &ToggleSubTerminals, &focus_handle, cx)
                 }
             })
             .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_terminal_overview(&ToggleTerminalOverview, window, cx);
+                this.toggle_sub_terminals(&ToggleSubTerminals, window, cx);
             }));
 
         Some(
@@ -8772,7 +8789,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::toggle_zoom))
             .on_action(cx.listener(Self::toggle_terminal_thread_search))
-            .on_action(cx.listener(Self::toggle_terminal_overview))
+            .on_action(cx.listener(Self::toggle_sub_terminals))
             .on_action(cx.listener(Self::focus_next_overview_terminal))
             .on_action(cx.listener(Self::focus_previous_overview_terminal))
             .on_action(cx.listener(Self::toggle_zoom_overview_terminal))
@@ -10533,11 +10550,22 @@ mod tests {
         });
     }
 
-    fn toggle_test_terminal_overview(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+    fn toggle_test_sub_terminals(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
         panel.update_in(cx, |panel, window, cx| {
-            panel.toggle_terminal_overview(&ToggleTerminalOverview, window, cx);
+            panel.toggle_sub_terminals(&ToggleSubTerminals, window, cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_toggle_sub_terminals_keeps_its_old_name(cx: &mut TestAppContext) {
+        let (_panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_window, cx| {
+            let action = cx
+                .build_action("agent::ToggleTerminalOverview", None)
+                .expect("the old action name should still resolve");
+            assert!(action.partial_eq(&ToggleSubTerminals));
+        });
     }
 
     #[gpui::test]
@@ -10546,7 +10574,7 @@ mod tests {
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.overview_candidate_id(cx), None);
             assert!(!panel.terminals[&parent_id].overview);
@@ -10558,7 +10586,7 @@ mod tests {
         });
         set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.overview_candidate_id(cx), Some(parent_id));
             assert!(!panel.terminal_overview_fits(parent_id, cx));
@@ -10566,10 +10594,21 @@ mod tests {
                 !panel.terminals[&parent_id].overview,
                 "the overview should not turn on below the minimum sub terminal width"
             );
+            assert!(
+                panel
+                    .workspace
+                    .upgrade()
+                    .expect("workspace should exist")
+                    .read(cx)
+                    .has_notification(&workspace::notifications::NotificationId::unique::<
+                        ToggleSubTerminals,
+                    >()),
+                "the action should explain why sub terminals can't show"
+            );
         });
 
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.read_with(&cx, |panel, cx| {
             assert!(panel.terminals[&parent_id].overview);
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
@@ -10590,7 +10629,7 @@ mod tests {
         });
 
         set_test_terminal_overview_layout(&panel, parent_id, px(500.), &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.read_with(&cx, |panel, _| {
             assert!(
                 !panel.terminals[&parent_id].overview,
@@ -10617,7 +10656,7 @@ mod tests {
         cx.run_until_parked();
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.active_terminal_id(), Some(parent_id));
@@ -10646,7 +10685,7 @@ mod tests {
             assert!(panel.terminal_overview_fits(parent_id, cx));
         });
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         let terminal_bounds = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
             panel.read_with(cx, |panel, cx| {
@@ -10713,7 +10752,7 @@ mod tests {
             panel.activate_terminal(parent_id, true, window, cx);
         });
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.close_terminal(first_child_id, window, cx);
@@ -10760,7 +10799,7 @@ mod tests {
         let [first_id, second_id] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(first_id, window, cx);
@@ -10809,7 +10848,7 @@ mod tests {
         let [first_id, _] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(first_id, window, cx);
         });
@@ -10834,7 +10873,7 @@ mod tests {
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
         });
@@ -10857,7 +10896,7 @@ mod tests {
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
             if let Some(terminal) = panel.terminals.get_mut(&sub_terminal_id) {
@@ -10876,7 +10915,7 @@ mod tests {
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             assert!(panel.terminal_surface_visible(sub_terminal_id, cx));
             panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
@@ -11008,7 +11047,7 @@ mod tests {
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
         });
@@ -11033,7 +11072,7 @@ mod tests {
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
         });
@@ -11058,7 +11097,7 @@ mod tests {
         let [first_id, _] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         focus_test_terminal(&panel, first_id, &mut cx);
         dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -11082,7 +11121,7 @@ mod tests {
         let [first_id, second_id] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.toggle_overview_terminal_minimized(second_id, window, cx);
         });
@@ -11176,7 +11215,7 @@ mod tests {
             "navigation should do nothing while the overview is off"
         );
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.close_terminal(hidden_id, window, cx);
         });
@@ -11208,7 +11247,7 @@ mod tests {
         let [first_id, second_id] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         focus_test_terminal(&panel, parent_id, &mut cx);
         dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
@@ -11273,7 +11312,7 @@ mod tests {
         let (panel, mut cx, _parent_id, sub_terminal_ids) =
             setup_visible_test_overview(cx, 1).await;
         let sub_terminal_id = sub_terminal_ids[0];
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         focus_test_terminal(&panel, sub_terminal_id, &mut cx);
         dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
 
@@ -11297,7 +11336,7 @@ mod tests {
     async fn test_overview_zoom_renames_sub_terminal(cx: &mut TestAppContext) {
         let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
         let sub_terminal_id = sub_terminal_ids[0];
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         focus_test_terminal(&panel, sub_terminal_id, &mut cx);
         dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, &mut cx);
 
@@ -11321,7 +11360,7 @@ mod tests {
         let [first_id, second_id] = sub_terminal_ids[..] else {
             panic!("expected two sub terminals");
         };
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         let zoom = |terminal_id: TerminalId, cx: &mut VisualTestContext| {
             focus_test_terminal(&panel, terminal_id, cx);
             dispatch_test_overview_action(&panel, &ToggleZoomOverviewTerminal, cx);
@@ -11342,9 +11381,9 @@ mod tests {
         assert_not_zoomed(&mut cx);
 
         zoom(second_id, &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         assert_not_zoomed(&mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         assert_not_zoomed(&mut cx);
 
         zoom(second_id, &mut cx);
@@ -11441,7 +11480,7 @@ mod tests {
         });
         cx.simulate_resize(size(px(4000.), px(1200.)));
         cx.run_until_parked();
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
 
         let sub_terminal_ids = panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
@@ -11764,7 +11803,7 @@ mod tests {
             })
         );
 
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         let hide = Some(TerminalOverviewButtonState {
             terminal_id: parent_id,
             toggled: true,
@@ -15191,7 +15230,7 @@ mod tests {
             panel.activate_terminal(parent_id, true, window, cx);
         });
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         assert_eq!(
             panel.read_with(&cx, |panel, cx| panel.visible_overview_id(cx)),
             Some(parent_id)
@@ -15470,7 +15509,7 @@ mod tests {
             panel.activate_terminal(parent_id, true, window, cx);
         });
         set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
-        toggle_test_terminal_overview(&panel, &mut cx);
+        toggle_test_sub_terminals(&panel, &mut cx);
         panel.update(&mut cx, |panel, cx| {
             panel.zoomed_overview_terminal = Some(sub_terminal_id);
             cx.notify();

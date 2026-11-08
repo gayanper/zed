@@ -414,8 +414,9 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
-        /// Toggles the overview of a terminal thread and its sub terminals.
-        ToggleTerminalOverview,
+        /// Shows or hides the sub terminals of a terminal thread.
+        #[action(deprecated_aliases = ["agent::ToggleTerminalOverview"])]
+        ToggleSubTerminals,
         /// Moves focus to the next terminal in the terminal overview.
         FocusNextOverviewTerminal,
         /// Moves focus to the previous terminal in the terminal overview.
