@@ -85,8 +85,8 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, KeyContext,
-    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, canvas,
-    prelude::*, pulsating_between,
+    MouseButton, Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle,
+    canvas, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -111,8 +111,9 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CENTERED_PADDING_FLEX_SHRINK, CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace,
+    PathList, SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace,
+    WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
     notifications::NotificationId,
@@ -1317,6 +1318,10 @@ pub struct AgentPanel {
     /// Width of the terminal content area from the last frame. The overview
     /// toggle depends on it, but the toolbar renders before that area is laid out.
     terminal_content_width: Rc<Cell<Pixels>>,
+    /// Mirrors the workspace's centered layout mode. The panel renders in a cached
+    /// dock, so it re-renders only when this changes, not on every workspace notify.
+    centered_layout: bool,
+    _workspace_observation: Option<Subscription>,
     /// Sub terminals whose last start failed, which only a retry starts again.
     failed_sub_terminals: HashSet<TerminalId>,
     /// Sub terminals still starting, with their parents. They have no metadata
@@ -1679,7 +1684,17 @@ impl AgentPanel {
         #[cfg(feature = "zed-cloud")]
         let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
+        let centered_layout = workspace.centered_layout;
         let workspace = workspace.weak_handle();
+        let _workspace_observation = workspace.upgrade().map(|workspace| {
+            cx.observe(&workspace, |this, workspace, cx| {
+                let centered_layout = workspace.read(cx).centered_layout;
+                if this.centered_layout != centered_layout {
+                    this.centered_layout = centered_layout;
+                    cx.notify();
+                }
+            })
+        });
         let agent_comment_store = match workspace.upgrade() {
             Some(workspace) => agent_comments::workspace_comment_store(&workspace, cx),
             // Unreachable while the panel is built from a live workspace; a
@@ -1788,6 +1803,8 @@ impl AgentPanel {
             pending_terminal_spawn: None,
             pending_terminal_restores: HashMap::default(),
             terminal_content_width: Rc::new(Cell::new(Pixels::ZERO)),
+            centered_layout,
+            _workspace_observation,
             failed_sub_terminals: HashSet::default(),
             spawning_sub_terminals: HashMap::default(),
             zoomed_overview_terminal: None,
@@ -3376,14 +3393,46 @@ impl AgentPanel {
             .max(min_width)
     }
 
+    /// The narrowest content that still fits the terminal with its sub terminal
+    /// column, so centered layout paddings collapse before the column hides.
+    fn terminal_overview_min_width(&self, cx: &App) -> Option<Pixels> {
+        let terminal_id = self.overview_candidate_id(cx)?;
+        if !self.overview_has_sub_terminals(terminal_id, cx) {
+            return None;
+        }
+        // Layout snaps widths to whole pixels, which could land a hair below the
+        // fractional width `terminal_overview_fits` checks against.
+        Some(
+            self.terminal_overview_required_width(terminal_id, cx)?
+                .ceil(),
+        )
+    }
+
+    fn terminal_overview_required_width(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<Pixels> {
+        let (cell_width, sub_cell_width) = self.terminal_overview_cell_widths(terminal_id, cx)?;
+        Some(
+            cell_width * TERMINAL_OVERVIEW_MIN_COLUMNS
+                + Self::terminal_overview_sub_width_for(sub_cell_width, cx),
+        )
+    }
+
+    fn overview_has_sub_terminals(&self, terminal_id: TerminalId, cx: &App) -> bool {
+        // Persisted sub terminals may still be restoring, which would leave the
+        // sub terminal column empty. Failed ones show there, to be retried.
+        self.terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| terminal.overview)
+            && (!self.loaded_sub_terminal_ids(terminal_id).is_empty()
+                || !self.failed_sub_terminals_of(terminal_id, cx).is_empty())
+    }
+
     fn terminal_overview_fits(&self, terminal_id: TerminalId, cx: &App) -> bool {
-        let Some((cell_width, sub_cell_width)) =
-            self.terminal_overview_cell_widths(terminal_id, cx)
-        else {
-            return false;
-        };
-        let sub_width = Self::terminal_overview_sub_width_for(sub_cell_width, cx);
-        self.terminal_content_width.get() - sub_width >= cell_width * TERMINAL_OVERVIEW_MIN_COLUMNS
+        self.terminal_overview_required_width(terminal_id, cx)
+            .is_some_and(|required_width| self.terminal_content_width.get() >= required_width)
     }
 
     fn sync_terminal_font_scales(&self, cx: &mut App) {
@@ -3404,11 +3453,7 @@ impl AgentPanel {
 
     fn visible_overview_id(&self, cx: &App) -> Option<TerminalId> {
         let terminal_id = self.overview_candidate_id(cx)?;
-        // Persisted sub terminals may still be restoring, which would leave the
-        // sub terminal column empty. Failed ones show there, to be retried.
-        (self.terminals.get(&terminal_id)?.overview
-            && (!self.loaded_sub_terminal_ids(terminal_id).is_empty()
-                || !self.failed_sub_terminals_of(terminal_id, cx).is_empty())
+        (self.overview_has_sub_terminals(terminal_id, cx)
             && self.terminal_overview_fits(terminal_id, cx))
         .then_some(terminal_id)
     }
@@ -8849,35 +8894,86 @@ impl Render for AgentPanel {
                             .into_any_element(),
                         None => terminal_content.into_any_element(),
                     };
+                    let terminal_focus_handle = terminal_view.focus_handle(cx);
                     let terminal_content_width = self.terminal_content_width.clone();
                     let panel = cx.weak_entity();
+                    let centered_paddings = self
+                        .centered_layout
+                        .then(|| Workspace::centered_layout_paddings(cx));
+                    let terminal_overview_min_width = self.terminal_overview_min_width(cx);
+                    let render_padding = |size: f32| {
+                        (size > 0.).then(|| {
+                            let terminal_focus_handle = terminal_focus_handle.clone();
+                            div()
+                                .h_full()
+                                .w(relative(size))
+                                .flex_shrink(CENTERED_PADDING_FLEX_SHRINK)
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    window.focus(&terminal_focus_handle, cx);
+                                })
+                        })
+                    };
+
+                    // The width canvas measures the main terminal together with the sub
+                    // terminal column, so showing the column never changes what it reads.
+                    let measured_content =
+                        div().relative().size_full().child(terminal_content).child(
+                            canvas(
+                                move |bounds, window, _cx| {
+                                    let width = bounds.size.width;
+                                    if terminal_content_width.replace(width) != width {
+                                        // The overview toggle reads this width, and the
+                                        // toolbar was already rendered with the old one.
+                                        // A notify during a draw doesn't schedule another
+                                        // frame, so defer it.
+                                        window.on_next_frame(move |window, cx| {
+                                            panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.terminal_width_changed(window, cx);
+                                                })
+                                                .log_err();
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        );
+                    let terminal_content = match centered_paddings {
+                        None => measured_content.into_any_element(),
+                        Some(paddings) => {
+                            let min_content_width = terminal_overview_min_width
+                                .map_or(paddings.min_content_width, |min_width| {
+                                    min_width.max(paddings.min_content_width)
+                                });
+                            h_flex()
+                                .size_full()
+                                .children(render_padding(paddings.left).map(|padding| {
+                                    padding.debug_selector(|| {
+                                        "agent_panel_centered_layout_left_padding".into()
+                                    })
+                                }))
+                                .child(
+                                    Workspace::centered_content_style(
+                                        measured_content,
+                                        min_content_width,
+                                    )
+                                    .debug_selector(|| {
+                                        "agent_panel_centered_layout_content".into()
+                                    }),
+                                )
+                                .children(render_padding(paddings.right).map(|padding| {
+                                    padding.debug_selector(|| {
+                                        "agent_panel_centered_layout_right_padding".into()
+                                    })
+                                }))
+                                .into_any_element()
+                        }
+                    };
 
                     parent
-                        .child(
-                            div().relative().size_full().child(terminal_content).child(
-                                canvas(
-                                    move |bounds, window, _cx| {
-                                        let width = bounds.size.width;
-                                        if terminal_content_width.replace(width) != width {
-                                            // The overview toggle reads this width, and the
-                                            // toolbar was already rendered with the old one.
-                                            // A notify during a draw doesn't schedule another
-                                            // frame, so defer it.
-                                            window.on_next_frame(move |window, cx| {
-                                                panel
-                                                    .update(cx, |panel, cx| {
-                                                        panel.terminal_width_changed(window, cx);
-                                                    })
-                                                    .log_err();
-                                            });
-                                        }
-                                    },
-                                    |_, _, _, _| {},
-                                )
-                                .absolute()
-                                .size_full(),
-                            ),
-                        )
+                        .child(terminal_content)
                         .child(self.render_drag_target(cx))
                 }
             })
@@ -11624,6 +11720,96 @@ mod tests {
             Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
         );
         assert!(test_terminal_bounds(&panel, sub_terminal_id, &mut cx).cell_width() > Pixels::ZERO);
+    }
+
+    fn redraw_test_panel(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_centers_terminal_and_keeps_sub_terminals(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx, parent_id, sub_terminal_ids) =
+            setup_test_terminal_overview(cx, 1).await;
+        let sub_terminal_id = sub_terminal_ids[0];
+        let workspace = panel.read_with(&cx, |panel, _| {
+            panel.workspace.upgrade().expect("workspace should exist")
+        });
+        let toggle_centered_layout = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_centered_layout(&workspace::ToggleCenteredLayout, window, cx);
+            });
+            redraw_test_panel(cx);
+        };
+
+        redraw_test_panel(&mut cx);
+        assert!(
+            cx.debug_bounds("agent_panel_centered_layout_content")
+                .is_none()
+        );
+
+        toggle_centered_layout(&mut cx);
+        let left = cx
+            .debug_bounds("agent_panel_centered_layout_left_padding")
+            .expect("left padding should render");
+        let content = cx
+            .debug_bounds("agent_panel_centered_layout_content")
+            .expect("centered content should render");
+        let right = cx
+            .debug_bounds("agent_panel_centered_layout_right_padding")
+            .expect("right padding should render");
+        assert!(left.size.width > Pixels::ZERO && right.size.width > Pixels::ZERO);
+        assert_eq!(left.right(), content.left());
+        assert_eq!(content.right(), right.left());
+        let overview_min_width = panel.read_with(&cx, |panel, cx| {
+            assert!(panel.centered_layout);
+            assert_eq!(panel.terminal_content_width.get(), content.size.width);
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+            let overview_min_width = panel
+                .terminal_overview_min_width(cx)
+                .expect("the overview should need a minimum width");
+            assert!(
+                overview_min_width > Workspace::centered_layout_paddings(cx).min_content_width,
+                "the overview should need more than the centered layout minimum"
+            );
+            overview_min_width
+        });
+
+        // Wide enough for the sub terminal column, but not once the paddings take
+        // their share. The paddings should collapse instead of hiding the column.
+        let row_width = right.right() - left.left();
+        let current_window_width = cx.update(|window, _| window.viewport_size().width);
+        let window_width = current_window_width - row_width + overview_min_width * 1.2;
+        cx.simulate_resize(size(window_width, px(1200.)));
+        redraw_test_panel(&mut cx);
+        let content = cx
+            .debug_bounds("agent_panel_centered_layout_content")
+            .expect("centered content should render");
+        assert!(content.size.width >= overview_min_width);
+        let narrowed_left = cx
+            .debug_bounds("agent_panel_centered_layout_left_padding")
+            .map_or(Pixels::ZERO, |bounds| bounds.size.width);
+        assert!(narrowed_left < left.size.width);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
+        assert_eq!(
+            test_terminal_font_scale(&panel, sub_terminal_id, &mut cx),
+            Some(TERMINAL_OVERVIEW_SUB_FONT_SCALE)
+        );
+
+        toggle_centered_layout(&mut cx);
+        assert!(
+            cx.debug_bounds("agent_panel_centered_layout_content")
+                .is_none()
+        );
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.centered_layout);
+            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
+        });
     }
 
     #[gpui::test]

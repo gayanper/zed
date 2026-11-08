@@ -177,7 +177,16 @@ use crate::{
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
 /// Makes centered layout paddings give up their width long before the centered content does.
-const CENTERED_PADDING_FLEX_SHRINK: f32 = 1000.;
+pub const CENTERED_PADDING_FLEX_SHRINK: f32 = 1000.;
+
+/// Centered layout sizes from the settings: each padding as a fraction of the row,
+/// and the width the centered content keeps before it starts shrinking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CenteredLayoutPaddings {
+    pub left: f32,
+    pub right: f32,
+    pub min_content_width: Pixels,
+}
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -8929,10 +8938,29 @@ impl Workspace {
             ))
     }
 
+    pub fn centered_layout_paddings(cx: &App) -> CenteredLayoutPaddings {
+        let settings = WorkspaceSettings::get_global(cx).centered_layout;
+        let left = Self::adjust_padding(settings.left_padding.map(|padding| padding.0));
+        let right = Self::adjust_padding(settings.right_padding.map(|padding| padding.0));
+        // The paddings used to be sized relative to the row next to a full-width
+        // content, which flexbox shrank to `1 / (1 + left + right)` of the row.
+        // Keep those proportions now that the content grows into the remaining space.
+        let scale = 1.0 + left + right;
+        CenteredLayoutPaddings {
+            left: left / scale,
+            right: right / scale,
+            min_content_width: px(settings
+                .min_content_width
+                .filter(|width| width.is_finite())
+                .unwrap_or(0.0)
+                .max(0.0)),
+        }
+    }
+
     /// The centered content starts at the minimum width and grows into the space the
     /// paddings leave. The paddings shrink far more readily, so they collapse before the
     /// content shrinks below the minimum, and the content still fits a narrower row.
-    fn centered_content_style<E: Styled>(element: E, min_width: Pixels) -> E {
+    pub fn centered_content_style<E: Styled>(element: E, min_width: Pixels) -> E {
         element
             .flex_basis(min_width)
             .flex_grow(1.)
@@ -9629,28 +9657,19 @@ impl Render for Workspace {
                     .border_color(cx.theme().colors().pane_group_border)
             })
         };
+        let centered_layout_paddings = Self::centered_layout_paddings(cx);
         let render_centered_paddings = |enabled: bool| {
             if !enabled {
                 return (None, None);
             }
-
-            let settings = WorkspaceSettings::get_global(cx).centered_layout;
-            let left = Self::adjust_padding(settings.left_padding.map(|padding| padding.0));
-            let right = Self::adjust_padding(settings.right_padding.map(|padding| padding.0));
-            // The paddings used to be sized relative to the row next to a full-width
-            // content, which flexbox shrank to `1 / (1 + left + right)` of the row.
-            // Keep those proportions now that the content grows into the remaining space.
-            let scale = 1.0 + left + right;
-            (render_padding(left / scale), render_padding(right / scale))
+            (
+                render_padding(centered_layout_paddings.left),
+                render_padding(centered_layout_paddings.right),
+            )
         };
         let centered_paddings = render_centered_paddings(pad_center_pane);
         let zoomed_paddings = render_centered_paddings(pad_zoomed_pane);
-        let centered_min_content_width = px(WorkspaceSettings::get_global(cx)
-            .centered_layout
-            .min_content_width
-            .filter(|width| width.is_finite())
-            .unwrap_or(0.0)
-            .max(0.0));
+        let centered_min_content_width = centered_layout_paddings.min_content_width;
         let center_min_content_width = pad_center_pane.then_some(centered_min_content_width);
         let ui_font = theme_settings::setup_ui_font(window, cx);
 
