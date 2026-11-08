@@ -621,7 +621,8 @@ A font size from `6` to `100` pixels (inclusive)
 {
   "centered_layout": {
     "left_padding": 0.2,
-    "right_padding": 0.2
+    "right_padding": 0.2,
+    "min_content_width": 400
   }
 }
 ```
@@ -630,6 +631,8 @@ A font size from `6` to `100` pixels (inclusive)
 
 The `left_padding` and `right_padding` options define the relative width of the
 left and right padding of the central pane from the workspace when the centered layout mode is activated. Valid values range is from `0` to `0.4`.
+
+The `min_content_width` option sets the minimum width, in pixels, of the central pane. When the space around the central pane gets narrower (for example, because a dock is enlarged), the paddings shrink so that the pane keeps at least this width. If the central area is narrower than this width, the paddings are removed and the pane takes the whole area. Use `0` to disable it.
 
 ## Close on File Delete
 

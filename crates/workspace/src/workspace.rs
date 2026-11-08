@@ -176,6 +176,8 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+/// Makes centered layout paddings give up their width long before the centered content does.
+const CENTERED_PADDING_FLEX_SHRINK: f32 = 1000.;
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -8902,6 +8904,7 @@ impl Workspace {
     fn render_center(
         &self,
         render_cx: &PaneRenderContext,
+        min_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
@@ -8913,6 +8916,9 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
+            .when_some(min_width, |this, min_width| {
+                Self::centered_content_style(this, min_width)
+            })
             .debug_selector(|| "editor-region".into())
             .child(self.center.render(
                 self.zoomed.as_ref(),
@@ -8921,6 +8927,17 @@ impl Workspace {
                 window,
                 cx,
             ))
+    }
+
+    /// The centered content starts at the minimum width and grows into the space the
+    /// paddings leave. The paddings shrink far more readily, so they collapse before the
+    /// content shrinks below the minimum, and the content still fits a narrower row.
+    fn centered_content_style<E: Styled>(element: E, min_width: Pixels) -> E {
+        element
+            .flex_basis(min_width)
+            .flex_grow(1.)
+            .flex_shrink(1.)
+            .min_w(px(0.))
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -9607,6 +9624,7 @@ impl Render for Workspace {
                 div()
                     .h_full()
                     .w(relative(size))
+                    .flex_shrink(CENTERED_PADDING_FLEX_SHRINK)
                     .bg(cx.theme().colors().editor_background)
                     .border_color(cx.theme().colors().pane_group_border)
             })
@@ -9617,17 +9635,23 @@ impl Render for Workspace {
             }
 
             let settings = WorkspaceSettings::get_global(cx).centered_layout;
-            (
-                render_padding(Self::adjust_padding(
-                    settings.left_padding.map(|padding| padding.0),
-                )),
-                render_padding(Self::adjust_padding(
-                    settings.right_padding.map(|padding| padding.0),
-                )),
-            )
+            let left = Self::adjust_padding(settings.left_padding.map(|padding| padding.0));
+            let right = Self::adjust_padding(settings.right_padding.map(|padding| padding.0));
+            // The paddings used to be sized relative to the row next to a full-width
+            // content, which flexbox shrank to `1 / (1 + left + right)` of the row.
+            // Keep those proportions now that the content grows into the remaining space.
+            let scale = 1.0 + left + right;
+            (render_padding(left / scale), render_padding(right / scale))
         };
         let centered_paddings = render_centered_paddings(pad_center_pane);
         let zoomed_paddings = render_centered_paddings(pad_zoomed_pane);
+        let centered_min_content_width = px(WorkspaceSettings::get_global(cx)
+            .centered_layout
+            .min_content_width
+            .filter(|width| width.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0));
+        let center_min_content_width = pad_center_pane.then_some(centered_min_content_width);
         let ui_font = theme_settings::setup_ui_font(window, cx);
 
         let theme = cx.theme().clone();
@@ -9836,6 +9860,7 @@ impl Render for Workspace {
                                                                 )
                                                                 .child(self.render_center(
                                                                     &pane_render_context,
+                                                                    center_min_content_width,
                                                                     window,
                                                                     cx,
                                                                 ))
@@ -9901,6 +9926,7 @@ impl Render for Workspace {
                                                                         )
                                                                         .child(self.render_center(
                                                                             &pane_render_context,
+                                                                            center_min_content_width,
                                                                             window,
                                                                             cx,
                                                                         ))
@@ -9968,6 +9994,7 @@ impl Render for Workspace {
                                                                         )
                                                                         .child(self.render_center(
                                                                             &pane_render_context,
+                                                                            center_min_content_width,
                                                                             window,
                                                                             cx,
                                                                         ))
@@ -10020,6 +10047,7 @@ impl Render for Workspace {
                                                         )
                                                         .child(self.render_center(
                                                             &pane_render_context,
+                                                            center_min_content_width,
                                                             window,
                                                             cx,
                                                         ))
@@ -10057,6 +10085,12 @@ impl Render for Workspace {
                                         .child(
                                             div()
                                                 .size_full()
+                                                .map(|this| {
+                                                    Self::centered_content_style(
+                                                        this,
+                                                        centered_min_content_width,
+                                                    )
+                                                })
                                                 .debug_selector(|| {
                                                     "zoomed_centered_layout_content".into()
                                                 })
@@ -15873,6 +15907,110 @@ mod tests {
             zoomed_padding_bounds(cx),
             (None, None),
             "a zoomed dock should not receive centered layout padding"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_keeps_min_content_width(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        add_an_item_to_active_pane(cx, &workspace, 1);
+        let viewport_width = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_centered_layout(&ToggleCenteredLayout, window, cx);
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            let viewport_width = window.viewport_size().width;
+            workspace.resize_right_dock(viewport_width - px(500.), window, cx);
+            viewport_width
+        });
+        cx.run_until_parked();
+        let dock_width = workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .right_dock()
+                .read(cx)
+                .stored_active_panel_size(window, cx)
+                .expect("the right dock should have an active panel")
+        });
+        let center_row_width = viewport_width - dock_width;
+        assert!(
+            center_row_width / 1.4 < px(400.),
+            "the center row should be narrow enough that proportional paddings alone would squeeze the pane below the minimum, got {center_row_width:?}"
+        );
+
+        let editor_region = cx
+            .debug_bounds("editor-region")
+            .expect("the center pane should be rendered");
+        assert!(
+            editor_region.size.width >= px(399.),
+            "the centered pane should keep its minimum width, got {:?}",
+            editor_region.size.width
+        );
+        assert!(
+            editor_region.right() <= center_row_width,
+            "the centered pane should fit beside the dock instead of being clipped: pane {editor_region:?}, dock width {dock_width:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_content_fits_narrow_center(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        add_an_item_to_active_pane(cx, &workspace, 1);
+        let viewport_width = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_centered_layout(&ToggleCenteredLayout, window, cx);
+            window.viewport_size().width
+        });
+        cx.run_until_parked();
+
+        let editor_region = cx
+            .debug_bounds("editor-region")
+            .expect("the center pane should be rendered");
+        let expected_width = viewport_width / 1.4;
+        assert!(
+            (editor_region.size.width - expected_width).abs() <= px(2.),
+            "a wide centered pane should keep its proportional width: expected {expected_width:?}, got {:?}",
+            editor_region.size.width
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.resize_right_dock(viewport_width - px(300.), window, cx);
+        });
+        cx.run_until_parked();
+        let dock_width = workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .right_dock()
+                .read(cx)
+                .stored_active_panel_size(window, cx)
+                .expect("the right dock should have an active panel")
+        });
+        let center_row_width = viewport_width - dock_width;
+        assert!(
+            center_row_width < px(400.),
+            "the center row should be narrower than the minimum width, got {center_row_width:?}"
+        );
+
+        let editor_region = cx
+            .debug_bounds("editor-region")
+            .expect("the center pane should be rendered");
+        assert!(
+            editor_region.right() <= center_row_width,
+            "the centered pane should shrink with the row instead of being clipped: pane {editor_region:?}, row width {center_row_width:?}"
+        );
+        assert!(
+            editor_region.size.width >= center_row_width - px(4.),
+            "the paddings should collapse before the pane shrinks: pane {editor_region:?}, row width {center_row_width:?}"
         );
     }
 

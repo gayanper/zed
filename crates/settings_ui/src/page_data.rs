@@ -5137,7 +5137,7 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn layout_section() -> [SettingsPageItem; 6] {
+    fn layout_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Layout"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5200,6 +5200,31 @@ fn window_and_layout_page() -> SettingsPage {
                             .centered_layout
                             .get_or_insert_default()
                             .right_padding = value;
+                    },
+                }),
+                metadata: None,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                files: USER,
+                title: "Centered Layout Minimum Content Width",
+                description: "Width in pixels the central pane keeps while centered layout paddings shrink.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("centered_layout.min_content_width"),
+                    pick: |settings_content| {
+                        settings_content
+                            .workspace
+                            .centered_layout
+                            .as_ref()?
+                            .min_content_width
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspace
+                            .centered_layout
+                            .get_or_insert_default()
+                            .min_content_width = value;
                     },
                 }),
                 metadata: None,

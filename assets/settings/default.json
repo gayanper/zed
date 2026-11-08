@@ -107,6 +107,10 @@
     // The relative width of the right padding of the central pane from the
     // workspace when the centered layout is used.
     "right_padding": 0.2,
+    // The minimum width, in pixels, of the central pane when the centered
+    // layout is used. The paddings shrink before the pane becomes narrower
+    // than this width; the pane only shrinks further once the paddings are gone.
+    "min_content_width": 400,
   },
   // Image viewer settings
   "image_viewer": {

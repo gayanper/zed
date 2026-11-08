@@ -715,6 +715,12 @@ pub struct CenteredLayoutSettings {
     ///
     /// Default: 0.2
     pub right_padding: Option<CenteredPaddingSettings>,
+    /// The minimum width, in pixels, of the central pane when the centered
+    /// layout is used. The paddings shrink before the pane becomes narrower
+    /// than this width; the pane only shrinks further once the paddings are gone.
+    ///
+    /// Default: 400
+    pub min_content_width: Option<f32>,
 }
 
 #[derive(
