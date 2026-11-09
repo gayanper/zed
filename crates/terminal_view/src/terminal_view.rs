@@ -33,10 +33,10 @@ use std::{
 };
 use task::TaskId;
 use terminal::{
-    Clear, Content, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
-    PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
-    ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
-    TerminalBounds, ToggleViMode,
+    Clear, Content, Copy, Event, GridRow, HoveredWord, MaybeNavigationTarget, Modes,
+    MouseInputMode, Paste, PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus,
+    Terminal, TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -48,6 +48,7 @@ use ui::{
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
@@ -76,7 +77,7 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
     }
 }
 
-pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)>>;
+pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<GutterMarker>>;
 
 #[derive(Clone)]
 pub(crate) struct SelectionAction {
@@ -111,11 +112,191 @@ impl TextBlock {
     }
 }
 
+fn sentence_start(sentence: &TextBlock) -> Point {
+    sentence
+        .rows
+        .first()
+        .map_or(Point::new(0, 0), |(line, columns)| {
+            Point::new(*line, *columns.start())
+        })
+}
+
+fn sentence_contains(sentence: &TextBlock, point: Point) -> bool {
+    sentence
+        .rows
+        .iter()
+        .any(|(line, columns)| *line == point.line && columns.contains(&point.column))
+}
+
+/// The rows of each sentence in a block's `rows`, by Unicode sentence
+/// boundaries. A line break the program wrote ends a sentence too, since
+/// terminal output is mostly lines without punctuation, while a row the
+/// terminal wrapped carries on, and so does a row that looks like the
+/// program wrapped prose (see [`looks_wrapped_by_program`]).
+fn sentence_rows(
+    block_rows: &[(i32, RangeInclusive<usize>)],
+    grid_rows: &[GridRow],
+) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
+    let mut sentences = Vec::new();
+    let mut paragraph = String::new();
+    let mut byte_points = Vec::new();
+    let mut previous_row: Option<(&GridRow, &RangeInclusive<usize>)> = None;
+    for (line, columns) in block_rows {
+        let Some(grid_row) = grid_rows.iter().find(|row| row.line == *line) else {
+            continue;
+        };
+        let continues = previous_row.is_some_and(|(previous, previous_columns)| {
+            previous.line.saturating_add(1) == *line
+                && (previous.wraps
+                    || looks_wrapped_by_program(previous, previous_columns, grid_row, columns))
+        });
+        if !continues {
+            push_paragraph_sentences(&paragraph, &byte_points, &mut sentences);
+            paragraph.clear();
+            byte_points.clear();
+        } else if !previous_row.is_some_and(|(previous, _)| previous.wraps)
+            && !paragraph.ends_with(char::is_whitespace)
+            && let Some(last_point) = byte_points.last().copied()
+        {
+            // The program's line break stood for a space.
+            paragraph.push(' ');
+            byte_points.push(last_point);
+        }
+        for column in columns.clone() {
+            if grid_row.wide_char_spacers.contains(&column) {
+                continue;
+            }
+            let Some(character) = grid_row.characters.get(column) else {
+                break;
+            };
+            paragraph.push(*character);
+            byte_points.extend(std::iter::repeat_n(
+                Point::new(*line, column),
+                character.len_utf8(),
+            ));
+        }
+        previous_row = Some((grid_row, columns));
+    }
+    push_paragraph_sentences(&paragraph, &byte_points, &mut sentences);
+    sentences
+}
+
+/// Whether a line break looks like a program wrapping prose to fit the
+/// terminal, as agent TUIs do, rather than ending a line of a log or of
+/// code. The terminal can't tell them apart, so this guesses: the row
+/// reaches well across the terminal and ends in a word or a comma, and the
+/// next row carries on at the same indent or deeper with a lowercase word.
+/// Rows of code or listings rarely look like that. A row that carries on
+/// with a capital, a digit or a script without case starts afresh.
+fn looks_wrapped_by_program(
+    row: &GridRow,
+    columns: &RangeInclusive<usize>,
+    next_row: &GridRow,
+    next_columns: &RangeInclusive<usize>,
+) -> bool {
+    let text_columns = |row: &GridRow, columns: &RangeInclusive<usize>| {
+        columns
+            .clone()
+            .filter_map(|column| Some((column, *row.characters.get(column)?)))
+            .filter(|(column, character)| {
+                !character.is_whitespace() && !row.wide_char_spacers.contains(column)
+            })
+            .collect::<Vec<_>>()
+    };
+    let text = text_columns(row, columns);
+    let next_text = text_columns(next_row, next_columns);
+    let (Some((first_column, _)), Some((last_column, _))) = (text.first(), text.last()) else {
+        return false;
+    };
+    let Some((next_first_column, _)) = next_text.first() else {
+        return false;
+    };
+    // Closing quotes and brackets after a full stop still end a sentence.
+    let ends_in_word = text
+        .iter()
+        .rev()
+        .map(|(_, character)| *character)
+        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’'))
+        .is_some_and(|character| character.is_alphabetic() || character == ',');
+    let word_length = next_text
+        .windows(2)
+        .position(|pair| pair[1].0 != pair[0].0 + 1)
+        .map_or(next_text.len(), |index| index + 1);
+    let next_word = next_text[..word_length]
+        .iter()
+        .map(|(_, character)| *character)
+        .collect::<String>();
+    let next_word = next_word.trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”']);
+    let width = row.characters.len();
+    ends_in_word
+        && last_column.saturating_mul(3) >= width.saturating_mul(2)
+        && next_first_column >= first_column
+        && !next_word.is_empty()
+        && next_word.chars().all(|character| {
+            // Apostrophes, as in "others'" or "don't", but not the hyphens
+            // of listings such as "drwxr-xr-x".
+            (character.is_alphabetic() && character.is_lowercase())
+                || matches!(character, '\'' | '’')
+        })
+        && next_word.starts_with(char::is_alphabetic)
+}
+
+fn push_paragraph_sentences(
+    paragraph: &str,
+    byte_points: &[Point],
+    sentences: &mut Vec<Vec<(i32, RangeInclusive<usize>)>>,
+) {
+    for (start, sentence) in paragraph.split_sentence_bound_indices() {
+        let trimmed_start = sentence.len() - sentence.trim_start().len();
+        let trimmed = sentence.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let start = start + trimmed_start;
+        let Some(points) = byte_points.get(start..start + trimmed.len()) else {
+            continue;
+        };
+        let mut rows: Vec<(i32, RangeInclusive<usize>)> = Vec::new();
+        for point in points {
+            match rows.last_mut() {
+                Some((line, columns)) if *line == point.line => {
+                    *columns = *columns.start()..=point.column.max(*columns.end());
+                }
+                _ => rows.push((point.line, point.column..=point.column)),
+            }
+        }
+        sentences.push(rows);
+    }
+}
+
 pub(crate) type TextBlockProvider = Rc<dyn Fn(&Terminal, Point, &App) -> Option<TextBlock>>;
 
-/// The text block a pick points at.
+/// A marker in the gutter over grid `lines`. `count` is the number of
+/// marked items it stands for, shown when there's more than one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GutterMarker {
+    pub lines: RangeInclusive<i32>,
+    pub color: Hsla,
+    pub count: usize,
+}
+
+pub(crate) type GutterMarkerClick =
+    Rc<dyn Fn(RangeInclusive<i32>, GpuiPoint<Pixels>, &mut Window, &mut App)>;
+
+/// How much of a text block a pick takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextBlockLevel {
+    #[default]
+    Block,
+    Sentence,
+}
+
+/// The text a pick points at.
 pub(crate) struct PickedTextBlock {
+    /// The picked text: the block, or a sentence of it.
     pub(crate) block: TextBlock,
+    /// The block a picked sentence is in.
+    pub(crate) parent: Option<TextBlock>,
     /// Where the pick points on the block, which the action's popover
     /// opens next to.
     pub(crate) anchor: Point,
@@ -127,6 +308,7 @@ struct TextBlockPick {
     /// The picked point as a scrollback row and column, which output
     /// scrolling the screen doesn't change until the scrollback is full.
     position: Option<(i64, usize)>,
+    level: TextBlockLevel,
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -215,6 +397,7 @@ pub struct TerminalView {
     block_below_cursor: Option<Rc<BlockProperties>>,
     selection_action: Option<SelectionAction>,
     gutter_markers: Option<GutterMarkers>,
+    pub(crate) gutter_marker_click: Option<GutterMarkerClick>,
     text_block_provider: Option<TextBlockProvider>,
     text_block_suspended: bool,
     /// The viewport row and column under the pointer, while it's over the
@@ -376,6 +559,7 @@ impl TerminalView {
             block_below_cursor: None,
             selection_action: None,
             gutter_markers: None,
+            gutter_marker_click: None,
             text_block_provider: None,
             text_block_suspended: false,
             pointer_cell: None,
@@ -542,16 +726,34 @@ impl TerminalView {
     /// marks follow the terminal's output.
     pub fn set_gutter_markers(
         &mut self,
-        markers: impl Fn(&Content, &App) -> Vec<(RangeInclusive<i32>, Hsla)> + 'static,
+        markers: impl Fn(&Content, &App) -> Vec<GutterMarker> + 'static,
         cx: &mut Context<Self>,
     ) {
         self.gutter_markers = Some(Rc::new(markers));
         cx.notify();
     }
 
+    /// Runs `handler` with a marker's lines and the window position of a
+    /// click on it.
+    pub fn on_gutter_marker_click(
+        &mut self,
+        handler: impl Fn(RangeInclusive<i32>, GpuiPoint<Pixels>, &mut Window, &mut App) + 'static,
+    ) {
+        self.gutter_marker_click = Some(Rc::new(handler));
+    }
+
     pub fn clear_gutter_markers(&mut self, cx: &mut Context<Self>) {
         self.gutter_markers = None;
+        self.gutter_marker_click = None;
         cx.notify();
+    }
+
+    /// The gutter marker over a grid line, if any.
+    pub(crate) fn gutter_marker_at(&self, line: i32, cx: &App) -> Option<GutterMarker> {
+        let markers = self.gutter_markers.as_ref()?;
+        markers(self.terminal.read(cx).last_content(), cx)
+            .into_iter()
+            .find(|marker| marker.lines.contains(&line))
     }
 
     /// Finds the text block at a grid point, which a pick highlights and
@@ -601,8 +803,76 @@ impl TerminalView {
                 .or_else(|| self.next_text_block_point(self.visible_lines(cx).rev(), cx))
         };
         let position = point.and_then(|point| self.scrollback_position(point, cx));
-        self.text_block_pick = Some(TextBlockPick { position });
+        self.text_block_pick = Some(TextBlockPick {
+            position,
+            level: TextBlockLevel::Block,
+        });
         cx.notify();
+    }
+
+    pub fn text_block_pick_level(&self) -> Option<TextBlockLevel> {
+        Some(self.text_block_pick.as_ref()?.level)
+    }
+
+    /// Picks the whole block, or a sentence of it: the one under the
+    /// pointer, else the block's first.
+    pub fn set_text_block_pick_level(&mut self, level: TextBlockLevel, cx: &mut Context<Self>) {
+        let Some(pick) = &self.text_block_pick else {
+            return;
+        };
+        if pick.level == level {
+            return;
+        }
+        let point = pick
+            .position
+            .and_then(|position| self.grid_point(position, cx));
+        let position = match level {
+            TextBlockLevel::Block => pick.position,
+            TextBlockLevel::Sentence => point
+                .and_then(|point| self.first_sentence_point(point, cx))
+                .and_then(|point| self.scrollback_position(point, cx))
+                .or(pick.position),
+        };
+        if let Some(pick) = &mut self.text_block_pick {
+            pick.level = level;
+            pick.position = position;
+        }
+        cx.notify();
+    }
+
+    fn first_sentence_point(&self, point: Point, cx: &App) -> Option<Point> {
+        let block = self.text_block_at(point, cx)?;
+        let pointer_sentence = self
+            .pointer_point(cx)
+            .filter(|pointer| self.text_block_at(*pointer, cx).as_ref() == Some(&block))
+            .and_then(|pointer| self.sentence_at(pointer, cx))
+            .map(|(sentence, _)| sentence);
+        let sentence =
+            pointer_sentence.or_else(|| self.block_sentences(&block, cx).into_iter().next())?;
+        Some(sentence_start(&sentence))
+    }
+
+    /// Whether `range` is one sentence of the text block there, and not the
+    /// whole block.
+    pub fn is_text_block_sentence(&self, range: Range, cx: &App) -> bool {
+        let Some(block) = self.text_block_at(range.start(), cx) else {
+            return false;
+        };
+        block.range() != Some(range)
+            && self
+                .block_sentences(&block, cx)
+                .iter()
+                .any(|sentence| sentence.range() == Some(range))
+    }
+
+    /// Goes from a sentence back to its block, else ends the pick.
+    pub fn back_out_of_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        match self.text_block_pick_level() {
+            Some(TextBlockLevel::Sentence) => {
+                self.set_text_block_pick_level(TextBlockLevel::Block, cx)
+            }
+            _ => self.cancel_text_block_pick(cx),
+        }
     }
 
     pub fn cancel_text_block_pick(&mut self, cx: &mut Context<Self>) {
@@ -612,19 +882,71 @@ impl TerminalView {
         }
     }
 
-    /// Moves the pick to the next or the previous text block on screen.
+    /// Moves the pick to the next or the previous text block on screen, or
+    /// while picking sentences, to the next or the previous sentence, which
+    /// carries on into the neighboring block.
     pub fn move_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(pick) = &self.text_block_pick else {
             return;
         };
-        let visible_lines = self.visible_lines(cx);
         let current_point = pick
             .position
             .and_then(|position| self.grid_point(position, cx));
+        let point = match pick.level {
+            TextBlockLevel::Block => self.adjacent_block_point(current_point, forward, cx),
+            TextBlockLevel::Sentence => self.adjacent_sentence_point(current_point, forward, cx),
+        };
+        let Some(position) = point.and_then(|point| self.scrollback_position(point, cx)) else {
+            return;
+        };
+        if let Some(pick) = &mut self.text_block_pick {
+            pick.position = Some(position);
+        }
+        cx.notify();
+    }
+
+    fn adjacent_sentence_point(
+        &self,
+        current_point: Option<Point>,
+        forward: bool,
+        cx: &App,
+    ) -> Option<Point> {
+        let Some((sentence, block)) = current_point.and_then(|point| self.sentence_at(point, cx))
+        else {
+            return self.adjacent_block_point(current_point, forward, cx);
+        };
+        let sentences = self.block_sentences(&block, cx);
+        let index = sentences.iter().position(|other| *other == sentence)?;
+        let next_index = if forward {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        };
+        if let Some(next) = next_index.and_then(|index| sentences.get(index)) {
+            return Some(sentence_start(next));
+        }
+        let block_point = self.adjacent_block_point(current_point, forward, cx)?;
+        let next_block = self.text_block_at(block_point, cx)?;
+        let next_sentences = self.block_sentences(&next_block, cx);
+        let next = if forward {
+            next_sentences.first()
+        } else {
+            next_sentences.last()
+        };
+        Some(next.map_or(block_point, sentence_start))
+    }
+
+    fn adjacent_block_point(
+        &self,
+        current_point: Option<Point>,
+        forward: bool,
+        cx: &App,
+    ) -> Option<Point> {
+        let visible_lines = self.visible_lines(cx);
         let current_lines = current_point
             .and_then(|point| self.text_block_at(point, cx))
             .and_then(|block| block.lines());
-        let point = if forward {
+        if forward {
             let first_line = current_lines
                 .map(|lines| lines.end() + 1)
                 .or(current_point.map(|point| point.line + 1))
@@ -636,14 +958,7 @@ impl TerminalView {
                 .or(current_point.map(|point| point.line - 1))
                 .unwrap_or(*visible_lines.end());
             self.next_text_block_point((*visible_lines.start()..=first_line).rev(), cx)
-        };
-        let Some(position) = point.and_then(|point| self.scrollback_position(point, cx)) else {
-            return;
-        };
-        if let Some(pick) = &mut self.text_block_pick {
-            pick.position = Some(position);
         }
-        cx.notify();
     }
 
     /// The picked block's range, its text and the window position its
@@ -657,15 +972,10 @@ impl TerminalView {
         if !self.takes_mouse_for_text_block_pick() {
             return None;
         }
-        let point = self
-            .text_block_pick
-            .as_ref()?
-            .position
-            .and_then(|position| self.grid_point(position, cx))?;
-        let block = self.text_block_at(point, cx)?;
+        let picked = self.picked_text(cx)?;
         let content = self.terminal.read(cx).last_content();
         let origin = terminal_element::text_block_action_origin(
-            point,
+            picked.anchor,
             content.display_offset,
             content.terminal_bounds,
             self.scroll_top,
@@ -675,7 +985,85 @@ impl TerminalView {
         if !keep_picking {
             self.cancel_text_block_pick(cx);
         }
-        Some((block.range()?, block.text, origin))
+        Some((picked.block.range()?, picked.block.text, origin))
+    }
+
+    /// The text the pick points at, looked up from the terminal's content.
+    fn picked_text(&self, cx: &App) -> Option<PickedTextBlock> {
+        let pick = self.text_block_pick.as_ref()?;
+        let point = pick
+            .position
+            .and_then(|position| self.grid_point(position, cx))?;
+        match pick.level {
+            TextBlockLevel::Block => Some(PickedTextBlock {
+                block: self.text_block_at(point, cx)?,
+                parent: None,
+                anchor: point,
+            }),
+            TextBlockLevel::Sentence => {
+                let (sentence, block) = self.sentence_at(point, cx)?;
+                let anchor = if sentence_contains(&sentence, point) {
+                    point
+                } else {
+                    sentence_start(&sentence)
+                };
+                Some(PickedTextBlock {
+                    block: sentence,
+                    parent: Some(block),
+                    anchor,
+                })
+            }
+        }
+    }
+
+    /// The sentence at `point`, else the first one after it in its block,
+    /// else the block's last, with the block.
+    fn sentence_at(&self, point: Point, cx: &App) -> Option<(TextBlock, TextBlock)> {
+        let block = self.text_block_at(point, cx)?;
+        let sentences = self.block_sentences(&block, cx);
+        let sentence = sentences
+            .iter()
+            .find(|sentence| sentence_contains(sentence, point))
+            .or_else(|| {
+                sentences
+                    .iter()
+                    .find(|sentence| sentence_start(sentence) >= point)
+            })
+            .or(sentences.last())?
+            .clone();
+        Some((sentence, block))
+    }
+
+    fn block_sentences(&self, block: &TextBlock, cx: &App) -> Vec<TextBlock> {
+        let Some(lines) = block.lines() else {
+            return Vec::new();
+        };
+        let terminal = self.terminal.read(cx);
+        let grid_rows = terminal.grid_rows(lines);
+        sentence_rows(&block.rows, &grid_rows)
+            .into_iter()
+            .map(|rows| {
+                let mut text = String::new();
+                for ((line, _), row_text) in rows.iter().zip(terminal.rows_text(&rows)) {
+                    // A row the program wrapped ends at a space it left out.
+                    let terminal_wrapped = grid_rows
+                        .iter()
+                        .any(|row| row.line + 1 == *line && row.wraps);
+                    if !text.is_empty() && !terminal_wrapped {
+                        text.truncate(text.trim_end().len());
+                        text.push(' ');
+                        text.push_str(row_text.trim_start());
+                    } else {
+                        text.push_str(&row_text);
+                    }
+                }
+                TextBlock {
+                    rows,
+                    text,
+                    label: None,
+                }
+            })
+            .collect()
     }
 
     /// The first line's text block, as the point that a keyboard pick rests
@@ -753,25 +1141,25 @@ impl TerminalView {
         if !self.takes_mouse_for_text_block_pick() {
             return None;
         }
-        let label = self
-            .text_block_pick
-            .as_ref()?
-            .position
-            .and_then(|position| self.grid_point(position, cx))
-            .and_then(|point| self.text_block_at(point, cx))
-            .map(|block| {
-                block.label.or_else(|| {
-                    self.selection_action
-                        .as_ref()
-                        .map(|action| action.label.clone())
-                })
-            });
+        let picked = self.picked_text(cx);
+        let level = self.text_block_pick.as_ref()?.level;
+        let label = picked.map(|picked| picked.block).map(|block| {
+            block.label.or_else(|| {
+                self.selection_action
+                    .as_ref()
+                    .map(|action| action.label.clone())
+            })
+        });
+        let escape = match level {
+            TextBlockLevel::Block => "Esc to cancel",
+            TextBlockLevel::Sentence => "Esc for the block",
+        };
         Some(match label {
             Some(Some(label)) => format!(
-                "{label}: click or Enter · Shift to keep picking · ↑↓ to move · Esc to cancel"
+                "{label}: click or Enter · Shift to keep picking · ↑↓ to move · ←→ for block or sentence · {escape}"
             )
             .into(),
-            _ => "Point at a block · ↑↓ to move · Esc to cancel".into(),
+            _ => format!("Point at a block · ↑↓ to move · {escape}").into(),
         })
     }
 
@@ -793,20 +1181,7 @@ impl TerminalView {
         if !self.takes_mouse_for_text_block_pick() {
             return;
         }
-        let Some(point) = self
-            .text_block_pick
-            .as_ref()
-            .and_then(|pick| pick.position)
-            .and_then(|position| self.grid_point(position, cx))
-        else {
-            return;
-        };
-        self.picked_text_block = self
-            .text_block_at(point, cx)
-            .map(|block| PickedTextBlock {
-                block,
-                anchor: point,
-            });
+        self.picked_text_block = self.picked_text(cx);
     }
 
     fn shows_workspace_actions(&self) -> bool {
@@ -2013,27 +2388,31 @@ impl Render for TerminalView {
                     }),
             )
             .when_some(self.text_block_pick_hint(cx), |this, hint| {
-                    let colors = cx.theme().colors();
-                    this.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .border_1()
-                            .border_color(colors.border_focused),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom_1()
-                            .right_3()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.elevated_surface_background)
-                            .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)),
-                    )
+                let colors = cx.theme().colors();
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_1()
+                        .border_color(colors.border_focused),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_1()
+                        .right_3()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.elevated_surface_background)
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
+                        .children(self.render_text_block_level_buttons(cx)),
+                )
             })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
@@ -2044,6 +2423,37 @@ impl Render for TerminalView {
                 )
                 .with_priority(1)
             }))
+    }
+}
+
+impl TerminalView {
+    /// Switches between picking blocks and picking sentences, for pointer
+    /// users who don't know the keys.
+    fn render_text_block_level_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let current_level = self.text_block_pick_level()?;
+        let button = |id: &'static str, label: &'static str, level: TextBlockLevel| {
+            Button::new(id, label)
+                .label_size(LabelSize::XSmall)
+                .toggle_state(current_level == level)
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.set_text_block_pick_level(level, cx)
+                }))
+        };
+        Some(
+            h_flex()
+                .gap_0p5()
+                .child(button(
+                    "text-block-level-block",
+                    "Block",
+                    TextBlockLevel::Block,
+                ))
+                .child(button(
+                    "text-block-level-sentence",
+                    "Sentence",
+                    TextBlockLevel::Sentence,
+                ))
+                .into_any_element(),
+        )
     }
 }
 
@@ -2793,6 +3203,118 @@ mod tests {
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
+    fn grid_row(line: i32, text: &str, wraps: bool) -> GridRow {
+        GridRow {
+            line,
+            characters: text.chars().collect(),
+            wide_char_spacers: Vec::new(),
+            wraps,
+        }
+    }
+
+    #[test]
+    fn test_sentence_rows() {
+        let grid_rows = [
+            grid_row(0, "One. Two is", true),
+            grid_row(1, "wrapped. Three", false),
+            grid_row(2, "No stop", false),
+        ];
+        let block_rows = [(0, 0..=10), (1, 0..=13), (2, 0..=6)];
+        assert_eq!(
+            sentence_rows(&block_rows, &grid_rows),
+            vec![
+                vec![(0, 0..=3)],
+                vec![(0, 5..=10), (1, 0..=7)],
+                vec![(1, 9..=13)],
+                vec![(2, 0..=6)],
+            ],
+            "a wrapped row carries a sentence on, while a line break ends one"
+        );
+    }
+
+    #[test]
+    fn test_sentence_rows_join_rows_the_program_wrapped() {
+        let grid_rows = [
+            grid_row(0, "Ran the build and it failed  ", false),
+            grid_row(1, "  with an error. Retry it.   ", false),
+            grid_row(2, "ERROR at line 3              ", false),
+            grid_row(3, "Short line                   ", false),
+            grid_row(4, "next line                    ", false),
+        ];
+        let block_rows = [
+            (0, 0..=27),
+            (1, 2..=25),
+            (2, 0..=14),
+            (3, 0..=9),
+            (4, 0..=8),
+        ];
+        assert_eq!(
+            sentence_rows(&block_rows, &grid_rows),
+            vec![
+                vec![(0, 0..=27), (1, 2..=15)],
+                vec![(1, 17..=25)],
+                vec![(2, 0..=14)],
+                vec![(3, 0..=9)],
+                vec![(4, 0..=8)],
+            ],
+            "a long row without a full stop runs on into a lowercase row, while \
+             an uppercase row or a short row starts afresh"
+        );
+
+        let rows_ending_at_text = [(0, 0..=26), (1, 2..=25)];
+        assert_eq!(
+            sentence_rows(&rows_ending_at_text, &grid_rows)[0],
+            vec![(0, 0..=26), (1, 2..=15)],
+            "the program's line break should stand for a space"
+        );
+    }
+
+    #[test]
+    fn test_sentence_rows_keep_code_and_listings_apart() {
+        let grid_rows = [
+            grid_row(0, "drwxr-xr-x  5 user staff 160 some-long-name  ", false),
+            grid_row(1, "drwxr-xr-x  5 user staff 160 other-name      ", false),
+            grid_row(2, "fn long_name(arg: Type, other: Type) -> R {  ", false),
+            grid_row(3, "    let value = compute(arg);                ", false),
+        ];
+        let listing_rows = [(0, 0..=42), (1, 0..=38)];
+        assert_eq!(sentence_rows(&listing_rows, &grid_rows).len(), 2);
+        let code_rows = [(2, 0..=42), (3, 4..=28)];
+        assert_eq!(sentence_rows(&code_rows, &grid_rows).len(), 2);
+    }
+
+    #[test]
+    fn test_sentence_rows_check_the_whole_next_word() {
+        let joins = |next: &str| {
+            let grid_rows = [
+                grid_row(0, "Pick the option that you want  ", false),
+                grid_row(1, next, false),
+            ];
+            let next_end = next.trim_end().len().saturating_sub(1);
+            sentence_rows(&[(0, 0..=28), (1, 0..=next_end)], &grid_rows).len() == 1
+        };
+        assert!(joins("a long time ago."));
+        assert!(joins("others' positions and the questions."));
+        assert!(joins("don't stop."));
+        assert!(!joins("a) OAuth"));
+        assert!(!joins("x1 foo"));
+    }
+
+    #[test]
+    fn test_sentence_rows_skip_wide_char_spacers() {
+        // The spacer at column 1 holds a space in the grid.
+        let grid_rows = [GridRow {
+            line: 0,
+            characters: "界  x. Next.".chars().collect(),
+            wide_char_spacers: vec![1],
+            wraps: false,
+        }];
+        assert_eq!(
+            sentence_rows(&[(0, 0..=10)], &grid_rows),
+            vec![vec![(0, 0..=4)], vec![(0, 6..=10)]],
+        );
+    }
+
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
         for path in paths {
@@ -3247,7 +3769,10 @@ mod tests {
         cx.run_until_parked();
     }
 
-    fn picked_line(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Option<i32> {
+    fn picked_line(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<i32> {
         terminal_view.read_with(cx, |terminal_view, _| {
             let picked = terminal_view.picked_text_block.as_ref()?;
             Some(picked.block.rows.first()?.0)
@@ -3255,9 +3780,7 @@ mod tests {
     }
 
     fn is_picking(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> bool {
-        terminal_view.read_with(cx, |terminal_view, _| {
-            terminal_view.is_picking_text_block()
-        })
+        terminal_view.read_with(cx, |terminal_view, _| terminal_view.is_picking_text_block())
     }
 
     #[gpui::test]
@@ -3290,7 +3813,10 @@ mod tests {
 
         cx.simulate_keystrokes("a");
         cx.run_until_parked();
-        assert!(!is_picking(&terminal_view, &mut cx), "typing should end the pick");
+        assert!(
+            !is_picking(&terminal_view, &mut cx),
+            "typing should end the pick"
+        );
         assert_eq!(picked_line(&terminal_view, &mut cx), None);
     }
 
@@ -3363,9 +3889,15 @@ mod tests {
         click(cell(1.5), &mut cx);
         assert_eq!(
             actions.borrow().as_slice(),
-            &[(Range::new(Point::new(0, 0), Point::new(0, 4)), "hello".into())]
+            &[(
+                Range::new(Point::new(0, 0), Point::new(0, 4)),
+                "hello".into()
+            )]
         );
-        assert!(!is_picking(&terminal_view, &mut cx), "a click should end the pick");
+        assert!(
+            !is_picking(&terminal_view, &mut cx),
+            "a click should end the pick"
+        );
         assert!(
             terminal
                 .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
@@ -3403,9 +3935,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_pick_click_released_off_the_terminal_keeps_later_releases(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_pick_click_released_off_the_terminal_keeps_later_releases(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
@@ -3429,7 +3959,10 @@ mod tests {
         );
         drag(cell(0.1), cell(4.9), &mut cx);
         assert_eq!(
-            terminal.read_with(&cx, |terminal, _| terminal.last_content.selection_text.clone()),
+            terminal.read_with(&cx, |terminal, _| terminal
+                .last_content
+                .selection_text
+                .clone()),
             Some("hello".into()),
             "a later drag should select again"
         );

@@ -14,10 +14,11 @@ use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_comments::{
-    AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, CancelTerminalCommentPick,
-    ClearPendingComments, CommentPopover, CommentTerminalSelection, ConfirmTerminalCommentTarget,
-    ConfirmTerminalCommentTargetAndContinue, InsertPendingComments,
-    SelectNextTerminalCommentTarget, SelectPreviousTerminalCommentTarget, TerminalComment,
+    AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, BackOutOfTerminalCommentPick,
+    CancelTerminalCommentPick, ClearPendingComments, CommentPopover, CommentTerminalSelection,
+    ConfirmTerminalCommentTarget, ConfirmTerminalCommentTargetAndContinue, InsertPendingComments,
+    SelectNextTerminalCommentTarget, SelectPreviousTerminalCommentTarget,
+    SelectTerminalCommentBlock, SelectTerminalCommentSentence, TerminalComment,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -84,9 +85,9 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, KeyContext,
-    MouseButton, Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle,
-    canvas, prelude::*, pulsating_between,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton,
+    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, canvas,
+    prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -101,7 +102,7 @@ use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::terminal_settings::TerminalSettings;
 use terminal::{Content as TerminalContent, Event as TerminalEvent};
 use terminal_view::terminal_element::scaled_font_size;
-use terminal_view::{TerminalView, TextBlock};
+use terminal_view::{GutterMarker, TerminalView, TextBlock, TextBlockLevel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -797,17 +798,17 @@ fn scrollback_row(content: &TerminalContent, line: i32) -> i64 {
 }
 
 /// The text on screen without whitespace and box borders, with the grid
-/// line of each byte. Whitespace and line breaks are left out because a
+/// point of each byte. Whitespace and line breaks are left out because a
 /// resize changes them: lines rewrap and TUIs redraw with other padding.
 struct ScreenText {
     text: String,
-    byte_lines: Vec<i32>,
+    byte_points: Vec<terminal::Point>,
 }
 
 impl ScreenText {
     fn new(content: &TerminalContent) -> Self {
         let mut text = String::new();
-        let mut byte_lines = Vec::new();
+        let mut byte_points = Vec::new();
         for cell in &content.cells {
             // Selected text includes a cell's zero-width characters, such as
             // the U+FE0F in "➡️", so they must be here for comments to match.
@@ -816,20 +817,23 @@ impl ScreenText {
             for character in characters {
                 if !is_ignored_by_anchor(character) {
                     text.push(character);
-                    byte_lines.extend(std::iter::repeat_n(cell.point.line, character.len_utf8()));
+                    byte_points.extend(std::iter::repeat_n(cell.point, character.len_utf8()));
                 }
             }
         }
-        Self { text, byte_lines }
+        Self { text, byte_points }
     }
 
-    /// The grid lines that show a terminal comment's text, closest to where
-    /// it was made.
-    fn comment_lines(
+    /// The first and last grid points of a terminal comment's text, where
+    /// it shows closest to where it was made. A comment on whole lines covers
+    /// them from the first column to the last. A comment on part of a line is
+    /// only found at its column, so a short sentence doesn't move to the same
+    /// text in another place on its line.
+    fn comment_span(
         &self,
         comment: &TerminalComment,
         content: &TerminalContent,
-    ) -> Option<std::ops::RangeInclusive<i32>> {
+    ) -> Option<(terminal::Point, terminal::Point)> {
         let anchor = comment
             .quoted_text
             .chars()
@@ -841,20 +845,43 @@ impl ScreenText {
         self.text
             .match_indices(&anchor)
             .filter_map(|(start, matched)| {
-                let first_line = *self.byte_lines.get(start)?;
-                let last_line = *self.byte_lines.get(start + matched.len() - 1)?;
-                Some(first_line..=last_line)
+                let first = *self.byte_points.get(start)?;
+                let last = *self.byte_points.get(start + matched.len() - 1)?;
+                match comment.start_column {
+                    Some(start_column) => (first.column == start_column).then_some((first, last)),
+                    None => Some((
+                        terminal::Point::new(first.line, 0),
+                        terminal::Point::new(last.line, usize::MAX),
+                    )),
+                }
             })
-            .min_by_key(|lines| (scrollback_row(content, *lines.start()) - comment.first_row).abs())
+            .min_by_key(|(start, _)| {
+                (scrollback_row(content, start.line) - comment.first_row).abs()
+            })
     }
 }
 
+/// The comments whose text is on screen, with their spans, in the order of
+/// their first lines.
+fn visible_terminal_comments<'a>(
+    comments: impl Iterator<Item = &'a TerminalComment>,
+    content: &TerminalContent,
+) -> Vec<(&'a TerminalComment, (terminal::Point, terminal::Point))> {
+    let screen_text = ScreenText::new(content);
+    comments
+        .filter_map(|comment| Some((comment, screen_text.comment_span(comment, content)?)))
+        .sorted_by_key(|(_, (start, _))| *start)
+        .collect()
+}
+
+/// One marker per run of overlapping commented lines, counting the
+/// comments on them.
 fn terminal_comment_markers(
     store: &Entity<AgentCommentStore>,
     terminal_entity_id: EntityId,
     content: &TerminalContent,
     cx: &App,
-) -> Vec<(std::ops::RangeInclusive<i32>, Hsla)> {
+) -> Vec<GutterMarker> {
     let mut comments = store
         .read(cx)
         .terminal_comments(terminal_entity_id)
@@ -865,15 +892,39 @@ fn terminal_comment_markers(
         return Vec::new();
     }
     let color = agent_comments::agent_comment_color(cx.theme());
-    let screen_text = ScreenText::new(content);
-    comments
-        .filter_map(|comment| Some((screen_text.comment_lines(comment, content)?, color)))
-        .collect()
+    let mut markers: Vec<GutterMarker> = Vec::new();
+    for (_, (start, end)) in visible_terminal_comments(comments, content) {
+        match markers.last_mut() {
+            Some(marker) if start.line <= *marker.lines.end() => {
+                marker.lines = *marker.lines.start()..=end.line.max(*marker.lines.end());
+                marker.count += 1;
+            }
+            _ => markers.push(GutterMarker {
+                lines: start.line..=end.line,
+                color,
+                count: 1,
+            }),
+        }
+    }
+    markers
 }
+
+fn spans_overlap(
+    (start, end): (terminal::Point, terminal::Point),
+    (other_start, other_end): (terminal::Point, terminal::Point),
+) -> bool {
+    start <= other_end && other_start <= end
+}
+
+/// The characters of a quote that the menu of comments under a gutter
+/// marker shows.
+const MAX_COMMENT_MENU_QUOTE: usize = 60;
 
 enum TerminalCommentPickAction {
     Move { forward: bool },
     Confirm { keep_picking: bool },
+    Level(TextBlockLevel),
+    BackOut,
     Cancel,
 }
 
@@ -911,12 +962,16 @@ fn terminal_comment_text_block(
     let first_line = block_rows.first()?.0;
     let last_line = block_rows.last()?.0;
     let edits_comment = store.upgrade().is_some_and(|store| {
-        let screen_text = ScreenText::new(content);
-        store
-            .read(cx)
-            .terminal_comments(terminal_entity_id)
-            .filter_map(|comment| screen_text.comment_lines(comment, content))
-            .any(|lines| *lines.start() <= last_line && first_line <= *lines.end())
+        let block_span = (
+            terminal::Point::new(first_line, 0),
+            terminal::Point::new(last_line, usize::MAX),
+        );
+        visible_terminal_comments(
+            store.read(cx).terminal_comments(terminal_entity_id),
+            content,
+        )
+        .into_iter()
+        .any(|(comment, span)| comment.start_column.is_none() && spans_overlap(span, block_span))
     });
     Some(TextBlock {
         rows: block_rows,
@@ -1360,6 +1415,9 @@ pub struct AgentPanel {
     _agent_comment_store_subscription: Subscription,
     /// The comment input opened from the visible terminal thread.
     terminal_comment: Option<CommentPopover>,
+    /// Lists the comments under a gutter marker that stands for more than
+    /// one, to pick the one to open.
+    terminal_comment_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     _agent_comment_stores_subscription: Subscription,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
@@ -1834,6 +1892,7 @@ impl AgentPanel {
             agent_comment_store,
             _agent_comment_store_subscription,
             terminal_comment: None,
+            terminal_comment_menu: None,
             _agent_comment_stores_subscription,
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
@@ -8061,6 +8120,16 @@ impl AgentPanel {
                     cx,
                 );
             }
+            TerminalCommentPickAction::Level(level) => {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.set_text_block_pick_level(level, cx)
+                });
+            }
+            TerminalCommentPickAction::BackOut => {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.back_out_of_text_block_pick(cx)
+                });
+            }
             TerminalCommentPickAction::Cancel => {
                 terminal_view.update(cx, |terminal_view, cx| {
                     terminal_view.cancel_text_block_pick(cx)
@@ -8125,6 +8194,22 @@ impl AgentPanel {
                 },
                 cx,
             );
+            terminal_view.on_gutter_marker_click({
+                let panel = panel.clone();
+                move |lines, position, window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.open_terminal_comments_at_marker(
+                                terminal_id,
+                                lines,
+                                position,
+                                window,
+                                cx,
+                            )
+                        })
+                        .log_err();
+                }
+            });
             terminal_view.on_selection_action(
                 "Comment for Agent",
                 move |range, text, position, window, cx| {
@@ -8147,7 +8232,8 @@ impl AgentPanel {
     }
 
     /// Comments on text selected in a terminal thread, or edits the comment
-    /// on a selected row, since comments don't overlap.
+    /// of the same kind on the selected text. A sentence of a block gets a
+    /// comment of its own on part of a line.
     fn open_terminal_comment(
         &mut self,
         terminal_id: TerminalId,
@@ -8173,21 +8259,101 @@ impl AgentPanel {
         let terminal = terminal_view.read(cx).terminal().clone();
         let terminal_entity_id = terminal.entity_id();
         let content = terminal.read(cx).last_content();
-        let screen_text = ScreenText::new(content);
-        let selected_lines = range.start().line..=range.end().line;
-        let existing = store
+        // A sentence is commented on where it is, since it's often short
+        // enough to show elsewhere too, while other text follows its text.
+        let start_column = terminal_view
             .read(cx)
-            .terminal_comments(terminal_entity_id)
-            .filter_map(|comment| {
-                let lines = screen_text.comment_lines(comment, content)?;
-                (lines.start() <= selected_lines.end() && selected_lines.start() <= lines.end())
-                    .then(|| (*lines.start(), comment))
-            })
-            .min_by_key(|(first_line, _)| *first_line)
-            .map(|(_, comment)| comment.clone());
+            .is_text_block_sentence(range, cx)
+            .then_some(range.start().column);
+        let selected_span = match start_column {
+            Some(_) => (range.start(), range.end()),
+            None => (
+                terminal::Point::new(range.start().line, 0),
+                terminal::Point::new(range.end().line, usize::MAX),
+            ),
+        };
+        // Sentence comments and whole-line comments sit side by side, so a
+        // pick only edits a comment of its own kind.
+        let existing = visible_terminal_comments(
+            store.read(cx).terminal_comments(terminal_entity_id),
+            content,
+        )
+        .into_iter()
+        .filter(|(comment, span)| {
+            comment.start_column.is_some() == start_column.is_some()
+                && spans_overlap(*span, selected_span)
+        })
+        .min_by_key(|(_, (start, _))| {
+            (
+                (start.line - range.start().line).abs(),
+                start.column.abs_diff(range.start().column),
+            )
+        })
+        .map(|(comment, _)| comment.clone());
         let first_row = scrollback_row(content, range.start().line);
 
-        let on_close = move |panel: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+        if let Some(comment) = existing {
+            self.edit_terminal_comment(terminal_id, &comment, position, window, cx);
+            return;
+        }
+        self.resume_terminal_text_blocks(cx);
+        self.terminal_comment_menu = None;
+        self.terminal_comment = Some(CommentPopover::new_terminal(
+            terminal_entity_id,
+            first_row,
+            start_column,
+            text,
+            position,
+            workspace.downgrade(),
+            window,
+            cx,
+            Self::terminal_comment_closed(terminal_id),
+        ));
+        // Otherwise the pointer resting on the comment input would target
+        // the text under it.
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.set_text_block_suspended(true, cx)
+        });
+        cx.notify();
+    }
+
+    fn edit_terminal_comment(
+        &mut self,
+        terminal_id: TerminalId,
+        comment: &TerminalComment,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_view) = self
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.view.clone())
+        else {
+            return;
+        };
+        self.resume_terminal_text_blocks(cx);
+        self.terminal_comment_menu = None;
+        self.terminal_comment = CommentPopover::edit_terminal(
+            comment,
+            position,
+            self.workspace.upgrade().as_ref(),
+            window,
+            cx,
+            Self::terminal_comment_closed(terminal_id),
+        );
+        if self.terminal_comment.is_some() {
+            terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.set_text_block_suspended(true, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn terminal_comment_closed(
+        terminal_id: TerminalId,
+    ) -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static {
+        move |panel, window, cx| {
             if let Some(terminal) = panel.terminals.get(&terminal_id) {
                 terminal
                     .view
@@ -8197,36 +8363,86 @@ impl AgentPanel {
                     .update(cx, |terminal, _| terminal.clear_selection());
             }
             panel.close_terminal_comment(window, cx)
-        };
-        self.resume_terminal_text_blocks(cx);
-        self.terminal_comment = match existing {
-            Some(comment) => CommentPopover::edit_terminal(
-                &comment,
-                position,
-                Some(&workspace),
-                window,
-                cx,
-                on_close,
-            ),
-            None => Some(CommentPopover::new_terminal(
-                terminal_entity_id,
-                first_row,
-                text,
-                position,
-                workspace.downgrade(),
-                window,
-                cx,
-                on_close,
-            )),
-        };
-        if self.terminal_comment.is_some() {
-            // Otherwise the pointer resting on the comment input would target
-            // the text under it.
-            terminal_view.update(cx, |terminal_view, cx| {
-                terminal_view.set_text_block_suspended(true, cx)
-            });
         }
-        cx.notify();
+    }
+
+    /// Opens the comment under a gutter marker, or when the marker stands
+    /// for more than one, a menu of their quotes to pick the one to open.
+    fn open_terminal_comments_at_marker(
+        &mut self,
+        terminal_id: TerminalId,
+        lines: std::ops::RangeInclusive<i32>,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let terminal = terminal.view.read(cx).terminal().clone();
+        let terminal_entity_id = terminal.entity_id();
+        let marker_span = (
+            terminal::Point::new(*lines.start(), 0),
+            terminal::Point::new(*lines.end(), usize::MAX),
+        );
+        let comments = visible_terminal_comments(
+            self.agent_comment_store
+                .read(cx)
+                .terminal_comments(terminal_entity_id),
+            terminal.read(cx).last_content(),
+        )
+        .into_iter()
+        .filter(|(_, span)| spans_overlap(*span, marker_span))
+        .map(|(comment, _)| comment.clone())
+        .collect::<Vec<_>>();
+        match comments.as_slice() {
+            [] => {}
+            [comment] => self.edit_terminal_comment(terminal_id, comment, position, window, cx),
+            _ => {
+                let panel = cx.entity().downgrade();
+                let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    for comment in comments {
+                        let quote = comment.quoted_text.split_whitespace().join(" ");
+                        let label = match quote.char_indices().nth(MAX_COMMENT_MENU_QUOTE) {
+                            Some((end, _)) => format!("{}…", &quote[..end]),
+                            None => quote,
+                        };
+                        let panel = panel.clone();
+                        menu = menu.entry(label, None, move |window, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.edit_terminal_comment(
+                                        terminal_id,
+                                        &comment,
+                                        position,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        });
+                    }
+                    menu
+                });
+                window.focus(&menu.focus_handle(cx), cx);
+                let subscription = cx.subscribe_in(
+                    &menu,
+                    window,
+                    move |panel, _, _: &gpui::DismissEvent, window, cx| {
+                        panel.terminal_comment_menu = None;
+                        // An entry opens a comment input, which takes focus.
+                        if panel.terminal_comment.is_none()
+                            && let Some(terminal) = panel.terminals.get(&terminal_id)
+                        {
+                            window.focus(&terminal.view.focus_handle(cx), cx);
+                        }
+                        cx.notify();
+                    },
+                );
+                self.terminal_comment_menu = Some((menu, position, subscription));
+                cx.notify();
+            }
+        }
     }
 
     /// Resumes the text block targets that the closed comment input suspended.
@@ -8813,6 +9029,33 @@ impl Render for AgentPanel {
                     );
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &BackOutOfTerminalCommentPick, window, cx| {
+                    this.handle_terminal_comment_pick_action(
+                        TerminalCommentPickAction::BackOut,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectTerminalCommentSentence, window, cx| {
+                    this.handle_terminal_comment_pick_action(
+                        TerminalCommentPickAction::Level(TextBlockLevel::Sentence),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectTerminalCommentBlock, window, cx| {
+                    this.handle_terminal_comment_pick_action(
+                        TerminalCommentPickAction::Level(TextBlockLevel::Block),
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
@@ -8982,6 +9225,19 @@ impl Render for AgentPanel {
                 self.terminal_comment
                     .as_ref()
                     .map(|popover| popover.render()),
+            )
+            .children(
+                self.terminal_comment_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| {
+                        gpui::deferred(
+                            gpui::anchored()
+                                .position(*position)
+                                .anchor(gpui::Anchor::TopLeft)
+                                .child(menu.clone()),
+                        )
+                        .with_priority(1)
+                    }),
             );
 
         match self.visible_font_size() {
@@ -14791,7 +15047,7 @@ mod tests {
                 cx,
             )
             .into_iter()
-            .map(|(lines, _)| lines)
+            .map(|marker| marker.lines)
             .collect()
         })
     }
@@ -15227,7 +15483,9 @@ mod tests {
                     ConfirmTerminalCommentTargetAndContinue,
                     pick_context,
                 ),
-                gpui::KeyBinding::new("escape", CancelTerminalCommentPick, pick_context),
+                gpui::KeyBinding::new("right", SelectTerminalCommentSentence, pick_context),
+                gpui::KeyBinding::new("left", SelectTerminalCommentBlock, pick_context),
+                gpui::KeyBinding::new("escape", BackOutOfTerminalCommentPick, pick_context),
             ])
         });
     }
@@ -15276,6 +15534,139 @@ mod tests {
     }
 
     const AUTH_QUESTION: &str = "1. Which auth?\r\n   a) OAuth\r\n   b) API key\r\n";
+
+    fn terminal_comment_columns(
+        workspace: &Entity<Workspace>,
+        terminal: &Entity<terminal::Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Option<usize>> {
+        let store = workspace_comment_store(workspace, cx);
+        store.read_with(cx, |store, _| {
+            store
+                .terminal_comments(terminal.entity_id())
+                .map(|comment| comment.start_column)
+                .collect()
+        })
+    }
+
+    fn comment_on_pick(keys: &str, body: &str, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes(keys);
+        cx.simulate_input(body);
+        cx.dispatch_action(agent_comments::Submit);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_comments_on_sentences(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "Build failed. Fix the path.\r\n", &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m right enter", "First.", &mut cx);
+        comment_on_pick("ctrl-alt-m right down enter", "Second.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Build failed.".to_string(), "Fix the path.".to_string()],
+            "right should pick the block's first sentence, and down the next one"
+        );
+        assert_eq!(
+            terminal_comment_columns(&workspace, &terminal, &mut cx),
+            vec![Some(0), Some(14)],
+        );
+        let marker_counts = panel.read_with(&cx, |panel, cx| {
+            terminal_comment_markers(
+                &panel.agent_comment_store,
+                terminal.entity_id(),
+                terminal.read(cx).last_content(),
+                cx,
+            )
+            .into_iter()
+            .map(|marker| (marker.lines, marker.count))
+            .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            marker_counts,
+            vec![(0..=0, 2)],
+            "comments on one line should share a marker that counts them"
+        );
+
+        comment_on_pick("ctrl-alt-m right down enter", "Edited.", &mut cx);
+        let store = workspace_comment_store(&workspace, &mut cx);
+        store.read_with(&cx, |store, _| {
+            let bodies = store
+                .terminal_comments(terminal.entity_id())
+                .map(|comment| comment.body.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bodies,
+                vec!["First.".to_string(), "Second.Edited.".to_string()],
+                "picking a commented sentence should edit its comment"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_block_keeps_whole_line_comments(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "Build failed. Fix the path.\r\n", &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m right left enter", "Whole.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Build failed. Fix the path.".to_string()],
+        );
+        assert_eq!(
+            terminal_comment_columns(&workspace, &terminal, &mut cx),
+            vec![None],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sentence_comment_stays_where_it_was_made(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "Retry. Done.\r\n", &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+        comment_on_pick("ctrl-alt-m right enter", "Why?", &mut cx);
+        assert_eq!(terminal_marker_lines(&panel, &terminal, &mut cx), [0..=0]);
+
+        write_terminal_output(&terminal, "\x1b[H\x1b[2JOther. Retry.\r\n", &mut cx);
+        assert_eq!(
+            terminal_marker_lines(&panel, &terminal, &mut cx),
+            Vec::<std::ops::RangeInclusive<i32>>::new(),
+            "a sentence comment shouldn't move to the same text elsewhere"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_escape_backs_out_of_a_sentence_pick(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, _terminal) =
+            open_terminal_with_output(&panel, "Build failed. Fix the path.\r\n", &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-alt-m right escape");
+        assert!(
+            terminal_picking(&panel, terminal_id, &mut cx),
+            "escape should go back to the block"
+        );
+        let level = panel.read_with(&cx, |panel, cx| {
+            panel.terminals[&terminal_id]
+                .view
+                .read(cx)
+                .text_block_pick_level()
+        });
+        assert_eq!(level, Some(TextBlockLevel::Block));
+        cx.simulate_keystrokes("escape");
+        assert!(!terminal_picking(&panel, terminal_id, &mut cx));
+    }
 
     #[gpui::test]
     async fn test_comment_terminal_selection_key_comments_on_the_selection(

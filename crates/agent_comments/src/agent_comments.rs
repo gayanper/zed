@@ -62,6 +62,13 @@ actions!(
         ConfirmTerminalCommentTargetAndContinue,
         /// Ends the terminal comment pick.
         CancelTerminalCommentPick,
+        /// Picks a sentence of the picked terminal block.
+        SelectTerminalCommentSentence,
+        /// Picks the whole terminal block the picked sentence is in.
+        SelectTerminalCommentBlock,
+        /// Goes from a picked sentence back to its terminal block, else ends
+        /// the pick.
+        BackOutOfTerminalCommentPick,
     ]
 );
 
@@ -146,6 +153,10 @@ pub struct TerminalComment {
     /// When the text shows in more than one place, the place closest to this
     /// row is taken.
     pub first_row: i64,
+    /// The column the commented text starts at on `first_row`, for a
+    /// comment on part of a line. Such a comment is only found where it was
+    /// made, so it never moves to the same text elsewhere.
+    pub start_column: Option<usize>,
     /// The commented text, kept as it was when the comment was made.
     pub quoted_text: String,
     pub body: String,
@@ -235,6 +246,7 @@ impl AgentCommentStore {
         &mut self,
         terminal_id: EntityId,
         first_row: i64,
+        start_column: Option<usize>,
         quoted_text: String,
         body: String,
         cx: &mut Context<Self>,
@@ -244,6 +256,7 @@ impl AgentCommentStore {
             id,
             terminal_id,
             first_row,
+            start_column,
             quoted_text,
             body,
         });
@@ -1603,6 +1616,7 @@ impl CommentPopover {
     pub fn new_terminal<V: 'static>(
         terminal_id: EntityId,
         first_row: i64,
+        start_column: Option<usize>,
         quoted_text: String,
         position: Point<Pixels>,
         workspace: WeakEntity<Workspace>,
@@ -1623,6 +1637,7 @@ impl CommentPopover {
                     store.add_terminal(
                         terminal_id,
                         first_row,
+                        start_column,
                         quoted_text.clone(),
                         body.clone(),
                         cx,
@@ -2092,6 +2107,7 @@ mod tests {
             store.add_terminal(
                 terminal_id,
                 first_row,
+                None,
                 format!("quoted {body}"),
                 body.to_string(),
                 cx,

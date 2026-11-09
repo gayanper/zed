@@ -4,9 +4,9 @@ use gpui::{
     ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement,
     LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    Point as GpuiPoint, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
+    point, px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -28,9 +28,7 @@ use workspace::Workspace;
 use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
-use crate::{
-    BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView,
-};
+use crate::{BlockContext, BlockProperties, ContentMode, GutterMarker, TerminalMode, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -46,7 +44,8 @@ pub struct LayoutState {
     display_offset: usize,
     hyperlink_tooltip: Option<AnyElement>,
     block_below_cursor_element: Option<AnyElement>,
-    gutter_markers: Vec<(RangeInclusive<usize>, Hsla)>,
+    /// Visible rows, color and count of each gutter marker.
+    gutter_markers: Vec<(RangeInclusive<usize>, Hsla, usize)>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
 }
@@ -974,6 +973,13 @@ impl TerminalElement {
                     terminal_view.swallow_left_mouse_up = false;
                 });
 
+                if open_gutter_marker(&terminal_view, e.position, window, cx) {
+                    terminal_view.update(cx, |terminal_view, _| {
+                        terminal_view.swallow_left_mouse_up = true;
+                    });
+                    return;
+                }
+
                 if terminal_view.read(cx).takes_mouse_for_text_block_pick() {
                     terminal_view.update(cx, |terminal_view, _| {
                         terminal_view.swallow_left_mouse_up = true;
@@ -1437,7 +1443,7 @@ impl Element for TerminalElement {
                     .read(cx)
                     .picked_text_block
                     .as_ref()
-                    .map(|picked| (picked.block.clone(), picked.anchor));
+                    .map(|picked| (picked.block.clone(), picked.parent.clone()));
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
@@ -1471,9 +1477,21 @@ impl Element for TerminalElement {
                         .push((selection.point_range(), player_color.selection));
                 }
                 let text_block_marker_color = theme.colors().text_accent;
-                if let Some((block, _)) = &text_block {
-                    let tint = theme.colors().ghost_element_hover;
-                    for (line, columns) in &block.rows {
+                if let Some((block, parent)) = &text_block {
+                    // A picked sentence stands out from the rest of its block.
+                    let parent_rows = parent.iter().flat_map(|parent| &parent.rows);
+                    let tints = parent_rows
+                        .map(|row| (row, theme.colors().ghost_element_hover))
+                        .chain(block.rows.iter().map(|row| {
+                            let tint = if parent.is_some() {
+                                theme.colors().ghost_element_selected
+                            } else {
+                                theme.colors().ghost_element_hover
+                            };
+                            (row, tint)
+                        }))
+                        .collect::<Vec<_>>();
+                    for ((line, columns), tint) in tints {
                         relative_highlighted_ranges.push((
                             Range::new(
                                 Point::new(*line, *columns.start()),
@@ -1652,16 +1670,23 @@ impl Element for TerminalElement {
                     Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
                     None => Vec::new(),
                 };
-                let text_block_marker = text_block
-                    .as_ref()
-                    .and_then(|(block, _)| Some((block.lines()?, text_block_marker_color)));
+                let text_block_marker = text_block.as_ref().and_then(|(block, _)| {
+                    Some(GutterMarker {
+                        lines: block.lines()?,
+                        color: text_block_marker_color,
+                        count: 1,
+                    })
+                });
                 let gutter_markers = gutter_markers
                     .iter()
                     .chain(text_block_marker.as_ref())
-                    .filter_map(|(lines, color)| {
-                        let rows =
-                            gutter_marker_rows(lines, display_offset, dimensions.num_lines())?;
-                        Some((rows, *color))
+                    .filter_map(|marker| {
+                        let rows = gutter_marker_rows(
+                            &marker.lines,
+                            display_offset,
+                            dimensions.num_lines(),
+                        )?;
+                        Some((rows, marker.color, marker.count))
                     })
                     .collect();
 
@@ -1731,7 +1756,11 @@ impl Element for TerminalElement {
                 && self.terminal_view.read(cx).hover.is_some()
             {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
-            } else if self.terminal_view.read(cx).takes_mouse_for_text_block_pick() {
+            } else if self
+                .terminal_view
+                .read(cx)
+                .takes_mouse_for_text_block_pick()
+            {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
             } else {
                 window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
@@ -1790,14 +1819,51 @@ impl Element for TerminalElement {
 
                     let marker_width = px(2.);
                     let marker_x = origin.x - (layout.dimensions.cell_width + marker_width) / 2.;
-                    for (rows, color) in &layout.gutter_markers {
+                    for (rows, color, count) in &layout.gutter_markers {
                         let line_height = layout.dimensions.line_height;
-                        let top = origin.y + *rows.start() as f32 * line_height;
-                        let height = (rows.end() - rows.start() + 1) as f32 * line_height;
-                        window.paint_quad(fill(
-                            Bounds::new(point(marker_x, top), size(marker_width, height)),
-                            *color,
-                        ));
+                        let mut top = origin.y + *rows.start() as f32 * line_height;
+                        let mut height = (rows.end() - rows.start() + 1) as f32 * line_height;
+                        if *count > 1 {
+                            // The count takes the marker's first row.
+                            let count_text = SharedString::from(count.to_string());
+                            let mut style = layout.base_text_style.clone();
+                            style.color = *color;
+                            let font_size = style.font_size.to_pixels(window.rem_size()) * 0.8;
+                            let shaped = window.text_system().shape_line(
+                                count_text.clone(),
+                                font_size,
+                                &[TextRun {
+                                    len: count_text.len(),
+                                    font: style.font(),
+                                    color: *color,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }],
+                                None,
+                            );
+                            let gutter_left = origin.x - layout.dimensions.cell_width;
+                            let x = gutter_left
+                                + (layout.dimensions.cell_width - shaped.width).max(px(0.)) / 2.;
+                            shaped
+                                .paint(
+                                    point(x, top),
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .log_err();
+                            top += line_height;
+                            height -= line_height;
+                        }
+                        if height > px(0.) {
+                            window.paint_quad(fill(
+                                Bounds::new(point(marker_x, top), size(marker_width, height)),
+                                *color,
+                            ));
+                        }
                     }
 
                     // Paint batched text runs instead of individual cells
@@ -2151,6 +2217,42 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
 /// which keeps it clear of the text it's for.
 fn action_anchor_size(window: &mut Window, cx: &mut App) -> Pixels {
     IconSize::Small.square(window, cx) + px(6.)
+}
+
+/// Runs the gutter marker click handler for a click in the gutter on a
+/// marker, and returns whether it ran.
+fn open_gutter_marker(
+    terminal_view: &Entity<TerminalView>,
+    position: GpuiPoint<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let view = terminal_view.read(cx);
+    let Some(handler) = view.gutter_marker_click.clone() else {
+        return false;
+    };
+    let content = view.terminal().read(cx).last_content();
+    let bounds = content.terminal_bounds;
+    if position.x >= bounds.bounds.origin.x || bounds.line_height <= px(0.) {
+        return false;
+    }
+    let row =
+        ((position.y - bounds.bounds.origin.y + view.scroll_top) / bounds.line_height).floor();
+    if row < 0. {
+        return false;
+    }
+    let Some(line) = i32::try_from(row as i64)
+        .ok()
+        .zip(i32::try_from(content.display_offset).ok())
+        .map(|(row, display_offset)| row - display_offset)
+    else {
+        return false;
+    };
+    let Some(marker) = view.gutter_marker_at(line, cx) else {
+        return false;
+    };
+    handler(marker.lines, position, window, cx);
+    true
 }
 
 /// Runs the selection action on the picked text block, and keeps picking
