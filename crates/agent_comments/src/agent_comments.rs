@@ -62,12 +62,20 @@ actions!(
         ConfirmTerminalCommentTargetAndContinue,
         /// Ends the terminal comment pick.
         CancelTerminalCommentPick,
-        /// Picks a sentence of the picked terminal block.
-        SelectTerminalCommentSentence,
-        /// Picks the whole terminal block the picked sentence is in.
-        SelectTerminalCommentBlock,
-        /// Goes from a picked sentence back to its terminal block, else ends
-        /// the pick.
+        /// Picks a smaller part of the picked terminal text: a paragraph of
+        /// a message, or a sentence of a paragraph.
+        NarrowTerminalCommentPick,
+        /// Picks the paragraph or the message that the picked terminal text
+        /// is in.
+        WidenTerminalCommentPick,
+        /// Adds the picked terminal text to the texts to comment on together,
+        /// or takes it out, and moves the pick to the previous one.
+        ExtendTerminalCommentPickUp,
+        /// Adds the picked terminal text to the texts to comment on together,
+        /// or takes it out, and moves the pick to the next one.
+        ExtendTerminalCommentPickDown,
+        /// Clears the texts picked to comment on together, else goes back to
+        /// the paragraph or the message the pick is in, else ends the pick.
         BackOutOfTerminalCommentPick,
     ]
 );
@@ -157,9 +165,22 @@ pub struct TerminalComment {
     /// comment on part of a line. Such a comment is only found where it was
     /// made, so it never moves to the same text elsewhere.
     pub start_column: Option<usize>,
-    /// The commented text, kept as it was when the comment was made.
+    pub kind: TerminalCommentKind,
+    /// The commented text, kept as it was when the comment was made. Text
+    /// picked in separate places is joined with lines of `…` between.
     pub quoted_text: String,
     pub body: String,
+}
+
+/// What a terminal comment was made on. A pick only edits a comment of its
+/// own kind, since comments on a paragraph, on one of its sentences and on
+/// its whole lines sit side by side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalCommentKind {
+    /// Whole lines: a selection or a message.
+    Lines,
+    Paragraph,
+    Sentence,
 }
 
 impl TerminalComment {
@@ -247,6 +268,7 @@ impl AgentCommentStore {
         terminal_id: EntityId,
         first_row: i64,
         start_column: Option<usize>,
+        kind: TerminalCommentKind,
         quoted_text: String,
         body: String,
         cx: &mut Context<Self>,
@@ -257,6 +279,7 @@ impl AgentCommentStore {
             terminal_id,
             first_row,
             start_column,
+            kind,
             quoted_text,
             body,
         });
@@ -1617,6 +1640,7 @@ impl CommentPopover {
         terminal_id: EntityId,
         first_row: i64,
         start_column: Option<usize>,
+        kind: TerminalCommentKind,
         quoted_text: String,
         position: Point<Pixels>,
         workspace: WeakEntity<Workspace>,
@@ -1638,6 +1662,7 @@ impl CommentPopover {
                         terminal_id,
                         first_row,
                         start_column,
+                        kind,
                         quoted_text.clone(),
                         body.clone(),
                         cx,
@@ -2108,6 +2133,7 @@ mod tests {
                 terminal_id,
                 first_row,
                 None,
+                TerminalCommentKind::Lines,
                 format!("quoted {body}"),
                 body.to_string(),
                 cx,

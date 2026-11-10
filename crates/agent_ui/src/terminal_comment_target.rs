@@ -39,6 +39,8 @@ pub(crate) struct TargetRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommentTarget {
     pub rows: Vec<TargetRow>,
+    /// Runs of grid lines that are one paragraph each.
+    pub paragraphs: Vec<RangeInclusive<i32>>,
     /// The item continues past `rows`.
     pub truncated: bool,
 }
@@ -47,7 +49,6 @@ struct LogicalLine {
     /// Indices into the rows, of the rows the terminal wrapped this line over.
     rows: RangeInclusive<usize>,
     indent: Option<usize>,
-    has_marker: bool,
 }
 
 impl LogicalLine {
@@ -65,35 +66,6 @@ fn text_columns(characters: &[char]) -> Option<RangeInclusive<usize>> {
     Some(start..=end)
 }
 
-/// Whether text starts with a list marker followed by a space: a bullet,
-/// an agent's message or answer marker, or a number or letter followed by
-/// `.` or `)`.
-fn starts_with_marker(text: &[char]) -> bool {
-    const BULLETS: &[char] = &['-', '*', '•', '◦', '▪', '●', '⏺', '⎿', '>', '❯'];
-    let followed_by_space =
-        |index: usize| text.get(index).is_some_and(|character| *character == ' ');
-    let Some(first) = text.first() else {
-        return false;
-    };
-    if BULLETS.contains(first) {
-        return followed_by_space(1);
-    }
-    let digits = text
-        .iter()
-        .take_while(|character| character.is_ascii_digit())
-        .count();
-    let label_length = if (1..=3).contains(&digits) {
-        digits
-    } else if first.is_ascii_alphabetic() {
-        1
-    } else {
-        return false;
-    };
-    text.get(label_length)
-        .is_some_and(|character| *character == '.' || *character == ')')
-        && followed_by_space(label_length + 1)
-}
-
 fn logical_lines(rows: &[GridRow]) -> Vec<LogicalLine> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -102,24 +74,11 @@ fn logical_lines(rows: &[GridRow]) -> Vec<LogicalLine> {
         while end + 1 < rows.len() && rows[end].wraps {
             end += 1;
         }
-        let first_text = (start..=end).find_map(|index| {
-            let columns = text_columns(&rows[index].characters)?;
-            Some((index, columns))
-        });
-        let (indent, has_marker) = match first_text {
-            Some((index, columns)) => {
-                let text = &rows[index].characters[*columns.start()..];
-                (
-                    Some(*columns.start()),
-                    index == start && starts_with_marker(text),
-                )
-            }
-            None => (None, false),
-        };
+        let indent =
+            (start..=end).find_map(|index| Some(*text_columns(&rows[index].characters)?.start()));
         lines.push(LogicalLine {
             rows: start..=end,
             indent,
-            has_marker,
         });
         start = end + 1;
     }
@@ -250,27 +209,154 @@ fn pattern_block(
     (pointed <= last).then_some(start..=last)
 }
 
-/// The innermost list item that contains line `pointed`, with its marker
-/// on lines `first` to `pointed` and its end cut at line `last`.
-fn innermost_item(
-    lines: &[LogicalLine],
-    pointed: usize,
-    first: usize,
-    last: usize,
-) -> Option<RangeInclusive<usize>> {
-    (first..=pointed)
-        .rev()
-        .take_while(|index| !lines[*index].is_blank())
-        .filter(|index| lines[*index].has_marker)
-        .map(|marker| marker..=item_end(lines, marker).min(last))
-        .find(|item| *item.end() >= pointed)
+/// Markers that start an agent message or a user prompt: a message is the
+/// marker's line and the lines indented deeper below it.
+const MESSAGE_START_MARKERS: &[&str] = &["⏺ ", "● ", "❯ ", "> "];
+
+/// Decorations that TUIs draw at the start of a line, which aren't part of
+/// the text and are left out of targets. A `>` stays, since it's also how
+/// Markdown quotes text.
+const DECORATIONS: &[char] = &['⏺', '●', '⎿', '❯'];
+
+fn starts_message(rows: &[GridRow], lines: &[LogicalLine], index: usize) -> bool {
+    let text = match_text(rows, &lines[index]);
+    MESSAGE_START_MARKERS
+        .iter()
+        .any(|marker| text.starts_with(marker))
 }
 
-/// The block at `line`: the innermost list item, the block of the first of
-/// `patterns` that contains it, or else the line itself. Inside a pattern's
-/// block, a list item other than its first line is targeted on its own.
-/// `rows` are consecutive grid rows around `line`, and `more_below` says
-/// whether the grid continues after them.
+/// The lines of the message that contains line `pointed`: from the nearest
+/// line above that starts a message and is indented less than the lines
+/// after it, to before the next line indented as little.
+fn marked_message(
+    rows: &[GridRow],
+    lines: &[LogicalLine],
+    pointed: usize,
+) -> Option<RangeInclusive<usize>> {
+    // The outermost start wins, so a quote or a bullet nested in a message
+    // doesn't start a message of its own.
+    let mut least_indent_below = usize::MAX;
+    let mut start = None;
+    for index in (0..=pointed).rev() {
+        let Some(indent) = lines[index].indent else {
+            continue;
+        };
+        if starts_message(rows, lines, index) && (index == pointed || indent < least_indent_below) {
+            start = Some((index, indent));
+        }
+        if indent == 0 {
+            break;
+        }
+        least_indent_below = least_indent_below.min(indent);
+    }
+    let (start, start_indent) = start?;
+    let mut last = start;
+    for index in start + 1..lines.len() {
+        match lines[index].indent {
+            Some(indent) if indent <= start_indent => break,
+            Some(_) => last = index,
+            None => {}
+        }
+    }
+    Some(start..=last)
+}
+
+/// The run of lines with text that contains line `pointed`, without a
+/// message start in it, ending where the lines are indented less than its
+/// first.
+fn unmarked_block(
+    rows: &[GridRow],
+    lines: &[LogicalLine],
+    pointed: usize,
+) -> RangeInclusive<usize> {
+    let mut start = pointed;
+    while let Some(previous) = start.checked_sub(1)
+        && let (Some(previous_indent), Some(indent)) = (lines[previous].indent, lines[start].indent)
+        && previous_indent <= indent
+        && !starts_message(rows, lines, previous)
+    {
+        start = previous;
+    }
+    let start_indent = lines[start].indent.unwrap_or(0);
+    let mut last = start;
+    while let Some(next) = lines.get(last + 1)
+        && next.indent.is_some_and(|indent| indent >= start_indent)
+        && !starts_message(rows, lines, last + 1)
+    {
+        last += 1;
+    }
+    start..=last
+}
+
+/// The runs of lines in `message` that are one paragraph each: the blocks
+/// of `patterns`, and questions with the lines indented deeper below them,
+/// such as their options.
+fn paragraph_runs(
+    rows: &[GridRow],
+    lines: &[LogicalLine],
+    texts: &mut MatchTexts,
+    message: &RangeInclusive<usize>,
+    patterns: &[TerminalCommentPattern],
+) -> Vec<RangeInclusive<usize>> {
+    let mut runs = Vec::new();
+    let mut index = *message.start();
+    while index <= *message.end() {
+        let run = if lines[index].is_blank() {
+            None
+        } else if let Some(block) = patterns
+            .iter()
+            .find_map(|pattern| pattern_block(lines, texts, index, pattern))
+            .filter(|block| *block.start() == index)
+        {
+            Some(*block.start()..=(*block.end()).min(*message.end()))
+        } else if !starts_message(rows, lines, index)
+            && match_text(rows, &lines[index]).ends_with('?')
+        {
+            Some(index..=item_end(lines, index).min(*message.end()))
+        } else {
+            None
+        };
+        match run {
+            Some(run) => {
+                index = run.end() + 1;
+                if run.start() != run.end() {
+                    runs.push(run);
+                }
+            }
+            None => index += 1,
+        }
+    }
+    runs
+}
+
+/// The columns of a row's text, after a decoration it starts with.
+fn without_decoration(
+    characters: &[char],
+    columns: RangeInclusive<usize>,
+) -> RangeInclusive<usize> {
+    let start = *columns.start();
+    if !characters
+        .get(start)
+        .is_some_and(|character| DECORATIONS.contains(character))
+    {
+        return columns;
+    }
+    let text_start = (start + 1..=*columns.end()).find(|column| {
+        characters
+            .get(*column)
+            .is_some_and(|character| !character.is_whitespace())
+    });
+    match text_start {
+        Some(text_start) => text_start..=*columns.end(),
+        None => columns,
+    }
+}
+
+/// The message at `line`: an agent message or a user prompt with the lines
+/// below it, else the run of lines with text around it. Inside a message,
+/// the blocks of `patterns` and questions with their options are one
+/// paragraph each. `rows` are consecutive grid rows around `line`, and
+/// `more_below` says whether the grid continues after them.
 pub(crate) fn find_comment_target(
     rows: &[GridRow],
     line: i32,
@@ -286,15 +372,15 @@ pub(crate) fn find_comment_target(
         return None;
     }
 
+    let line_range = marked_message(rows, &lines, pointed)
+        .unwrap_or_else(|| unmarked_block(rows, &lines, pointed));
     let mut texts = MatchTexts::new(rows, &lines, patterns);
-    let block = patterns
-        .iter()
-        .find_map(|pattern| pattern_block(&lines, &mut texts, pointed, pattern));
-    let item = match &block {
-        Some(block) => innermost_item(&lines, pointed, block.start() + 1, *block.end()),
-        None => innermost_item(&lines, pointed, 0, lines.len() - 1),
-    };
-    let line_range = item.or(block).unwrap_or(pointed..=pointed);
+    let paragraphs = paragraph_runs(rows, &lines, &mut texts, &line_range, patterns)
+        .into_iter()
+        .map(|run| {
+            rows[*lines[*run.start()].rows.start()].line..=rows[*lines[*run.end()].rows.end()].line
+        })
+        .collect();
     let first_row = *lines[*line_range.start()].rows.start();
     let last_row = *lines[*line_range.end()].rows.end();
     let has_text = |index: &usize| text_columns(&rows[*index].characters).is_some();
@@ -315,7 +401,7 @@ pub(crate) fn find_comment_target(
             };
             Some(TargetRow {
                 line: row.line,
-                columns,
+                columns: without_decoration(&row.characters, columns),
                 wraps: row.wraps,
             })
         })
@@ -327,6 +413,7 @@ pub(crate) fn find_comment_target(
     }
     Some(CommentTarget {
         rows: target_rows,
+        paragraphs,
         truncated,
     })
 }
@@ -373,6 +460,7 @@ pub(crate) fn picker_visible(content: &TerminalContent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use terminal_view::starts_with_list_marker;
 
     fn grid(text: &str) -> Vec<GridRow> {
         text.lines()
@@ -393,54 +481,113 @@ mod tests {
     }
 
     fn target_lines(rows: &[GridRow], line: i32) -> Option<RangeInclusive<i32>> {
-        let target = find_comment_target(rows, line, false, &[])?;
-        let first = target.rows.first()?.line;
-        let last = target.rows.last()?.line;
-        Some(first..=last)
+        pattern_target_lines(rows, line, &[])
+    }
+
+    fn pattern_target_lines(
+        rows: &[GridRow],
+        line: i32,
+        patterns: &[TerminalCommentPattern],
+    ) -> Option<RangeInclusive<i32>> {
+        let target = find_comment_target(rows, line, false, patterns)?;
+        Some(target.rows.first()?.line..=target.rows.last()?.line)
+    }
+
+    fn target_paragraphs(
+        rows: &[GridRow],
+        line: i32,
+        patterns: &[TerminalCommentPattern],
+    ) -> Vec<RangeInclusive<i32>> {
+        find_comment_target(rows, line, false, patterns)
+            .map(|target| target.paragraphs)
+            .unwrap_or_default()
     }
 
     #[test]
-    fn test_question_with_options() {
+    fn test_agent_message_with_paragraphs_is_one_target() {
         let rows = grid(indoc::indoc! {"
-            Some intro text.
+            ⏺ The build failed.
 
-            1. Which auth method should we use?
-               a) OAuth
-               b) API key
-                  with a second line
-            2. Should tokens expire?
-        "});
-        assert_eq!(target_lines(&rows, 2), Some(2..=5));
-        assert_eq!(target_lines(&rows, 3), Some(3..=3));
-        assert_eq!(target_lines(&rows, 5), Some(4..=5));
-        assert_eq!(target_lines(&rows, 6), Some(6..=6));
-    }
-
-    #[test]
-    fn test_line_fallback_and_blank_lines() {
-        let rows = grid(indoc::indoc! {"
-            Plain output line
-            another plain line
-
-            - bullet
-        "});
-        assert_eq!(target_lines(&rows, 1), Some(1..=1));
-        assert_eq!(target_lines(&rows, 2), None);
-        assert_eq!(target_lines(&rows, 3), Some(3..=3));
-    }
-
-    #[test]
-    fn test_agent_message_with_nested_bullets() {
-        let rows = grid(indoc::indoc! {"
-            ⏺ Here is the plan:
+              I fixed the linker flags:
               - first step
                 continued
               - second step
             > my answer
+            ⏺ Done.
         "});
-        assert_eq!(target_lines(&rows, 0), Some(0..=3));
-        assert_eq!(target_lines(&rows, 2), Some(1..=2));
-        assert_eq!(target_lines(&rows, 4), Some(4..=4));
+        for line in [0, 2, 3, 4, 5] {
+            assert_eq!(target_lines(&rows, line), Some(0..=5), "line {line}");
+        }
+        assert_eq!(target_lines(&rows, 1), None);
+        assert_eq!(target_lines(&rows, 6), Some(6..=6));
+        assert_eq!(target_lines(&rows, 7), Some(7..=7));
+    }
+
+    #[test]
+    fn test_nested_quotes_and_bullets_stay_in_their_message() {
+        let rows = grid(indoc::indoc! {"
+            ⏺ You wrote:
+              > quoted text
+                more quote
+              ● a bullet
+        "});
+        for line in 0..=3 {
+            assert_eq!(target_lines(&rows, line), Some(0..=3), "line {line}");
+        }
+    }
+
+    #[test]
+    fn test_message_markers_are_left_out() {
+        let rows = grid("⏺ Read the file\n  ⎿  Read 5 lines\n");
+        let target = find_comment_target(&rows, 1, false, &[]).unwrap();
+        assert_eq!(
+            target
+                .rows
+                .iter()
+                .map(|row| row.columns.clone())
+                .collect::<Vec<_>>(),
+            vec![2..=14, 5..=16]
+        );
+    }
+
+    #[test]
+    fn test_unmarked_text_blocks() {
+        let rows = grid(indoc::indoc! {"
+            Plain output line
+            another plain line
+              indented detail
+
+            Second block
+            back at the start
+            $ cargo test
+        "});
+        assert_eq!(target_lines(&rows, 0), Some(0..=2));
+        assert_eq!(target_lines(&rows, 2), Some(0..=2));
+        assert_eq!(target_lines(&rows, 3), None);
+        assert_eq!(target_lines(&rows, 5), Some(4..=6));
+    }
+
+    #[test]
+    fn test_indent_drop_ends_an_unmarked_block() {
+        let rows = grid("    indented\nback at the start\n");
+        assert_eq!(target_lines(&rows, 0), Some(0..=0));
+        assert_eq!(target_lines(&rows, 1), Some(1..=1));
+    }
+
+    #[test]
+    fn test_question_with_options_is_one_paragraph() {
+        let rows = grid(indoc::indoc! {"
+            ⏺ Some intro text.
+
+              1. Which auth method should we use?
+                 a) OAuth
+                 b) API key
+                    with a second line
+              2. Should tokens expire?
+              3. Plain item
+        "});
+        assert_eq!(target_lines(&rows, 4), Some(0..=7));
+        assert_eq!(target_paragraphs(&rows, 4, &[]), vec![2..=5]);
     }
 
     #[test]
@@ -489,24 +636,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cjk_text_with_wide_characters() {
+        let mut rows = grid("⏺ 界 wide\n  更多 text\n");
+        rows[0].characters.insert(3, ' ');
+        rows[0].wide_char_spacers = vec![3];
+        assert_eq!(target_lines(&rows, 1), Some(0..=1));
+    }
+
+    #[test]
     fn test_markers() {
         for text in ["- a", "* a", "• a", "❯ a", "1. a", "12) a", "a) a", "B. a"] {
             assert!(
-                starts_with_marker(&text.chars().collect::<Vec<_>>()),
+                starts_with_list_marker(&text.chars().collect::<Vec<_>>()),
                 "{text}"
             );
         }
         for text in ["-a", "e.g. a", "1.5 a", "1234. a", "ab) a", "text"] {
             assert!(
-                !starts_with_marker(&text.chars().collect::<Vec<_>>()),
+                !starts_with_list_marker(&text.chars().collect::<Vec<_>>()),
                 "{text}"
             );
         }
     }
 
     #[test]
-    fn test_long_items_are_truncated() {
-        let mut text = String::from("- long item\n");
+    fn test_long_messages_are_truncated() {
+        let mut text = String::from("⏺ long message\n");
         for _ in 0..MAX_TARGET_ROWS + 10 {
             text.push_str("  more\n");
         }
@@ -514,7 +669,7 @@ mod tests {
         let target = find_comment_target(&rows, 0, false, &[]).unwrap();
         assert_eq!(target.rows.len(), MAX_TARGET_ROWS);
         assert!(target.truncated);
-        assert!(target_text(&target, &["- long item".to_string()]).ends_with('…'));
+        assert!(target_text(&target, &["long message".to_string()]).ends_with('…'));
     }
 
     fn default_patterns() -> Vec<TerminalCommentPattern> {
@@ -533,17 +688,8 @@ mod tests {
         .collect()
     }
 
-    fn pattern_target_lines(
-        rows: &[GridRow],
-        line: i32,
-        patterns: &[TerminalCommentPattern],
-    ) -> Option<RangeInclusive<i32>> {
-        let target = find_comment_target(rows, line, false, patterns)?;
-        Some(target.rows.first()?.line..=target.rows.last()?.line)
-    }
-
     #[test]
-    fn test_grilling_questions() {
+    fn test_grilling_questions_are_paragraphs() {
         let rows = grid(indoc::indoc! {"
             ⏺ Some questions:
 
@@ -558,27 +704,27 @@ mod tests {
             > my answer
         "});
         let patterns = default_patterns();
-        assert_eq!(pattern_target_lines(&rows, 2, &patterns), Some(2..=6));
-        assert_eq!(pattern_target_lines(&rows, 5, &patterns), Some(2..=6));
-        assert_eq!(pattern_target_lines(&rows, 6, &patterns), Some(6..=6));
-        assert_eq!(pattern_target_lines(&rows, 7, &patterns), None);
-        assert_eq!(pattern_target_lines(&rows, 9, &patterns), Some(8..=9));
+        assert_eq!(pattern_target_lines(&rows, 5, &patterns), Some(0..=9));
+        assert_eq!(target_paragraphs(&rows, 5, &patterns), vec![2..=6, 8..=9]);
         assert_eq!(pattern_target_lines(&rows, 10, &patterns), Some(10..=10));
-        assert_eq!(pattern_target_lines(&rows, 0, &patterns), Some(0..=0));
     }
 
     #[test]
-    fn test_pattern_ends_at_dedent_and_next_start() {
+    fn test_pattern_at_column_zero_starts_a_message() {
         let rows = grid(indoc::indoc! {"
-            ⏺ Question 1: first?
-              detail
-              Question 2: second?
-            ⏺ Done.
+            ⏺ Q2 - Expiry
+              ➡ one hour
+
+            ⏺ Next message
+              more text
+            > my answer
+            Q3 revenue grew
         "});
         let patterns = default_patterns();
         assert_eq!(pattern_target_lines(&rows, 1, &patterns), Some(0..=1));
-        assert_eq!(pattern_target_lines(&rows, 2, &patterns), Some(2..=2));
-        assert_eq!(pattern_target_lines(&rows, 3, &patterns), Some(3..=3));
+        assert_eq!(target_paragraphs(&rows, 1, &patterns), vec![0..=1]);
+        assert_eq!(pattern_target_lines(&rows, 4, &patterns), Some(3..=4));
+        assert_eq!(pattern_target_lines(&rows, 6, &patterns), Some(6..=6));
     }
 
     #[test]
@@ -597,10 +743,9 @@ mod tests {
                 end: None,
             },
         ];
-        assert_eq!(pattern_target_lines(&rows, 1, &patterns), Some(0..=1));
-        assert_eq!(pattern_target_lines(&rows, 3, &patterns), Some(0..=3));
+        assert_eq!(target_paragraphs(&rows, 1, &patterns), vec![0..=1]);
         let reversed = patterns.into_iter().rev().collect::<Vec<_>>();
-        assert_eq!(pattern_target_lines(&rows, 1, &reversed), Some(0..=3));
+        assert_eq!(target_paragraphs(&rows, 1, &reversed), vec![0..=3]);
     }
 
     #[test]
@@ -609,27 +754,6 @@ mod tests {
         rows[0].wide_char_spacers = vec![1];
         let lines = logical_lines(&rows);
         assert_eq!(match_text(&rows, &lines[0]), "❓ Q1 - Title");
-        assert_eq!(
-            pattern_target_lines(&rows, 0, &default_patterns()),
-            Some(0..=0)
-        );
-    }
-
-    #[test]
-    fn test_pattern_at_column_zero_ends_at_next_message() {
-        let rows = grid(indoc::indoc! {"
-            ⏺ Q2 - Expiry
-              ➡ one hour
-
-            ⏺ Next message
-              more text
-            > my answer
-            Q3 revenue grew
-        "});
-        let patterns = default_patterns();
-        assert_eq!(pattern_target_lines(&rows, 0, &patterns), Some(0..=1));
-        assert_eq!(pattern_target_lines(&rows, 4, &patterns), Some(3..=4));
-        assert_eq!(pattern_target_lines(&rows, 6, &patterns), Some(6..=6));
     }
 
     #[test]

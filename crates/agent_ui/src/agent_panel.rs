@@ -16,9 +16,11 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use agent_comments::{
     AgentCommentStore, AgentCommentStoreEvent, AgentCommentStores, BackOutOfTerminalCommentPick,
     CancelTerminalCommentPick, ClearPendingComments, CommentPopover, CommentTerminalSelection,
-    ConfirmTerminalCommentTarget, ConfirmTerminalCommentTargetAndContinue, InsertPendingComments,
-    SelectNextTerminalCommentTarget, SelectPreviousTerminalCommentTarget,
-    SelectTerminalCommentBlock, SelectTerminalCommentSentence, TerminalComment,
+    ConfirmTerminalCommentTarget, ConfirmTerminalCommentTargetAndContinue,
+    ExtendTerminalCommentPickDown, ExtendTerminalCommentPickUp, InsertPendingComments,
+    NarrowTerminalCommentPick, SelectNextTerminalCommentTarget,
+    SelectPreviousTerminalCommentTarget, TerminalComment, TerminalCommentKind,
+    WidenTerminalCommentPick,
 };
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -102,7 +104,7 @@ use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::terminal_settings::TerminalSettings;
 use terminal::{Content as TerminalContent, Event as TerminalEvent};
 use terminal_view::terminal_element::scaled_font_size;
-use terminal_view::{GutterMarker, TerminalView, TextBlock, TextBlockLevel};
+use terminal_view::{GutterMarker, PickedTextKind, TerminalView, TextBlock, TextBlockLevel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -797,6 +799,10 @@ fn scrollback_row(content: &TerminalContent, line: i32) -> i64 {
     content.total_lines as i64 - content.screen_lines as i64 + i64::from(line)
 }
 
+/// What texts picked in separate places are joined with in a comment's
+/// quote.
+const MULTI_PART_SEPARATOR: &str = "\n…\n";
+
 /// The text on screen without whitespace and box borders, with the grid
 /// point of each byte. Whitespace and line breaks are left out because a
 /// resize changes them: lines rewrap and TUIs redraw with other padding.
@@ -834,19 +840,28 @@ impl ScreenText {
         comment: &TerminalComment,
         content: &TerminalContent,
     ) -> Option<(terminal::Point, terminal::Point)> {
-        let anchor = comment
+        // Texts picked in separate places are joined with an ellipsis, and
+        // are found in order with other text between them.
+        let parts = comment
             .quoted_text
-            .chars()
-            .filter(|character| !is_ignored_by_anchor(*character))
-            .collect::<String>();
-        if anchor.is_empty() {
-            return None;
-        }
+            .split(MULTI_PART_SEPARATOR)
+            .map(|part| {
+                part.chars()
+                    .filter(|character| !is_ignored_by_anchor(*character))
+                    .collect::<String>()
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let (first_part, other_parts) = parts.split_first()?;
         self.text
-            .match_indices(&anchor)
+            .match_indices(first_part.as_str())
             .filter_map(|(start, matched)| {
+                let mut end = start + matched.len();
+                for part in other_parts {
+                    end += self.text.get(end..)?.find(part.as_str())? + part.len();
+                }
                 let first = *self.byte_points.get(start)?;
-                let last = *self.byte_points.get(start + matched.len() - 1)?;
+                let last = *self.byte_points.get(end - 1)?;
                 match comment.start_column {
                     Some(start_column) => (first.column == start_column).then_some((first, last)),
                     None => Some((
@@ -923,7 +938,9 @@ const MAX_COMMENT_MENU_QUOTE: usize = 60;
 enum TerminalCommentPickAction {
     Move { forward: bool },
     Confirm { keep_picking: bool },
-    Level(TextBlockLevel),
+    Extend { forward: bool },
+    Narrow,
+    Widen,
     BackOut,
     Cancel,
 }
@@ -971,12 +988,15 @@ fn terminal_comment_text_block(
             content,
         )
         .into_iter()
-        .any(|(comment, span)| comment.start_column.is_none() && spans_overlap(span, block_span))
+        .any(|(comment, span)| {
+            comment.kind == TerminalCommentKind::Lines && spans_overlap(span, block_span)
+        })
     });
     Some(TextBlock {
         rows: block_rows,
         text,
         label: edits_comment.then(|| "Edit Comment".into()),
+        paragraphs: target.paragraphs,
     })
 }
 
@@ -8066,7 +8086,7 @@ impl AgentPanel {
         });
         match selection_target {
             Some((range, text, position)) => {
-                self.open_terminal_comment(terminal_id, range, text, position, window, cx);
+                self.open_terminal_comment(terminal_id, range, text, None, position, window, cx);
             }
             None => {
                 terminal_view.update(cx, |terminal_view, cx| {
@@ -8085,12 +8105,14 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((range, text, position)) = terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.take_text_block_pick_target(keep_picking, window, cx)
-        }) else {
+        let Some((range, text, picked, position)) = terminal_view
+            .update(cx, |terminal_view, cx| {
+                terminal_view.take_text_block_pick_target(keep_picking, window, cx)
+            })
+        else {
             return;
         };
-        self.open_terminal_comment(terminal_id, range, text, position, window, cx);
+        self.open_terminal_comment(terminal_id, range, text, Some(picked), position, window, cx);
     }
 
     fn handle_terminal_comment_pick_action(
@@ -8120,9 +8142,19 @@ impl AgentPanel {
                     cx,
                 );
             }
-            TerminalCommentPickAction::Level(level) => {
+            TerminalCommentPickAction::Extend { forward } => {
                 terminal_view.update(cx, |terminal_view, cx| {
-                    terminal_view.set_text_block_pick_level(level, cx)
+                    terminal_view.extend_text_block_pick(forward, cx)
+                });
+            }
+            TerminalCommentPickAction::Narrow => {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.narrow_text_block_pick(cx)
+                });
+            }
+            TerminalCommentPickAction::Widen => {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.widen_text_block_pick(cx)
                 });
             }
             TerminalCommentPickAction::BackOut => {
@@ -8212,13 +8244,14 @@ impl AgentPanel {
             });
             terminal_view.on_selection_action(
                 "Comment for Agent",
-                move |range, text, position, window, cx| {
+                move |range, text, level, position, window, cx| {
                     panel
                         .update(cx, |panel, cx| {
                             panel.open_terminal_comment(
                                 terminal_id,
                                 range,
                                 text,
+                                level,
                                 position,
                                 window,
                                 cx,
@@ -8231,14 +8264,15 @@ impl AgentPanel {
         });
     }
 
-    /// Comments on text selected in a terminal thread, or edits the comment
-    /// of the same kind on the selected text. A sentence of a block gets a
-    /// comment of its own on part of a line.
+    /// Comments on text selected or picked in a terminal thread, or edits
+    /// the comment of the same kind on it. A picked paragraph or sentence
+    /// gets a comment of its own on part of a line.
     fn open_terminal_comment(
         &mut self,
         terminal_id: TerminalId,
         range: terminal::Range,
         text: String,
+        picked: Option<PickedTextKind>,
         position: gpui::Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -8259,12 +8293,16 @@ impl AgentPanel {
         let terminal = terminal_view.read(cx).terminal().clone();
         let terminal_entity_id = terminal.entity_id();
         let content = terminal.read(cx).last_content();
-        // A sentence is commented on where it is, since it's often short
-        // enough to show elsewhere too, while other text follows its text.
-        let start_column = terminal_view
-            .read(cx)
-            .is_text_block_sentence(range, cx)
-            .then_some(range.start().column);
+        let kind = match picked.map(|picked| picked.level) {
+            Some(TextBlockLevel::Paragraph) => TerminalCommentKind::Paragraph,
+            Some(TextBlockLevel::Sentence) => TerminalCommentKind::Sentence,
+            Some(TextBlockLevel::Message) | None => TerminalCommentKind::Lines,
+        };
+        let combined = picked.is_some_and(|picked| picked.combined);
+        // A paragraph or a sentence is commented on where it is, since it's
+        // often short enough to show elsewhere too, while other text follows
+        // its text.
+        let start_column = (kind != TerminalCommentKind::Lines).then_some(range.start().column);
         let selected_span = match start_column {
             Some(_) => (range.start(), range.end()),
             None => (
@@ -8272,16 +8310,20 @@ impl AgentPanel {
                 terminal::Point::new(range.end().line, usize::MAX),
             ),
         };
-        // Sentence comments and whole-line comments sit side by side, so a
-        // pick only edits a comment of its own kind.
+        // Comments of each kind sit side by side, so a pick only edits a
+        // comment of its own kind.
         let existing = visible_terminal_comments(
             store.read(cx).terminal_comments(terminal_entity_id),
             content,
         )
         .into_iter()
         .filter(|(comment, span)| {
-            comment.start_column.is_some() == start_column.is_some()
-                && spans_overlap(*span, selected_span)
+            // A comment is edited by picking its text again, never by
+            // picking texts around it together, and a paragraph or a
+            // sentence comment only by picking that very text.
+            let same_text = kind == TerminalCommentKind::Lines
+                || (span.0 == range.start() && comment.quoted_text == text);
+            !combined && comment.kind == kind && same_text && spans_overlap(*span, selected_span)
         })
         .min_by_key(|(_, (start, _))| {
             (
@@ -8302,6 +8344,7 @@ impl AgentPanel {
             terminal_entity_id,
             first_row,
             start_column,
+            kind,
             text,
             position,
             workspace.downgrade(),
@@ -9039,18 +9082,36 @@ impl Render for AgentPanel {
                 }),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTerminalCommentSentence, window, cx| {
+                cx.listener(|this, _: &NarrowTerminalCommentPick, window, cx| {
                     this.handle_terminal_comment_pick_action(
-                        TerminalCommentPickAction::Level(TextBlockLevel::Sentence),
+                        TerminalCommentPickAction::Narrow,
                         window,
                         cx,
                     );
                 }),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTerminalCommentBlock, window, cx| {
+                cx.listener(|this, _: &WidenTerminalCommentPick, window, cx| {
                     this.handle_terminal_comment_pick_action(
-                        TerminalCommentPickAction::Level(TextBlockLevel::Block),
+                        TerminalCommentPickAction::Widen,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendTerminalCommentPickUp, window, cx| {
+                    this.handle_terminal_comment_pick_action(
+                        TerminalCommentPickAction::Extend { forward: false },
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendTerminalCommentPickDown, window, cx| {
+                    this.handle_terminal_comment_pick_action(
+                        TerminalCommentPickAction::Extend { forward: true },
                         window,
                         cx,
                     );
@@ -15023,6 +15084,7 @@ mod tests {
                 terminal_id,
                 terminal::Range::new(range.0, range.1),
                 text.to_string(),
+                None,
                 gpui::point(px(0.), px(0.)),
                 window,
                 cx,
@@ -15451,6 +15513,7 @@ mod tests {
                 terminal_id,
                 terminal::Range::new(terminal::Point::new(1, 0), terminal::Point::new(1, 3)),
                 "beta".to_string(),
+                None,
                 gpui::point(px(0.), px(0.)),
                 window,
                 cx,
@@ -15483,8 +15546,10 @@ mod tests {
                     ConfirmTerminalCommentTargetAndContinue,
                     pick_context,
                 ),
-                gpui::KeyBinding::new("right", SelectTerminalCommentSentence, pick_context),
-                gpui::KeyBinding::new("left", SelectTerminalCommentBlock, pick_context),
+                gpui::KeyBinding::new("right", NarrowTerminalCommentPick, pick_context),
+                gpui::KeyBinding::new("left", WidenTerminalCommentPick, pick_context),
+                gpui::KeyBinding::new("shift-up", ExtendTerminalCommentPickUp, pick_context),
+                gpui::KeyBinding::new("shift-down", ExtendTerminalCommentPickDown, pick_context),
                 gpui::KeyBinding::new("escape", BackOutOfTerminalCommentPick, pick_context),
             ])
         });
@@ -15663,7 +15728,7 @@ mod tests {
                 .read(cx)
                 .text_block_pick_level()
         });
-        assert_eq!(level, Some(TextBlockLevel::Block));
+        assert_eq!(level, Some(TextBlockLevel::Message));
         cx.simulate_keystrokes("escape");
         assert!(!terminal_picking(&panel, terminal_id, &mut cx));
     }
@@ -15698,7 +15763,8 @@ mod tests {
     ) {
         let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
         bind_terminal_comment_keys(&mut cx);
-        let (terminal_id, terminal) = open_terminal_with_output(&panel, AUTH_QUESTION, &mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "First block.\r\n\r\nSecond block.\r\n", &mut cx);
         focus_terminal(&panel, terminal_id, &mut cx);
 
         cx.simulate_keystrokes("ctrl-alt-m");
@@ -15717,7 +15783,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             terminal_comment_quotes(&workspace, &terminal, &mut cx),
-            vec!["a) OAuth".to_string()],
+            vec!["First block.".to_string()],
             "the pick should start at the last block, and up should move to the one above"
         );
     }
@@ -15726,7 +15792,8 @@ mod tests {
     async fn test_shift_enter_keeps_the_terminal_comment_pick(cx: &mut TestAppContext) {
         let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
         bind_terminal_comment_keys(&mut cx);
-        let (terminal_id, terminal) = open_terminal_with_output(&panel, AUTH_QUESTION, &mut cx);
+        let (terminal_id, terminal) =
+            open_terminal_with_output(&panel, "First block.\r\n\r\nSecond block.\r\n", &mut cx);
         focus_terminal(&panel, terminal_id, &mut cx);
 
         cx.simulate_keystrokes("ctrl-alt-m shift-enter");
@@ -15746,8 +15813,261 @@ mod tests {
         assert!(!terminal_picking(&panel, terminal_id, &mut cx));
         assert_eq!(
             terminal_comment_quotes(&workspace, &terminal, &mut cx),
-            vec!["b) API key".to_string(), "a) OAuth".to_string()],
+            vec!["Second block.".to_string(), "First block.".to_string()],
         );
+    }
+
+    const AGENT_MESSAGE: &str =
+        "⏺ First paragraph here.\r\n\r\n  Second one. Two sentences.\r\n\r\n  Third.\r\n";
+
+    fn terminal_comment_kinds(
+        workspace: &Entity<Workspace>,
+        terminal: &Entity<terminal::Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(TerminalCommentKind, Option<usize>)> {
+        let store = workspace_comment_store(workspace, cx);
+        store.read_with(cx, |store, _| {
+            store
+                .terminal_comments(terminal.entity_id())
+                .map(|comment| (comment.kind, comment.start_column))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_comments_on_paragraphs(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m up enter", "Second.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Second one. Two sentences.".to_string()],
+            "the pick should start at the last paragraph, and up should move to the one above"
+        );
+        assert_eq!(
+            terminal_comment_kinds(&workspace, &terminal, &mut cx),
+            vec![(TerminalCommentKind::Paragraph, Some(2))],
+        );
+
+        comment_on_pick("ctrl-alt-m up right enter", "Sentence.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec![
+                "Second one. Two sentences.".to_string(),
+                "Second one.".to_string()
+            ],
+            "picking a sentence of a commented paragraph should comment on it apart"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_keeps_paragraph_and_sentence_comments_apart(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m enter", "Paragraph.", &mut cx);
+        cx.simulate_keystrokes("ctrl-alt-m right");
+        let level = panel.read_with(&cx, |panel, cx| {
+            panel.terminals[&terminal_id]
+                .view
+                .read(cx)
+                .text_block_pick_level()
+        });
+        assert_eq!(
+            level,
+            Some(TextBlockLevel::Paragraph),
+            "a paragraph of one sentence has no sentence level to go to"
+        );
+        // The sentence level button still picks the sentence.
+        panel.update(&mut cx, |panel, cx| {
+            panel.terminals[&terminal_id].view.update(cx, |view, cx| {
+                view.set_text_block_pick_level(TextBlockLevel::Sentence, cx)
+            })
+        });
+        comment_on_pick("enter", "Sentence.", &mut cx);
+        assert_eq!(
+            terminal_comment_kinds(&workspace, &terminal, &mut cx),
+            vec![
+                (TerminalCommentKind::Paragraph, Some(2)),
+                (TerminalCommentKind::Sentence, Some(2)),
+            ],
+            "a one-sentence paragraph and its sentence should keep comments of their own"
+        );
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Third.".to_string(), "Third.".to_string()],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_collects_paragraphs(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick(
+            "ctrl-alt-m up up shift-down shift-down enter",
+            "All.",
+            &mut cx,
+        );
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["First paragraph here.\nSecond one. Two sentences.\nThird.".to_string()],
+        );
+        assert_eq!(
+            terminal_marker_lines(&panel, &terminal, &mut cx),
+            vec![0..=4]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_collects_apart_paragraphs(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m up up shift-down down enter", "Ends.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["First paragraph here.\n…\nThird.".to_string()],
+            "paragraphs apart should be joined with an ellipsis"
+        );
+        assert_eq!(
+            terminal_marker_lines(&panel, &terminal, &mut cx),
+            vec![0..=4],
+            "a comment on paragraphs apart should still be found on screen"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_collecting_around_a_commented_paragraph_makes_a_new_comment(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m up enter", "Middle.", &mut cx);
+        comment_on_pick("ctrl-alt-m up up shift-down down enter", "Ends.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec![
+                "Second one. Two sentences.".to_string(),
+                "First paragraph here.\n…\nThird.".to_string(),
+            ],
+            "texts picked around a commented paragraph shouldn't edit its comment"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_collecting_a_commented_paragraph_with_the_next_makes_a_new_comment(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m up up enter", "First.", &mut cx);
+        comment_on_pick("ctrl-alt-m up up shift-down enter", "Both.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec![
+                "First paragraph here.".to_string(),
+                "First paragraph here.\nSecond one. Two sentences.".to_string(),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_collecting_messages_around_a_commented_message_makes_a_new_comment(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(
+            &panel,
+            "First block.\r\n\r\nSecond block.\r\n\r\nThird block.\r\n",
+            &mut cx,
+        );
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m up enter", "Second.", &mut cx);
+        comment_on_pick("ctrl-alt-m up up shift-down down enter", "Ends.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec![
+                "Second block.".to_string(),
+                "First block.\n…\nThird block.".to_string(),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_shift_at_the_last_paragraph_keeps_it_picked(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick("ctrl-alt-m shift-down shift-down up enter", "Two.", &mut cx);
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Second one. Two sentences.\nThird.".to_string()],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_comment_pick_takes_a_collected_paragraph_back_out(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        comment_on_pick(
+            "ctrl-alt-m up up shift-down up shift-down down enter",
+            "Only.",
+            &mut cx,
+        );
+        assert_eq!(
+            terminal_comment_quotes(&workspace, &terminal, &mut cx),
+            vec!["Third.".to_string()],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_escape_clears_collected_paragraphs_first(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = setup_agent_comments(cx).await;
+        bind_terminal_comment_keys(&mut cx);
+        let (terminal_id, _terminal) = open_terminal_with_output(&panel, AGENT_MESSAGE, &mut cx);
+        focus_terminal(&panel, terminal_id, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-alt-m up shift-down escape");
+        let level = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.terminals[&terminal_id]
+                    .view
+                    .read(cx)
+                    .text_block_pick_level()
+            })
+        };
+        assert_eq!(level(&mut cx), Some(TextBlockLevel::Paragraph));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(level(&mut cx), Some(TextBlockLevel::Message));
+        cx.simulate_keystrokes("escape");
+        assert!(!terminal_picking(&panel, terminal_id, &mut cx));
     }
 
     #[gpui::test]
@@ -15951,7 +16271,7 @@ mod tests {
     async fn test_clicking_a_picked_terminal_block_opens_a_comment(cx: &mut TestAppContext) {
         let (workspace, panel, mut cx) = setup_agent_comments(cx).await;
         let (_terminal_id, terminal) =
-            open_terminal_with_output(&panel, "alpha\r\nbeta\r\n", &mut cx);
+            open_terminal_with_output(&panel, "alpha\r\n\r\nbeta\r\n", &mut cx);
         let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content().terminal_bounds);
         let cell = |column: f32| {
             bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * 0.5)

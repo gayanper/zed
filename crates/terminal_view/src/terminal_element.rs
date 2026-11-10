@@ -1438,12 +1438,18 @@ impl Element for TerminalElement {
                 self.terminal_view.update(cx, |terminal_view, cx| {
                     terminal_view.update_picked_text_block(window, cx)
                 });
-                let text_block = self
-                    .terminal_view
-                    .read(cx)
-                    .picked_text_block
-                    .as_ref()
-                    .map(|picked| (picked.block.clone(), picked.parent.clone()));
+                let text_block =
+                    self.terminal_view
+                        .read(cx)
+                        .picked_text_block
+                        .as_ref()
+                        .map(|picked| {
+                            (
+                                picked.block.clone(),
+                                picked.parent.clone(),
+                                picked.collected.clone(),
+                            )
+                        });
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
@@ -1477,21 +1483,15 @@ impl Element for TerminalElement {
                         .push((selection.point_range(), player_color.selection));
                 }
                 let text_block_marker_color = theme.colors().text_accent;
-                if let Some((block, parent)) = &text_block {
-                    // A picked sentence stands out from the rest of its block.
-                    let parent_rows = parent.iter().flat_map(|parent| &parent.rows);
-                    let tints = parent_rows
-                        .map(|row| (row, theme.colors().ghost_element_hover))
-                        .chain(block.rows.iter().map(|row| {
-                            let tint = if parent.is_some() {
-                                theme.colors().ghost_element_selected
-                            } else {
-                                theme.colors().ghost_element_hover
-                            };
-                            (row, tint)
-                        }))
-                        .collect::<Vec<_>>();
-                    for ((line, columns), tint) in tints {
+                if let Some((block, _, collected)) = &text_block {
+                    // Only the picked texts are highlighted, not the block
+                    // around them.
+                    let tint = theme.colors().ghost_element_selected;
+                    let rows = collected
+                        .iter()
+                        .flat_map(|collected| &collected.rows)
+                        .chain(&block.rows);
+                    for (line, columns) in rows {
                         relative_highlighted_ranges.push((
                             Range::new(
                                 Point::new(*line, *columns.start()),
@@ -1670,7 +1670,7 @@ impl Element for TerminalElement {
                     Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
                     None => Vec::new(),
                 };
-                let text_block_marker = text_block.as_ref().and_then(|(block, _)| {
+                let text_block_marker = text_block.as_ref().and_then(|(block, _, _)| {
                     Some(GutterMarker {
                         lines: block.lines()?,
                         color: text_block_marker_color,
@@ -2270,8 +2270,8 @@ fn pick_text_block(
     }) else {
         return;
     };
-    let (range, text, origin) = target;
-    (action.handler)(range, text, origin, window, cx);
+    let (range, text, kind, origin) = target;
+    (action.handler)(range, text, Some(kind), origin, window, cx);
 }
 
 /// Where the selection action's popover opens for a text block: just below the cell the

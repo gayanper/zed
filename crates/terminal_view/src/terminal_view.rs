@@ -79,10 +79,22 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 
 pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<GutterMarker>>;
 
+pub(crate) type SelectionActionHandler =
+    Rc<dyn Fn(Range, String, Option<PickedTextKind>, GpuiPoint<Pixels>, &mut Window, &mut App)>;
+
+/// What a pick that runs the selection action took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PickedTextKind {
+    pub level: TextBlockLevel,
+    /// Whether texts picked to act on together were joined.
+    pub combined: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct SelectionAction {
     pub(crate) label: SharedString,
-    pub(crate) handler: Rc<dyn Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App)>,
+    /// Receives the level of a picked text block, or none for a selection.
+    pub(crate) handler: SelectionActionHandler,
 }
 
 /// A block of text in the grid that can be picked for the selection action.
@@ -95,6 +107,9 @@ pub struct TextBlock {
     /// Replaces the selection action's label in the pick's hint, for
     /// example when the action on this block differs.
     pub label: Option<SharedString>,
+    /// Runs of grid lines that are one paragraph each, whatever their rows
+    /// look like, such as a question with its options.
+    pub paragraphs: Vec<RangeInclusive<i32>>,
 }
 
 impl TextBlock {
@@ -112,49 +127,215 @@ impl TextBlock {
     }
 }
 
-fn sentence_start(sentence: &TextBlock) -> Point {
-    sentence
-        .rows
+fn unit_start(unit: &TextBlock) -> Point {
+    unit.rows
         .first()
         .map_or(Point::new(0, 0), |(line, columns)| {
             Point::new(*line, *columns.start())
         })
 }
 
-fn sentence_contains(sentence: &TextBlock, point: Point) -> bool {
-    sentence
-        .rows
+fn unit_contains(unit: &TextBlock, point: Point) -> bool {
+    unit.rows
         .iter()
         .any(|(line, columns)| *line == point.line && columns.contains(&point.column))
 }
 
-/// The rows of each sentence in a block's `rows`, by Unicode sentence
-/// boundaries. A line break the program wrote ends a sentence too, since
-/// terminal output is mostly lines without punctuation, while a row the
-/// terminal wrapped carries on, and so does a row that looks like the
-/// program wrapped prose (see [`looks_wrapped_by_program`]).
-fn sentence_rows(
-    block_rows: &[(i32, RangeInclusive<usize>)],
+/// Whether text starts with a list marker followed by a space: a bullet,
+/// an agent's message or answer marker, or a number or letter followed by
+/// `.` or `)`.
+pub fn starts_with_list_marker(text: &[char]) -> bool {
+    const BULLETS: &[char] = &['-', '*', '•', '◦', '▪', '●', '⏺', '⎿', '>', '❯'];
+    let followed_by_space =
+        |index: usize| text.get(index).is_some_and(|character| *character == ' ');
+    let Some(first) = text.first() else {
+        return false;
+    };
+    if BULLETS.contains(first) {
+        return followed_by_space(1);
+    }
+    let digits = text
+        .iter()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    let label_length = if (1..=3).contains(&digits) {
+        digits
+    } else if first.is_ascii_alphabetic() {
+        1
+    } else {
+        return false;
+    };
+    text.get(label_length)
+        .is_some_and(|character| *character == '.' || *character == ')')
+        && followed_by_space(label_length + 1)
+}
+
+/// The columns and characters of a row's text, without whitespace and the
+/// cells that pad wide characters.
+fn row_text_columns(row: &GridRow, columns: &RangeInclusive<usize>) -> Vec<(usize, char)> {
+    columns
+        .clone()
+        .filter_map(|column| Some((column, *row.characters.get(column)?)))
+        .filter(|(column, character)| {
+            !character.is_whitespace() && !row.wide_char_spacers.contains(column)
+        })
+        .collect()
+}
+
+/// The column a paragraph's rows line up at: its first text, or the text
+/// after the list marker it starts with.
+fn paragraph_text_indent(row: &GridRow, columns: &RangeInclusive<usize>) -> Option<usize> {
+    let text = row_text_columns(row, columns);
+    let (first_column, _) = text.first()?;
+    let characters = row.characters.get(*first_column..=*columns.end())?.to_vec();
+    if !starts_with_list_marker(&characters) {
+        return Some(*first_column);
+    }
+    // The marker is the first word, and the text after it starts at the
+    // next one.
+    let after_marker = text
+        .windows(2)
+        .find(|pair| pair[1].0 != pair[0].0 + 1)
+        .map(|pair| pair[1].0);
+    Some(after_marker.unwrap_or(*first_column))
+}
+
+/// The rows of each paragraph in a block's `rows`. A paragraph runs over
+/// rows the terminal wrapped, the lines of the block's `paragraphs`, and
+/// rows that look like the program wrapped prose (see
+/// [`continues_paragraph`]). Any other line break ends a paragraph, since
+/// terminal output is mostly lines that stand on their own.
+fn paragraph_rows(
+    block: &TextBlock,
     grid_rows: &[GridRow],
 ) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
-    let mut sentences = Vec::new();
-    let mut paragraph = String::new();
-    let mut byte_points = Vec::new();
+    let mut paragraphs: Vec<Vec<(i32, RangeInclusive<usize>)>> = Vec::new();
     let mut previous_row: Option<(&GridRow, &RangeInclusive<usize>)> = None;
-    for (line, columns) in block_rows {
+    let mut text_indent = None;
+    let group_of = |line: i32| {
+        block
+            .paragraphs
+            .iter()
+            .position(|group| group.contains(&line))
+    };
+    for (line, columns) in &block.rows {
         let Some(grid_row) = grid_rows.iter().find(|row| row.line == *line) else {
             continue;
         };
         let continues = previous_row.is_some_and(|(previous, previous_columns)| {
-            previous.line.saturating_add(1) == *line
-                && (previous.wraps
-                    || looks_wrapped_by_program(previous, previous_columns, grid_row, columns))
+            if previous.line.saturating_add(1) != *line {
+                return false;
+            }
+            match (group_of(previous.line), group_of(*line)) {
+                (Some(previous_group), Some(group)) => previous_group == group,
+                (None, None) => {
+                    previous.wraps
+                        || text_indent.is_some_and(|text_indent| {
+                            continues_paragraph(
+                                previous,
+                                previous_columns,
+                                grid_row,
+                                columns,
+                                text_indent,
+                            )
+                        })
+                }
+                _ => false,
+            }
         });
-        if !continues {
-            push_paragraph_sentences(&paragraph, &byte_points, &mut sentences);
-            paragraph.clear();
-            byte_points.clear();
-        } else if !previous_row.is_some_and(|(previous, _)| previous.wraps)
+        match paragraphs.last_mut() {
+            Some(paragraph) if continues => paragraph.push((*line, columns.clone())),
+            _ => {
+                paragraphs.push(vec![(*line, columns.clone())]);
+                text_indent = paragraph_text_indent(grid_row, columns);
+            }
+        }
+        previous_row = Some((grid_row, columns));
+    }
+    paragraphs
+}
+
+/// Whether a line break looks like a program wrapping prose to fit the
+/// terminal, as agent TUIs do, rather than ending a line of a log or of
+/// code. The terminal can't tell them apart, so this guesses: the row
+/// reaches well across the terminal and ends in a word or punctuation of
+/// prose, and the next row carries on at the paragraph's indent with a
+/// word. Rows of code, listings and logs rarely look like that.
+fn continues_paragraph(
+    row: &GridRow,
+    columns: &RangeInclusive<usize>,
+    next_row: &GridRow,
+    next_columns: &RangeInclusive<usize>,
+    text_indent: usize,
+) -> bool {
+    let text = row_text_columns(row, columns);
+    let next_text = row_text_columns(next_row, next_columns);
+    let Some((last_column, _)) = text.last() else {
+        return false;
+    };
+    // A Markdown heading stands on its own line.
+    if text.first().is_some_and(|(_, character)| *character == '#') {
+        return false;
+    }
+    let Some((next_first_column, _)) = next_text.first() else {
+        return false;
+    };
+    // Closing quotes and brackets after the last word don't matter.
+    let ends_in_prose = text
+        .iter()
+        .rev()
+        .map(|(_, character)| *character)
+        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’' | '`'))
+        .is_some_and(|character| {
+            character.is_alphabetic() || matches!(character, ',' | '.' | '?' | '!' | ':')
+        });
+    let word_length = next_text
+        .windows(2)
+        .position(|pair| pair[1].0 != pair[0].0 + 1)
+        .map_or(next_text.len(), |index| index + 1);
+    let next_characters = next_text[..word_length]
+        .iter()
+        .map(|(_, character)| *character)
+        .collect::<Vec<_>>();
+    let next_word = next_characters.iter().collect::<String>();
+    // A label such as "warning:" starts a line of its own.
+    if next_word.ends_with(':') {
+        return false;
+    }
+    let next_word = next_word
+        .trim_start_matches(['"', '“', '(', '`'])
+        .trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”', ')', '`']);
+    let width = row.characters.len();
+    ends_in_prose
+        && last_column.saturating_mul(3) >= width.saturating_mul(2)
+        && *next_first_column == text_indent
+        && !next_row
+            .characters
+            .get(*next_first_column..)
+            .is_some_and(starts_with_list_marker)
+        && next_word.starts_with(char::is_alphabetic)
+        // Apostrophes, as in "others'" or "don't", and dots, as in
+        // "Cargo.toml", but not the hyphens of listings such as
+        // "drwxr-xr-x", nor the digits of log lines.
+        && next_word
+            .chars()
+            .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
+}
+
+/// The rows of each sentence of a paragraph, by Unicode sentence
+/// boundaries.
+fn sentence_rows(
+    paragraph_rows: &[(i32, RangeInclusive<usize>)],
+    grid_rows: &[GridRow],
+) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
+    let mut paragraph = String::new();
+    let mut byte_points = Vec::new();
+    let mut previous_wraps = true;
+    for (line, columns) in paragraph_rows {
+        let Some(grid_row) = grid_rows.iter().find(|row| row.line == *line) else {
+            continue;
+        };
+        if !previous_wraps
             && !paragraph.ends_with(char::is_whitespace)
             && let Some(last_point) = byte_points.last().copied()
         {
@@ -175,70 +356,24 @@ fn sentence_rows(
                 character.len_utf8(),
             ));
         }
-        previous_row = Some((grid_row, columns));
+        previous_wraps = grid_row.wraps;
     }
+    let mut sentences = Vec::new();
     push_paragraph_sentences(&paragraph, &byte_points, &mut sentences);
     sentences
 }
 
-/// Whether a line break looks like a program wrapping prose to fit the
-/// terminal, as agent TUIs do, rather than ending a line of a log or of
-/// code. The terminal can't tell them apart, so this guesses: the row
-/// reaches well across the terminal and ends in a word or a comma, and the
-/// next row carries on at the same indent or deeper with a lowercase word.
-/// Rows of code or listings rarely look like that. A row that carries on
-/// with a capital, a digit or a script without case starts afresh.
-fn looks_wrapped_by_program(
-    row: &GridRow,
-    columns: &RangeInclusive<usize>,
-    next_row: &GridRow,
-    next_columns: &RangeInclusive<usize>,
-) -> bool {
-    let text_columns = |row: &GridRow, columns: &RangeInclusive<usize>| {
-        columns
-            .clone()
-            .filter_map(|column| Some((column, *row.characters.get(column)?)))
-            .filter(|(column, character)| {
-                !character.is_whitespace() && !row.wide_char_spacers.contains(column)
-            })
-            .collect::<Vec<_>>()
-    };
-    let text = text_columns(row, columns);
-    let next_text = text_columns(next_row, next_columns);
-    let (Some((first_column, _)), Some((last_column, _))) = (text.first(), text.last()) else {
-        return false;
-    };
-    let Some((next_first_column, _)) = next_text.first() else {
-        return false;
-    };
-    // Closing quotes and brackets after a full stop still end a sentence.
-    let ends_in_word = text
-        .iter()
-        .rev()
-        .map(|(_, character)| *character)
-        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’'))
-        .is_some_and(|character| character.is_alphabetic() || character == ',');
-    let word_length = next_text
-        .windows(2)
-        .position(|pair| pair[1].0 != pair[0].0 + 1)
-        .map_or(next_text.len(), |index| index + 1);
-    let next_word = next_text[..word_length]
-        .iter()
-        .map(|(_, character)| *character)
-        .collect::<String>();
-    let next_word = next_word.trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”']);
-    let width = row.characters.len();
-    ends_in_word
-        && last_column.saturating_mul(3) >= width.saturating_mul(2)
-        && next_first_column >= first_column
-        && !next_word.is_empty()
-        && next_word.chars().all(|character| {
-            // Apostrophes, as in "others'" or "don't", but not the hyphens
-            // of listings such as "drwxr-xr-x".
-            (character.is_alphabetic() && character.is_lowercase())
-                || matches!(character, '\'' | '’')
-        })
-        && next_word.starts_with(char::is_alphabetic)
+/// Abbreviations that a sentence doesn't end at, though Unicode sentence
+/// boundaries break after them before a capital.
+const ABBREVIATIONS: &[&str] = &[
+    "e.g.", "i.e.", "vs.", "cf.", "dr.", "mr.", "mrs.", "approx.",
+];
+
+fn ends_with_abbreviation(text: &str) -> bool {
+    text.split_whitespace().last().is_some_and(|word| {
+        let word = word.trim_start_matches(['(', '"', '“']).to_lowercase();
+        ABBREVIATIONS.contains(&word.as_str())
+    })
 }
 
 fn push_paragraph_sentences(
@@ -246,6 +381,7 @@ fn push_paragraph_sentences(
     byte_points: &[Point],
     sentences: &mut Vec<Vec<(i32, RangeInclusive<usize>)>>,
 ) {
+    let mut byte_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     for (start, sentence) in paragraph.split_sentence_bound_indices() {
         let trimmed_start = sentence.len() - sentence.trim_start().len();
         let trimmed = sentence.trim();
@@ -253,7 +389,16 @@ fn push_paragraph_sentences(
             continue;
         }
         let start = start + trimmed_start;
-        let Some(points) = byte_points.get(start..start + trimmed.len()) else {
+        let end = start + trimmed.len();
+        match byte_ranges.last_mut() {
+            Some(previous) if ends_with_abbreviation(&paragraph[previous.clone()]) => {
+                previous.end = end;
+            }
+            _ => byte_ranges.push(start..end),
+        }
+    }
+    for byte_range in byte_ranges {
+        let Some(points) = byte_points.get(byte_range) else {
             continue;
         };
         let mut rows: Vec<(i32, RangeInclusive<usize>)> = Vec::new();
@@ -283,20 +428,36 @@ pub struct GutterMarker {
 pub(crate) type GutterMarkerClick =
     Rc<dyn Fn(RangeInclusive<i32>, GpuiPoint<Pixels>, &mut Window, &mut App)>;
 
-/// How much of a text block a pick takes.
+/// How much of a text block a pick takes: the whole block, which is a
+/// message, or a paragraph or a sentence of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextBlockLevel {
     #[default]
-    Block,
+    Message,
+    Paragraph,
     Sentence,
+}
+
+impl TextBlockLevel {
+    const ALL: [Self; 3] = [Self::Message, Self::Paragraph, Self::Sentence];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Paragraph => "paragraph",
+            Self::Sentence => "sentence",
+        }
+    }
 }
 
 /// The text a pick points at.
 pub(crate) struct PickedTextBlock {
-    /// The picked text: the block, or a sentence of it.
+    /// The picked text: the block, or a paragraph or a sentence of it.
     pub(crate) block: TextBlock,
-    /// The block a picked sentence is in.
+    /// The block a picked paragraph or sentence is in.
     pub(crate) parent: Option<TextBlock>,
+    /// The other texts picked to act on together.
+    pub(crate) collected: Vec<TextBlock>,
     /// Where the pick points on the block, which the action's popover
     /// opens next to.
     pub(crate) anchor: Point,
@@ -309,6 +470,9 @@ struct TextBlockPick {
     /// scrolling the screen doesn't change until the scrollback is full.
     position: Option<(i64, usize)>,
     level: TextBlockLevel,
+    /// Where the other texts picked to act on together start, as scrollback
+    /// rows and columns.
+    collected: Vec<(i64, usize)>,
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -665,11 +829,19 @@ impl TerminalView {
     }
 
     /// Sets the action that a picked text block runs: `handler` gets the
-    /// block's range, its text and the window position to open at.
+    /// block's range, its text, the pick's level, which is none for a
+    /// selection, and the window position to open at.
     pub fn on_selection_action(
         &mut self,
         label: impl Into<SharedString>,
-        handler: impl Fn(Range, String, GpuiPoint<Pixels>, &mut Window, &mut App) + 'static,
+        handler: impl Fn(
+            Range,
+            String,
+            Option<PickedTextKind>,
+            GpuiPoint<Pixels>,
+            &mut Window,
+            &mut App,
+        ) + 'static,
         cx: &mut Context<Self>,
     ) {
         self.selection_action = Some(SelectionAction {
@@ -799,13 +971,22 @@ impl TerminalView {
         let point = if terminal.vi_mode_enabled() {
             Some(terminal.last_content().cursor.point)
         } else {
-            self.pointer_point(cx)
-                .or_else(|| self.next_text_block_point(self.visible_lines(cx).rev(), cx))
+            self.pointer_point(cx).or_else(|| {
+                // The last paragraph on screen, which is the most recent
+                // output.
+                let block_point = self.next_text_block_point(self.visible_lines(cx).rev(), cx)?;
+                let block = self.text_block_at(block_point, cx)?;
+                let last = self
+                    .block_units(&block, TextBlockLevel::Paragraph, cx)
+                    .pop()?;
+                Some(unit_start(&last))
+            })
         };
         let position = point.and_then(|point| self.scrollback_position(point, cx));
         self.text_block_pick = Some(TextBlockPick {
             position,
-            level: TextBlockLevel::Block,
+            level: TextBlockLevel::Paragraph,
+            collected: Vec::new(),
         });
         cx.notify();
     }
@@ -814,8 +995,16 @@ impl TerminalView {
         Some(self.text_block_pick.as_ref()?.level)
     }
 
-    /// Picks the whole block, or a sentence of it: the one under the
-    /// pointer, else the block's first.
+    fn pick_point(&self, cx: &App) -> Option<Point> {
+        self.text_block_pick
+            .as_ref()?
+            .position
+            .and_then(|position| self.grid_point(position, cx))
+    }
+
+    /// Picks the whole block, or a paragraph or a sentence of it: the one
+    /// under the pointer, else the one the pick is in. Clears the texts
+    /// picked to act on together, which are of the old level.
     pub fn set_text_block_pick_level(&mut self, level: TextBlockLevel, cx: &mut Context<Self>) {
         let Some(pick) = &self.text_block_pick else {
             return;
@@ -823,55 +1012,123 @@ impl TerminalView {
         if pick.level == level {
             return;
         }
-        let point = pick
-            .position
-            .and_then(|position| self.grid_point(position, cx));
-        let position = match level {
-            TextBlockLevel::Block => pick.position,
-            TextBlockLevel::Sentence => point
-                .and_then(|point| self.first_sentence_point(point, cx))
-                .and_then(|point| self.scrollback_position(point, cx))
-                .or(pick.position),
-        };
+        let from_message = pick.level == TextBlockLevel::Message;
+        let position = self
+            .pick_point(cx)
+            .and_then(|point| self.level_point(point, level, from_message, cx))
+            .and_then(|point| self.scrollback_position(point, cx))
+            .or(pick.position);
         if let Some(pick) = &mut self.text_block_pick {
             pick.level = level;
             pick.position = position;
+            pick.collected.clear();
         }
         cx.notify();
     }
 
-    fn first_sentence_point(&self, point: Point, cx: &App) -> Option<Point> {
+    /// Where a pick at `point` rests at `level`: the start of the unit
+    /// under the pointer when it's in the same block, else of the unit at
+    /// `point`, or of the block's first when the pick is on the whole
+    /// block.
+    fn level_point(
+        &self,
+        point: Point,
+        level: TextBlockLevel,
+        from_message: bool,
+        cx: &App,
+    ) -> Option<Point> {
+        if level == TextBlockLevel::Message {
+            return Some(point);
+        }
         let block = self.text_block_at(point, cx)?;
-        let pointer_sentence = self
+        // The pointer only counts while it's on the picked text, since the
+        // keyboard may have moved the pick away from it.
+        let current_unit = self
+            .text_block_pick
+            .as_ref()
+            .and_then(|pick| self.unit_at(point, pick.level, cx))
+            .map(|(unit, _)| unit);
+        let unit_point = self
             .pointer_point(cx)
-            .filter(|pointer| self.text_block_at(*pointer, cx).as_ref() == Some(&block))
-            .and_then(|pointer| self.sentence_at(pointer, cx))
-            .map(|(sentence, _)| sentence);
-        let sentence =
-            pointer_sentence.or_else(|| self.block_sentences(&block, cx).into_iter().next())?;
-        Some(sentence_start(&sentence))
+            .filter(|pointer| {
+                current_unit
+                    .as_ref()
+                    .is_some_and(|unit| unit_contains(unit, *pointer))
+            })
+            .or_else(|| from_message.then(|| unit_start(&block)))
+            .unwrap_or(point);
+        let (unit, _) = self.unit_at(unit_point, level, cx)?;
+        Some(unit_start(&unit))
     }
 
-    /// Whether `range` is one sentence of the text block there, and not the
-    /// whole block.
-    pub fn is_text_block_sentence(&self, range: Range, cx: &App) -> bool {
-        let Some(block) = self.text_block_at(range.start(), cx) else {
-            return false;
+    /// The nearest level past the pick's, toward smaller texts when
+    /// `narrower` is set, that picks other text than the pick does now.
+    /// Levels that would pick the same text as their neighbor are skipped,
+    /// toward the message when widening.
+    fn next_distinct_level(&self, narrower: bool, cx: &App) -> Option<TextBlockLevel> {
+        let pick = self.text_block_pick.as_ref()?;
+        let point = self.pick_point(cx)?;
+        let current = self.unit_at(point, pick.level, cx)?.0.range();
+        let index = TextBlockLevel::ALL
+            .iter()
+            .position(|level| *level == pick.level)?;
+        let candidates: Vec<TextBlockLevel> = if narrower {
+            TextBlockLevel::ALL[index + 1..].to_vec()
+        } else {
+            TextBlockLevel::ALL[..index].iter().rev().copied().collect()
         };
-        block.range() != Some(range)
-            && self
-                .block_sentences(&block, cx)
-                .iter()
-                .any(|sentence| sentence.range() == Some(range))
+        let from_message = pick.level == TextBlockLevel::Message;
+        let ranges = candidates
+            .iter()
+            .map(|level| {
+                self.level_point(point, *level, from_message, cx)
+                    .and_then(|point| self.unit_at(point, *level, cx))
+                    .and_then(|(unit, _)| unit.range())
+            })
+            .collect::<Vec<_>>();
+        let first = ranges
+            .iter()
+            .position(|range| range.is_some() && *range != current)?;
+        let mut chosen = first;
+        if !narrower {
+            while ranges
+                .get(chosen + 1)
+                .is_some_and(|range| *range == ranges[first])
+            {
+                chosen += 1;
+            }
+        }
+        candidates.get(chosen).copied()
     }
 
-    /// Goes from a sentence back to its block, else ends the pick.
+    /// Picks a paragraph of the picked message, or a sentence of the
+    /// picked paragraph.
+    pub fn narrow_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        if let Some(level) = self.next_distinct_level(true, cx) {
+            self.set_text_block_pick_level(level, cx);
+        }
+    }
+
+    /// Picks the paragraph or the message the pick is in.
+    pub fn widen_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        if let Some(level) = self.next_distinct_level(false, cx) {
+            self.set_text_block_pick_level(level, cx);
+        }
+    }
+
+    /// Clears the texts picked to act on together, else goes back to the
+    /// paragraph or the message the pick is in, else ends the pick.
     pub fn back_out_of_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        match self.text_block_pick_level() {
-            Some(TextBlockLevel::Sentence) => {
-                self.set_text_block_pick_level(TextBlockLevel::Block, cx)
-            }
-            _ => self.cancel_text_block_pick(cx),
+        if let Some(pick) = &mut self.text_block_pick
+            && !pick.collected.is_empty()
+        {
+            pick.collected.clear();
+            cx.notify();
+            return;
+        }
+        match self.next_distinct_level(false, cx) {
+            Some(level) => self.set_text_block_pick_level(level, cx),
+            None => self.cancel_text_block_pick(cx),
         }
     }
 
@@ -882,20 +1139,13 @@ impl TerminalView {
         }
     }
 
-    /// Moves the pick to the next or the previous text block on screen, or
-    /// while picking sentences, to the next or the previous sentence, which
-    /// carries on into the neighboring block.
+    /// Moves the pick to the next or the previous text at the pick's level,
+    /// which carries on into the neighboring block.
     pub fn move_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(pick) = &self.text_block_pick else {
             return;
         };
-        let current_point = pick
-            .position
-            .and_then(|position| self.grid_point(position, cx));
-        let point = match pick.level {
-            TextBlockLevel::Block => self.adjacent_block_point(current_point, forward, cx),
-            TextBlockLevel::Sentence => self.adjacent_sentence_point(current_point, forward, cx),
-        };
+        let point = self.adjacent_unit_point(self.pick_point(cx), pick.level, forward, cx);
         let Some(position) = point.and_then(|point| self.scrollback_position(point, cx)) else {
             return;
         };
@@ -905,35 +1155,69 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn adjacent_sentence_point(
+    /// Adds the picked text to the texts to act on together, or takes it
+    /// out when it's already one of them, and moves the pick on.
+    pub fn extend_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(pick) = &self.text_block_pick else {
+            return;
+        };
+        let point = self.pick_point(cx);
+        let start = point
+            .and_then(|point| self.unit_at(point, pick.level, cx))
+            .and_then(|(unit, _)| self.scrollback_position(unit_start(&unit), cx));
+        // At the first or the last text there's nowhere to move, so the
+        // text is only added, or pressing again would take it back out.
+        let at_end = self
+            .adjacent_unit_point(point, pick.level, forward, cx)
+            .is_none();
+        if let Some(start) = start
+            && let Some(pick) = &mut self.text_block_pick
+        {
+            match pick.collected.iter().position(|other| *other == start) {
+                Some(_) if at_end => {}
+                Some(index) => {
+                    pick.collected.remove(index);
+                }
+                None => pick.collected.push(start),
+            }
+        }
+        self.move_text_block_pick(forward, cx);
+        cx.notify();
+    }
+
+    fn adjacent_unit_point(
         &self,
         current_point: Option<Point>,
+        level: TextBlockLevel,
         forward: bool,
         cx: &App,
     ) -> Option<Point> {
-        let Some((sentence, block)) = current_point.and_then(|point| self.sentence_at(point, cx))
+        if level == TextBlockLevel::Message {
+            return self.adjacent_block_point(current_point, forward, cx);
+        }
+        let Some((unit, block)) = current_point.and_then(|point| self.unit_at(point, level, cx))
         else {
             return self.adjacent_block_point(current_point, forward, cx);
         };
-        let sentences = self.block_sentences(&block, cx);
-        let index = sentences.iter().position(|other| *other == sentence)?;
+        let units = self.block_units(&block, level, cx);
+        let index = units.iter().position(|other| *other == unit)?;
         let next_index = if forward {
             index.checked_add(1)
         } else {
             index.checked_sub(1)
         };
-        if let Some(next) = next_index.and_then(|index| sentences.get(index)) {
-            return Some(sentence_start(next));
+        if let Some(next) = next_index.and_then(|index| units.get(index)) {
+            return Some(unit_start(next));
         }
         let block_point = self.adjacent_block_point(current_point, forward, cx)?;
         let next_block = self.text_block_at(block_point, cx)?;
-        let next_sentences = self.block_sentences(&next_block, cx);
+        let next_units = self.block_units(&next_block, level, cx);
         let next = if forward {
-            next_sentences.first()
+            next_units.first()
         } else {
-            next_sentences.last()
+            next_units.last()
         };
-        Some(next.map_or(block_point, sentence_start))
+        Some(next.map_or(block_point, unit_start))
     }
 
     fn adjacent_block_point(
@@ -961,17 +1245,21 @@ impl TerminalView {
         }
     }
 
-    /// The picked block's range, its text and the window position its
-    /// action opens at. Ends the pick unless `keep_picking` is set.
+    /// The picked texts' range, their text, their level and the window
+    /// position the action opens at. Texts picked to act on together are
+    /// joined in the order they're on screen, with a line of `…` where
+    /// other text is between them. Ends the pick unless `keep_picking` is
+    /// set.
     pub fn take_text_block_pick_target(
         &mut self,
         keep_picking: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(Range, String, GpuiPoint<Pixels>)> {
+    ) -> Option<(Range, String, PickedTextKind, GpuiPoint<Pixels>)> {
         if !self.takes_mouse_for_text_block_pick() {
             return None;
         }
+        let level = self.text_block_pick.as_ref()?.level;
         let picked = self.picked_text(cx)?;
         let content = self.terminal.read(cx).last_content();
         let origin = terminal_element::text_block_action_origin(
@@ -982,65 +1270,107 @@ impl TerminalView {
             window,
             cx,
         )?;
+        let mut units = picked.collected;
+        units.push(picked.block);
+        units.sort_by_key(unit_start);
+        units.dedup_by_key(|unit| unit_start(unit));
+        let range = Range::new(
+            units.first()?.range()?.start(),
+            units.last()?.range()?.end(),
+        );
+        let mut text = String::new();
+        for (index, unit) in units.iter().enumerate() {
+            if let Some(previous) = index.checked_sub(1).and_then(|index| units.get(index)) {
+                let next_start =
+                    self.adjacent_unit_point(Some(unit_start(previous)), level, true, cx);
+                text.push_str(if next_start != Some(unit_start(unit)) {
+                    "\n…\n"
+                } else if level == TextBlockLevel::Sentence {
+                    " "
+                } else {
+                    "\n"
+                });
+            }
+            text.push_str(&unit.text);
+        }
         if !keep_picking {
             self.cancel_text_block_pick(cx);
+        } else if let Some(pick) = &mut self.text_block_pick {
+            pick.collected.clear();
         }
-        Some((picked.block.range()?, picked.block.text, origin))
+        let kind = PickedTextKind {
+            level,
+            combined: units.len() > 1,
+        };
+        Some((range, text, kind, origin))
     }
 
     /// The text the pick points at, looked up from the terminal's content.
     fn picked_text(&self, cx: &App) -> Option<PickedTextBlock> {
         let pick = self.text_block_pick.as_ref()?;
-        let point = pick
-            .position
-            .and_then(|position| self.grid_point(position, cx))?;
-        match pick.level {
-            TextBlockLevel::Block => Some(PickedTextBlock {
-                block: self.text_block_at(point, cx)?,
-                parent: None,
-                anchor: point,
-            }),
-            TextBlockLevel::Sentence => {
-                let (sentence, block) = self.sentence_at(point, cx)?;
-                let anchor = if sentence_contains(&sentence, point) {
-                    point
-                } else {
-                    sentence_start(&sentence)
-                };
-                Some(PickedTextBlock {
-                    block: sentence,
-                    parent: Some(block),
-                    anchor,
-                })
-            }
-        }
-    }
-
-    /// The sentence at `point`, else the first one after it in its block,
-    /// else the block's last, with the block.
-    fn sentence_at(&self, point: Point, cx: &App) -> Option<(TextBlock, TextBlock)> {
-        let block = self.text_block_at(point, cx)?;
-        let sentences = self.block_sentences(&block, cx);
-        let sentence = sentences
+        let point = self.pick_point(cx)?;
+        let (unit, block) = self.unit_at(point, pick.level, cx)?;
+        let anchor = if unit_contains(&unit, point) {
+            point
+        } else {
+            unit_start(&unit)
+        };
+        let collected = pick
+            .collected
             .iter()
-            .find(|sentence| sentence_contains(sentence, point))
-            .or_else(|| {
-                sentences
-                    .iter()
-                    .find(|sentence| sentence_start(sentence) >= point)
+            .filter_map(|position| {
+                let start = self.grid_point(*position, cx)?;
+                let (collected, _) = self.unit_at(start, pick.level, cx)?;
+                (unit_start(&collected) == start && collected != unit).then_some(collected)
             })
-            .or(sentences.last())?
-            .clone();
-        Some((sentence, block))
+            .collect();
+        Some(PickedTextBlock {
+            block: unit,
+            parent: (pick.level != TextBlockLevel::Message).then_some(block),
+            collected,
+            anchor,
+        })
     }
 
-    fn block_sentences(&self, block: &TextBlock, cx: &App) -> Vec<TextBlock> {
+    /// The text at `level` at `point`, else the first one after it in its
+    /// block, else the block's last, with the block.
+    fn unit_at(
+        &self,
+        point: Point,
+        level: TextBlockLevel,
+        cx: &App,
+    ) -> Option<(TextBlock, TextBlock)> {
+        let block = self.text_block_at(point, cx)?;
+        let units = self.block_units(&block, level, cx);
+        let unit = units
+            .iter()
+            .find(|unit| unit_contains(unit, point))
+            .or_else(|| units.iter().find(|unit| unit_start(unit) >= point))
+            .or(units.last())?
+            .clone();
+        Some((unit, block))
+    }
+
+    /// The texts of a block at `level`: the block itself, its paragraphs or
+    /// their sentences.
+    fn block_units(&self, block: &TextBlock, level: TextBlockLevel, cx: &App) -> Vec<TextBlock> {
+        if level == TextBlockLevel::Message {
+            return vec![block.clone()];
+        }
         let Some(lines) = block.lines() else {
             return Vec::new();
         };
         let terminal = self.terminal.read(cx);
         let grid_rows = terminal.grid_rows(lines);
-        sentence_rows(&block.rows, &grid_rows)
+        let paragraphs = paragraph_rows(block, &grid_rows);
+        let unit_rows = match level {
+            TextBlockLevel::Sentence => paragraphs
+                .iter()
+                .flat_map(|paragraph| sentence_rows(paragraph, &grid_rows))
+                .collect(),
+            _ => paragraphs,
+        };
+        unit_rows
             .into_iter()
             .map(|rows| {
                 let mut text = String::new();
@@ -1061,6 +1391,7 @@ impl TerminalView {
                     rows,
                     text,
                     label: None,
+                    paragraphs: Vec::new(),
                 }
             })
             .collect()
@@ -1141,8 +1472,16 @@ impl TerminalView {
         if !self.takes_mouse_for_text_block_pick() {
             return None;
         }
+        let pick = self.text_block_pick.as_ref()?;
+        let level = pick.level;
         let picked = self.picked_text(cx);
-        let level = self.text_block_pick.as_ref()?.level;
+        let position = picked.as_ref().and_then(|picked| {
+            let parent = picked.parent.as_ref()?;
+            let units = self.block_units(parent, level, cx);
+            let index = units.iter().position(|unit| *unit == picked.block)?;
+            Some(format!(" {}/{}", index + 1, units.len()))
+        });
+        let collected = picked.as_ref().map_or(0, |picked| picked.collected.len());
         let label = picked.map(|picked| picked.block).map(|block| {
             block.label.or_else(|| {
                 self.selection_action
@@ -1150,16 +1489,30 @@ impl TerminalView {
                     .map(|action| action.label.clone())
             })
         });
-        let escape = match level {
-            TextBlockLevel::Block => "Esc to cancel",
-            TextBlockLevel::Sentence => "Esc for the block",
+        let escape = if collected > 0 {
+            "Esc to clear".to_string()
+        } else {
+            match self.next_distinct_level(false, cx) {
+                Some(wider) => format!("Esc for the {}", wider.name()),
+                None => "Esc to cancel".to_string(),
+            }
         };
+        let mut level_name = level.name().to_string();
+        if let Some(first) = level_name.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        let picked_count = if collected > 0 {
+            format!(" · {} picked", collected + 1)
+        } else {
+            String::new()
+        };
+        let place = format!("{level_name}{}{picked_count}", position.unwrap_or_default());
         Some(match label {
             Some(Some(label)) => format!(
-                "{label}: click or Enter · Shift to keep picking · ↑↓ to move · ←→ for block or sentence · {escape}"
+                "{place} · {label}: click or Enter · Shift+↑↓ to add · ↑↓ to move · ←→ for message, paragraph or sentence · {escape}"
             )
             .into(),
-            _ => format!("Point at a block · ↑↓ to move · {escape}").into(),
+            _ => format!("Point at a message · ↑↓ to move · {escape}").into(),
         })
     }
 
@@ -1409,7 +1762,7 @@ impl TerminalView {
                     selection_action,
                     |menu, (SelectionAction { label, handler }, (range, text, origin))| {
                         menu.entry(label, None, move |window, cx| {
-                            handler(range, text.clone(), origin, window, cx)
+                            handler(range, text.clone(), None, origin, window, cx)
                         })
                     },
                 )
@@ -2427,14 +2780,18 @@ impl Render for TerminalView {
 }
 
 impl TerminalView {
-    /// Switches between picking blocks and picking sentences, for pointer
-    /// users who don't know the keys.
+    /// Switches between picking messages, paragraphs and sentences, for
+    /// pointer users who don't know the keys.
     fn render_text_block_level_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let current_level = self.text_block_pick_level()?;
         let button = |id: &'static str, label: &'static str, level: TextBlockLevel| {
             Button::new(id, label)
                 .label_size(LabelSize::XSmall)
                 .toggle_state(current_level == level)
+                .tooltip(Tooltip::text(format!(
+                    "Pick a {} · ←→ to change",
+                    level.name()
+                )))
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.set_text_block_pick_level(level, cx)
                 }))
@@ -2443,9 +2800,14 @@ impl TerminalView {
             h_flex()
                 .gap_0p5()
                 .child(button(
-                    "text-block-level-block",
-                    "Block",
-                    TextBlockLevel::Block,
+                    "text-block-level-message",
+                    "Message",
+                    TextBlockLevel::Message,
+                ))
+                .child(button(
+                    "text-block-level-paragraph",
+                    "Paragraph",
+                    TextBlockLevel::Paragraph,
                 ))
                 .child(button(
                     "text-block-level-sentence",
@@ -3203,101 +3565,317 @@ mod tests {
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
-    fn grid_row(line: i32, text: &str, wraps: bool) -> GridRow {
-        GridRow {
-            line,
-            characters: text.chars().collect(),
-            wide_char_spacers: Vec::new(),
-            wraps,
+    /// `text` without its first line break and the indentation its lines
+    /// share.
+    fn dedent(text: &str) -> String {
+        let text = text.strip_prefix('\n').unwrap_or(text);
+        let text = text.trim_end_matches(' ');
+        let indent = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        text.lines()
+            .map(|line| format!("{}\n", line.get(indent..).unwrap_or("")))
+            .collect()
+    }
+
+    /// The grid rows of `text`, padded to `width` columns, and a block of
+    /// its lines with text. A line ending in `\` wraps.
+    fn text_grid(text: &str, width: usize) -> (Vec<GridRow>, TextBlock) {
+        let mut grid_rows = Vec::new();
+        let mut block_rows = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let (line, wraps) = match line.strip_suffix('\\') {
+                Some(line) => (line, true),
+                None => (line, false),
+            };
+            let mut characters = line.chars().collect::<Vec<_>>();
+            characters.resize(width.max(characters.len()), ' ');
+            let line_number = index as i32;
+            let first = characters
+                .iter()
+                .position(|character| !character.is_whitespace());
+            let last = characters
+                .iter()
+                .rposition(|character| !character.is_whitespace());
+            if let (Some(first), Some(last)) = (first, last) {
+                let last = if wraps { characters.len() - 1 } else { last };
+                block_rows.push((line_number, first..=last));
+            }
+            grid_rows.push(GridRow {
+                line: line_number,
+                characters,
+                wide_char_spacers: Vec::new(),
+                wraps,
+            });
+        }
+        let block = TextBlock {
+            rows: block_rows,
+            text: String::new(),
+            label: None,
+            paragraphs: Vec::new(),
+        };
+        (grid_rows, block)
+    }
+
+    fn rows_text(rows: &[(i32, RangeInclusive<usize>)], grid_rows: &[GridRow]) -> String {
+        let mut text = String::new();
+        for (line, columns) in rows {
+            let Some(row) = grid_rows.iter().find(|row| row.line == *line) else {
+                continue;
+            };
+            let row_text = columns
+                .clone()
+                .filter_map(|column| row.characters.get(column))
+                .collect::<String>();
+            if !text.is_empty() && !text.ends_with(' ') {
+                text.push(' ');
+            }
+            text.push_str(row_text.trim());
+        }
+        text
+    }
+
+    fn paragraph_texts(block: &TextBlock, grid_rows: &[GridRow]) -> Vec<String> {
+        paragraph_rows(block, grid_rows)
+            .iter()
+            .map(|rows| rows_text(rows, grid_rows))
+            .collect()
+    }
+
+    fn sentence_texts(block: &TextBlock, grid_rows: &[GridRow]) -> Vec<String> {
+        paragraph_rows(block, grid_rows)
+            .iter()
+            .flat_map(|paragraph| sentence_rows(paragraph, grid_rows))
+            .map(|rows| rows_text(&rows, grid_rows))
+            .collect()
+    }
+
+    fn paragraphs_of(text: &str) -> Vec<String> {
+        let (grid_rows, block) = text_grid(text, 40);
+        paragraph_texts(&block, &grid_rows)
+    }
+
+    #[test]
+    fn test_paragraphs_of_an_agent_message() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  The build failed because the linker
+                  couldn't find the library. I fixed
+                  Cargo.toml and reran the tests.
+
+                  All of them pass now.
+            "
+            )),
+            vec![
+                "The build failed because the linker couldn't find the library. I fixed Cargo.toml and reran the tests.",
+                "All of them pass now.",
+            ],
+            "rows the program wrapped join, a row starting with \"I\" or a \
+             name included, and a blank line ends a paragraph"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_join_rows_the_terminal_wrapped() {
+        assert_eq!(
+            paragraphs_of("A row the terminal wrapped at its edg\\\ne goes on.\nNext line\n"),
+            vec![
+                "A row the terminal wrapped at its edg e goes on.",
+                "Next line"
+            ],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_of_bullets_with_wrapped_rows() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                - First step that takes long enough
+                  to wrap onto a second row.
+                - Second step.
+                  • A nested bullet that is long
+                    enough to wrap as well.
+                * Third step.
+            "
+            )),
+            vec![
+                "- First step that takes long enough to wrap onto a second row.",
+                "- Second step.",
+                "• A nested bullet that is long enough to wrap as well.",
+                "* Third step.",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_of_numbered_and_lettered_lists() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                1. Move the parser into its own crate
+                   so it can be tested alone.
+                2. Add tests.
+                a) Keep the old API as it is
+                   for now.
+                b) Remove it.
+            "
+            )),
+            vec![
+                "1. Move the parser into its own crate so it can be tested alone.",
+                "2. Add tests.",
+                "a) Keep the old API as it is for now.",
+                "b) Remove it.",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_code_diffs_listings_and_logs_apart() {
+        for text in [
+            &dedent(
+                "
+                fn long_name(arg: Type) -> Result {
+                    let value = compute(arg);
+                    value
+            ",
+            ),
+            &dedent(
+                "
+                @@ -1,3 +1,4 @@ fn main() in a file
+                +    let added = line();
+                     unchanged context line
+            ",
+            ),
+            &dedent(
+                "
+                drwxr-xr-x  5 user staff 160 crates
+                drwxr-xr-x  5 user staff 160 assets
+            ",
+            ),
+            &dedent(
+                "
+                2026-11-10T10:00:01 INFO started ok
+                2026-11-10T10:00:02 INFO listening
+            ",
+            ),
+            &dedent(
+                "
+                error[E0308]: mismatched types here, found
+                warning: unused variable `value` in main
+            ",
+            ),
+            &dedent(
+                "
+                ## A heading on its own line
+                Text under the heading that is long
+            ",
+            ),
+        ] {
+            let paragraphs = paragraphs_of(text);
+            assert_eq!(paragraphs.len(), text.lines().count(), "{paragraphs:?}");
         }
     }
 
     #[test]
-    fn test_sentence_rows() {
-        let grid_rows = [
-            grid_row(0, "One. Two is", true),
-            grid_row(1, "wrapped. Three", false),
-            grid_row(2, "No stop", false),
-        ];
-        let block_rows = [(0, 0..=10), (1, 0..=13), (2, 0..=6)];
+    fn test_paragraphs_of_quotes_and_tool_results() {
         assert_eq!(
-            sentence_rows(&block_rows, &grid_rows),
+            paragraphs_of(&dedent(
+                "
+                > A quoted reply that runs long enough
+                  to wrap onto the next row.
+                Read 42 lines from the file you named
+                and found nothing.
+            "
+            )),
             vec![
-                vec![(0, 0..=3)],
-                vec![(0, 5..=10), (1, 0..=7)],
-                vec![(1, 9..=13)],
-                vec![(2, 0..=6)],
+                "> A quoted reply that runs long enough to wrap onto the next row.",
+                "Read 42 lines from the file you named and found nothing.",
             ],
-            "a wrapped row carries a sentence on, while a line break ends one"
         );
     }
 
     #[test]
-    fn test_sentence_rows_join_rows_the_program_wrapped() {
-        let grid_rows = [
-            grid_row(0, "Ran the build and it failed  ", false),
-            grid_row(1, "  with an error. Retry it.   ", false),
-            grid_row(2, "ERROR at line 3              ", false),
-            grid_row(3, "Short line                   ", false),
-            grid_row(4, "next line                    ", false),
-        ];
-        let block_rows = [
-            (0, 0..=27),
-            (1, 2..=25),
-            (2, 0..=14),
-            (3, 0..=9),
-            (4, 0..=8),
-        ];
+    fn test_paragraph_runs_keep_their_lines_together() {
+        let (grid_rows, mut block) = text_grid(
+            &dedent(
+                "
+                1. Which auth method should we use?
+                   a) OAuth
+                   b) API key
+                2. Should tokens expire?
+            ",
+            ),
+            40,
+        );
+        block.paragraphs = vec![0..=2];
         assert_eq!(
-            sentence_rows(&block_rows, &grid_rows),
+            paragraph_texts(&block, &grid_rows),
             vec![
-                vec![(0, 0..=27), (1, 2..=15)],
-                vec![(1, 17..=25)],
-                vec![(2, 0..=14)],
-                vec![(3, 0..=9)],
-                vec![(4, 0..=8)],
+                "1. Which auth method should we use? a) OAuth b) API key",
+                "2. Should tokens expire?",
             ],
-            "a long row without a full stop runs on into a lowercase row, while \
-             an uppercase row or a short row starts afresh"
-        );
-
-        let rows_ending_at_text = [(0, 0..=26), (1, 2..=25)];
-        assert_eq!(
-            sentence_rows(&rows_ending_at_text, &grid_rows)[0],
-            vec![(0, 0..=26), (1, 2..=15)],
-            "the program's line break should stand for a space"
         );
     }
 
     #[test]
-    fn test_sentence_rows_keep_code_and_listings_apart() {
-        let grid_rows = [
-            grid_row(0, "drwxr-xr-x  5 user staff 160 some-long-name  ", false),
-            grid_row(1, "drwxr-xr-x  5 user staff 160 other-name      ", false),
-            grid_row(2, "fn long_name(arg: Type, other: Type) -> R {  ", false),
-            grid_row(3, "    let value = compute(arg);                ", false),
-        ];
-        let listing_rows = [(0, 0..=42), (1, 0..=38)];
-        assert_eq!(sentence_rows(&listing_rows, &grid_rows).len(), 2);
-        let code_rows = [(2, 0..=42), (3, 4..=28)];
-        assert_eq!(sentence_rows(&code_rows, &grid_rows).len(), 2);
-    }
-
-    #[test]
-    fn test_sentence_rows_check_the_whole_next_word() {
-        let joins = |next: &str| {
-            let grid_rows = [
-                grid_row(0, "Pick the option that you want  ", false),
-                grid_row(1, next, false),
-            ];
-            let next_end = next.trim_end().len().saturating_sub(1);
-            sentence_rows(&[(0, 0..=28), (1, 0..=next_end)], &grid_rows).len() == 1
+    fn test_paragraphs_of_wide_characters() {
+        let (mut grid_rows, block) = text_grid(
+            "界 is a wide character in a long row\nand this row carries it on.\n",
+            40,
+        );
+        grid_rows[0].characters.insert(1, ' ');
+        grid_rows[0].characters.pop();
+        grid_rows[0].wide_char_spacers = vec![1];
+        let block = TextBlock {
+            rows: vec![(0, 0..=36), (1, 0..=26)],
+            ..block
         };
-        assert!(joins("a long time ago."));
-        assert!(joins("others' positions and the questions."));
-        assert!(joins("don't stop."));
-        assert!(!joins("a) OAuth"));
-        assert!(!joins("x1 foo"));
+        assert_eq!(paragraph_rows(&block, &grid_rows).len(), 1);
+    }
+
+    #[test]
+    fn test_sentences_of_paragraphs() {
+        let (grid_rows, block) = text_grid(
+            &dedent(
+                "
+                One. Two runs on over a row that the
+                program wrapped. Three
+                No stop
+            ",
+            ),
+            40,
+        );
+        assert_eq!(
+            sentence_texts(&block, &grid_rows),
+            vec![
+                "One.",
+                "Two runs on over a row that the program wrapped.",
+                "Three",
+                "No stop"
+            ],
+        );
+    }
+
+    #[test]
+    fn test_sentences_go_on_after_abbreviations() {
+        let (grid_rows, block) = text_grid(
+            "Use a parser, e.g. Pest. Ask Dr. Who. It ends etc. Then more.\n",
+            70,
+        );
+        assert_eq!(
+            sentence_texts(&block, &grid_rows),
+            vec![
+                "Use a parser, e.g. Pest.",
+                "Ask Dr. Who.",
+                "It ends etc.",
+                "Then more."
+            ],
+        );
     }
 
     #[test]
@@ -3634,7 +4212,7 @@ mod tests {
             let actions = actions.clone();
             terminal_view.on_selection_action(
                 "Act on Selection",
-                move |range, text, _, _, _| actions.borrow_mut().push((range, text)),
+                move |range, text, _, _, _, _| actions.borrow_mut().push((range, text)),
                 cx,
             );
         });
@@ -3748,6 +4326,7 @@ mod tests {
                         rows: vec![(point.line, 0..=4)],
                         text: "hello".into(),
                         label: None,
+                        paragraphs: Vec::new(),
                     })
                 },
                 cx,
@@ -3807,7 +4386,9 @@ mod tests {
             terminal_view.text_block_pick_hint(cx)
         });
         assert!(
-            hint.is_some_and(|hint| hint.starts_with("Act on Selection: click or Enter")),
+            hint.is_some_and(
+                |hint| hint.starts_with("Paragraph 1/1 · Act on Selection: click or Enter")
+            ),
             "the hint should name the action on the picked block"
         );
 
