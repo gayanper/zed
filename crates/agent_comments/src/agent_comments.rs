@@ -24,8 +24,7 @@ use gpui::{
     deferred, px,
 };
 use language::{
-    Buffer, BufferEvent, BufferId, BufferSnapshot, DiskState, Point as BufferPoint,
-    ToOffset as _,
+    Buffer, BufferEvent, BufferId, BufferSnapshot, DiskState, Point as BufferPoint, ToOffset as _,
 };
 use multi_buffer::{MultiBuffer, MultiBufferRow, MultiBufferSnapshot};
 use settings::{Settings as _, SettingsStore};
@@ -40,6 +39,10 @@ actions!(
     [
         /// Adds the comment being written for the agent.
         Submit,
+        /// Closes the agent comment input if nothing has been written in it.
+        CancelIfEmpty,
+        /// Closes the agent comment input, discarding what was written in it.
+        Discard,
         /// Moves focus to the next control in the agent comment input.
         FocusNext,
         /// Moves focus to the previous control in the agent comment input.
@@ -1427,6 +1430,7 @@ impl CommentInput {
             let mut editor = Editor::auto_height(INPUT_MIN_LINES, INPUT_MAX_LINES, window, cx);
             editor.set_placeholder_text("Add a comment for the agent…", window, cx);
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.set_use_modal_editing(true);
             editor
         });
         // The editor comes first when tabbing through the input's controls.
@@ -1504,6 +1508,18 @@ impl CommentInput {
         cx.emit(CommentInputEvent::Cancelled);
     }
 
+    /// Vim users press escape out of habit, so in vim normal mode escape
+    /// mustn't throw away a written comment.
+    fn cancel_if_empty(&mut self, _: &CancelIfEmpty, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.read(cx).text(cx).trim().is_empty() {
+            cx.emit(CommentInputEvent::Cancelled);
+        }
+    }
+
+    fn discard(&mut self, _: &Discard, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(CommentInputEvent::Cancelled);
+    }
+
     fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
         window.focus_next(cx);
     }
@@ -1538,6 +1554,8 @@ impl Render for CommentInput {
             .tab_group()
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::cancel_if_empty))
+            .on_action(cx.listener(Self::discard))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_previous))
             .w(rems(36.))
@@ -2862,6 +2880,113 @@ mod tests {
                     .len()
             });
             assert_eq!(first_word_highlights, 1);
+        }
+
+        fn bind_keys(vim_enabled: bool, cx: &mut VisualTestContext) {
+            cx.update(|_, cx| {
+                vim::init(cx);
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |content| content.vim_mode = Some(vim_enabled));
+                });
+                let mut assets = vec![(
+                    "keymaps/default-macos.json",
+                    settings::KeybindSource::Default,
+                )];
+                if vim_enabled {
+                    assets.push(("keymaps/vim.json", settings::KeybindSource::Vim));
+                }
+                for (asset, source) in assets {
+                    let mut bindings =
+                        settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                            .expect("keymap should load");
+                    for binding in &mut bindings {
+                        binding.set_meta(source.meta());
+                    }
+                    cx.bind_keys(bindings);
+                }
+            });
+            cx.run_until_parked();
+        }
+
+        async fn open_input_with_keymap(
+            vim_enabled: bool,
+            cx: &mut TestAppContext,
+        ) -> (
+            Entity<Editor>,
+            Entity<AgentCommentStore>,
+            &mut VisualTestContext,
+        ) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+            bind_keys(vim_enabled, cx);
+            let store = enable_comments(&editor, cx);
+            select(&editor, 4..7, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            assert!(!editor_focused(&editor, cx), "the input takes focus");
+            (editor, store, cx)
+        }
+
+        #[gpui::test]
+        async fn test_vim_escape_closes_an_empty_input(cx: &mut TestAppContext) {
+            let (editor, _, cx) = open_input_with_keymap(true, cx).await;
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(editor_focused(&editor, cx));
+        }
+
+        #[gpui::test]
+        async fn test_vim_escape_keeps_a_written_comment(cx: &mut TestAppContext) {
+            let (editor, store, cx) = open_input_with_keymap(true, cx).await;
+            cx.simulate_keystrokes("i R e n a m e escape");
+            cx.run_until_parked();
+            assert!(
+                !editor_focused(&editor, cx),
+                "escape in insert mode returns to normal mode"
+            );
+            cx.simulate_keystrokes("escape ctrl-[");
+            cx.run_until_parked();
+            assert!(!editor_focused(&editor, cx));
+            assert!(bodies(&store, cx).is_empty());
+        }
+
+        #[gpui::test]
+        async fn test_vim_enter_submits(cx: &mut TestAppContext) {
+            let (editor, store, cx) = open_input_with_keymap(true, cx).await;
+            cx.simulate_keystrokes("i R e n a m e escape enter");
+            cx.run_until_parked();
+            assert!(editor_focused(&editor, cx));
+            assert_eq!(bodies(&store, cx), ["Rename"]);
+        }
+
+        #[gpui::test]
+        async fn test_vim_ctrl_c_discards_a_written_comment(cx: &mut TestAppContext) {
+            let (editor, store, cx) = open_input_with_keymap(true, cx).await;
+            cx.simulate_keystrokes("i R e n a m e escape ctrl-c");
+            cx.run_until_parked();
+            assert!(editor_focused(&editor, cx));
+            assert!(bodies(&store, cx).is_empty());
+        }
+
+        #[gpui::test]
+        async fn test_vim_tab_leaves_the_input_editor(cx: &mut TestAppContext) {
+            let (editor, _, cx) = open_input_with_keymap(true, cx).await;
+            let input_focus = cx.update(|window, cx| window.focused(cx));
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            let focus = cx.update(|window, cx| window.focused(cx));
+            assert!(focus.is_some());
+            assert_ne!(focus, input_focus, "tab moves to the input's buttons");
+            assert!(!editor_focused(&editor, cx));
+        }
+
+        #[gpui::test]
+        async fn test_escape_without_vim_discards_a_written_comment(cx: &mut TestAppContext) {
+            let (editor, store, cx) = open_input_with_keymap(false, cx).await;
+            cx.simulate_input("Rename");
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(editor_focused(&editor, cx));
+            assert!(bodies(&store, cx).is_empty());
         }
     }
 }

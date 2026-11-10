@@ -1211,6 +1211,22 @@
       "enter": "agent::Chat",
     },
   },
+  {
+    "context": "AgentCommentInput > Editor && VimControl && !menu",
+    "bindings": {
+      "enter": "agent_comments::Submit",
+      "ctrl-c": "agent_comments::Discard",
+      "tab": "agent_comments::FocusNext",
+      "shift-tab": "agent_comments::FocusPrevious",
+    },
+  },
+  {
+    "context": "AgentCommentInput > Editor && (vim_mode == normal || vim_mode == helix_normal) && !menu",
+    "bindings": {
+      "escape": "agent_comments::CancelIfEmpty",
+      "ctrl-[": "agent_comments::CancelIfEmpty",
+    },
+  },
 
   {
     "context": "SettingsWindow > NavigationMenu && !search",
