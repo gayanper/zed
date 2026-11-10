@@ -24,7 +24,8 @@ use gpui::{
     deferred, px,
 };
 use language::{
-    Buffer, BufferEvent, BufferId, BufferSnapshot, Point as BufferPoint, ToOffset as _,
+    Buffer, BufferEvent, BufferId, BufferSnapshot, DiskState, Point as BufferPoint,
+    ToOffset as _,
 };
 use multi_buffer::{MultiBuffer, MultiBufferRow, MultiBufferSnapshot};
 use settings::{Settings as _, SettingsStore};
@@ -846,10 +847,22 @@ fn refresh_editor_comment_buttons(
     show_selection_button: bool,
     cx: &mut Context<Editor>,
 ) {
-    let has_active_store = comment_store(editor.workspace().as_ref(), cx).is_some();
+    let has_active_store = comment_store(editor.workspace().as_ref(), cx).is_some()
+        && !selection_in_historic_file(editor, cx);
     editor.set_show_selection_comment_button(show_selection_button && has_active_store, cx);
     let in_comment = has_active_store && comment_at_cursor(editor, cx).is_some();
     editor.set_show_cursor_comment_button(in_comment, cx);
+}
+
+/// Whether the newest selection is in a past revision of a file, such as in a
+/// commit view, which isn't offered for comments.
+fn selection_in_historic_file(editor: &Editor, cx: &App) -> bool {
+    let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+    let selection = editor.selections.newest_anchor().range();
+    multi_buffer_snapshot
+        .anchor_range_to_buffer_anchor_range(selection)
+        .and_then(|(snapshot, _)| snapshot.file())
+        .is_some_and(|file| matches!(file.disk_state(), DiskState::Historic { .. }))
 }
 
 /// The first comment, in document order, overlapping the newest selection.
@@ -1096,7 +1109,9 @@ fn toggle_editor_comment(
             .update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
         return;
     }
-    if comment_store(editor.workspace().as_ref(), cx).is_none() {
+    if comment_store(editor.workspace().as_ref(), cx).is_none()
+        || selection_in_historic_file(editor, cx)
+    {
         return;
     }
     let display_snapshot = editor.display_snapshot(cx);
