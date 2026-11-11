@@ -66,6 +66,12 @@ pub struct ProjectSettingsContent {
     /// Default: true
     pub auto_start_language_servers: Option<bool>,
 
+    /// Names of language servers that start automatically even when
+    /// `auto_start_language_servers` is disabled. A project-level list replaces the user-level one.
+    ///
+    /// Default: []
+    pub auto_start_language_servers_exceptions: Option<Vec<String>>,
+
     pub terminal: Option<ProjectTerminalSettingsContent>,
 
     /// Configuration for Debugger-related features
@@ -97,7 +103,7 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, auto_start_language_servers, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        terminal, auto_start_language_servers, auto_start_language_servers_exceptions, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
     },
     defaults: { lsp, dap, context_servers },
 });

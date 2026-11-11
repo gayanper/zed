@@ -414,14 +414,15 @@ impl LocalLspStore {
             .copied()
             .or(self.auto_start_language_servers)
             .unwrap_or_else(|| {
-                ProjectSettings::get(
+                let settings = ProjectSettings::get(
                     Some(SettingsLocation {
                         worktree_id,
                         path: RelPath::empty(),
                     }),
                     cx,
-                )
-                .auto_start_language_servers
+                );
+                settings.auto_start_language_servers
+                    || settings.auto_start_language_servers_exceptions.contains(name)
             })
     }
 
@@ -13042,6 +13043,47 @@ impl LspStore {
             )
             .auto_start_language_servers
         })
+    }
+
+    /// Whether the named language server starts automatically on buffer open in the given worktree.
+    /// Always true for remote projects, where the host decides.
+    pub fn auto_starts_language_server(
+        &self,
+        name: &LanguageServerName,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> bool {
+        self.as_local()
+            .is_none_or(|local| local.can_start_language_server(name, worktree_id, cx))
+    }
+
+    /// Starts the named language servers for a buffer without stopping any running servers.
+    /// Local projects only; no-op for remote.
+    pub fn start_language_servers_for_buffer(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        server_names: Vec<LanguageServerName>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        if !local
+            .registered_buffers
+            .contains_key(&buffer.read(cx).remote_id())
+        {
+            return;
+        }
+        let selectors = server_names
+            .into_iter()
+            .map(LanguageServerSelector::Name)
+            .collect();
+        local.register_buffer_with_language_servers(
+            buffer,
+            selectors,
+            LanguageServerStartMode::Explicit,
+            cx,
+        );
     }
 
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {

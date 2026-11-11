@@ -1483,3 +1483,194 @@ async fn test_enabling_auto_start_starts_servers_for_open_buffers(cx: &mut TestA
     cx.run_until_parked();
     fake_servers.next().await.unwrap();
 }
+
+#[gpui::test]
+async fn test_auto_start_exceptions_bypass_disabled_auto_start(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.auto_start_language_servers = Some(false);
+                settings.project.auto_start_language_servers_exceptions =
+                    Some(vec!["spell-checker".to_string()]);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/the-root"), json!({ "a.rs": "fn a() {}" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/the-root").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut gated_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-analyzer",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let mut exempt_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "spell-checker",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let exempt_server = exempt_servers.next().await.unwrap();
+    let exempt_server_id = exempt_server.server.server_id();
+    assert!(gated_servers.next().now_or_never().is_none());
+
+    lsp_store.update(cx, |store, cx| {
+        store.start_language_servers_for_buffer(
+            &buffer,
+            vec![LanguageServerName("rust-analyzer".into())],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    gated_servers.next().await.unwrap();
+    assert!(
+        exempt_servers.next().now_or_never().is_none(),
+        "starting the gated server must not restart the exempt one"
+    );
+    lsp_store.read_with(cx, |store, _| {
+        assert!(
+            store
+                .language_server_statuses()
+                .any(|(server_id, _)| server_id == exempt_server_id)
+        );
+        assert_eq!(store.language_server_statuses().count(), 2);
+    });
+}
+
+#[gpui::test]
+async fn test_stop_all_holds_auto_start_exceptions(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.auto_start_language_servers = Some(false);
+                settings.project.auto_start_language_servers_exceptions =
+                    Some(vec!["spell-checker".to_string()]);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/the-root"),
+        json!({ "a.rs": "fn a() {}", "b.rs": "fn b() {}" }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/the-root").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut exempt_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "spell-checker",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+
+    let (_buffer_a, _handle_a) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    exempt_servers.next().await.unwrap();
+
+    lsp_store.update(cx, |store, cx| store.stop_all_language_servers(cx));
+    cx.run_until_parked();
+    let (_buffer_b, _handle_b) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(exempt_servers.next().now_or_never().is_none());
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 0);
+    });
+}
+
+#[gpui::test]
+async fn test_starting_server_in_one_worktree_keeps_it_running_in_another(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    disable_language_server_auto_start(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/first"), json!({ "a.rs": "fn a() {}" }))
+        .await;
+    fs.insert_tree(path!("/second"), json!({ "b.rs": "fn b() {}" }))
+        .await;
+
+    let project = Project::test(
+        fs,
+        [path!("/first").as_ref(), path!("/second").as_ref()],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-analyzer",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let server_names = vec![LanguageServerName("rust-analyzer".into())];
+
+    let (buffer_a, _handle_a) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/first/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    lsp_store.update(cx, |store, cx| {
+        store.start_language_servers_for_buffer(&buffer_a, server_names.clone(), cx);
+    });
+    cx.run_until_parked();
+    let first_server_id = fake_servers.next().await.unwrap().server.server_id();
+
+    let (buffer_b, _handle_b) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/second/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    lsp_store.update(cx, |store, cx| {
+        store.start_language_servers_for_buffer(&buffer_b, server_names, cx);
+    });
+    cx.run_until_parked();
+    fake_servers.next().await.unwrap();
+
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 2);
+        assert!(
+            store
+                .language_server_statuses()
+                .any(|(server_id, _)| server_id == first_server_id)
+        );
+    });
+}

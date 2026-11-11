@@ -2810,6 +2810,9 @@
   // Whether to start language servers automatically when buffers are opened.
   // When disabled, start them on demand from the language servers status bar button.
   "auto_start_language_servers": true,
+  // Names of language servers that start automatically even when
+  // `auto_start_language_servers` is disabled, e.g. ["codebook"].
+  "auto_start_language_servers_exceptions": [],
   // Common language server settings.
   "global_lsp_settings": {
     // Whether to show the LSP servers button in the status bar.

@@ -18,7 +18,7 @@ use language::{BinaryStatus, Buffer, BufferId, ServerHealth, language_settings::
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use path::PathStyle;
 use project::{
-    LspStore, LspStoreEvent, Worktree, lsp_store::log_store::GlobalLogStore,
+    LspStore, LspStoreEvent, Project, Worktree, lsp_store::log_store::GlobalLogStore,
     project_settings::ProjectSettings, trusted_worktrees::TrustedWorktrees,
 };
 use settings::{Settings as _, SettingsStore};
@@ -222,29 +222,30 @@ impl LanguageServerHealthStatus {
     }
 }
 
-/// Returns the active editor's buffer if it has language servers available but none running.
-fn startable_buffer(
-    editor: &Entity<Editor>,
-    workspace: &Workspace,
-    language_servers: &LanguageServers,
+/// Language servers for the active buffer that need a manual start: configured for the buffer's
+/// language, gated by `auto_start_language_servers`, and not running.
+#[derive(Clone)]
+struct StartableServers {
+    buffer: Entity<Buffer>,
+    servers: Vec<LanguageServerName>,
+    has_running_servers: bool,
+}
+
+fn startable_servers(
+    buffer: Entity<Buffer>,
+    project: &Project,
+    running_servers: &HashSet<LanguageServerName>,
     cx: &App,
-) -> Option<Entity<Buffer>> {
-    let buffer = editor.read(cx).active_buffer(cx)?;
-    let buffer_ref = buffer.read(cx);
-    let language = buffer_ref.language()?;
-    let file = project::File::from_dyn(buffer_ref.file())?;
-    let language_settings = LanguageSettings::for_buffer(buffer_ref, cx);
-    if !language_settings.enable_language_server {
+) -> Option<StartableServers> {
+    // Remote clients don't register adapters locally, so they can't tell whether a server exists.
+    if !project.is_local() {
         return None;
     }
-    let project = workspace.project().read(cx);
-    // Remote clients don't register adapters locally, so they can't tell whether a server exists.
-    if !project.is_local()
-        || project
-            .lsp_store()
-            .read(cx)
-            .auto_starts_language_servers(file.worktree_id(cx), cx)
-    {
+    let buffer_ref = buffer.read(cx);
+    let language = buffer_ref.language()?;
+    let worktree_id = project::File::from_dyn(buffer_ref.file())?.worktree_id(cx);
+    let language_settings = LanguageSettings::for_buffer(buffer_ref, cx);
+    if !language_settings.enable_language_server {
         return None;
     }
     let available_servers = project
@@ -253,18 +254,27 @@ fn startable_buffer(
         .iter()
         .map(|adapter| adapter.name())
         .collect::<Vec<_>>();
-    if language_settings
+    let lsp_store = project.lsp_store().read(cx);
+    let servers = language_settings
         .customized_language_servers(&available_servers)
-        .is_empty()
-    {
+        .into_iter()
+        .filter(|name| {
+            !running_servers.contains(name)
+                && !lsp_store.auto_starts_language_server(name, worktree_id, cx)
+        })
+        .collect::<Vec<_>>();
+    if servers.is_empty() {
         return None;
     }
-    let abs_path = file.worktree.read(cx).absolutize(&file.path);
-    let has_running_servers = language_servers
-        .servers_per_buffer_abs_path
-        .get(&abs_path)
-        .is_some_and(|servers_for_path| !servers_for_path.servers.is_empty());
-    (!has_running_servers).then_some(buffer)
+    Some(StartableServers {
+        buffer,
+        servers,
+        has_running_servers: !running_servers.is_empty(),
+    })
+}
+
+fn start_servers(lsp_store: &mut LspStore, startable: StartableServers, cx: &mut Context<LspStore>) {
+    lsp_store.start_language_servers_for_buffer(&startable.buffer, startable.servers, cx);
 }
 
 pub fn start_language_servers_for_active_buffer(
@@ -279,23 +289,49 @@ pub fn start_language_servers_for_active_buffer(
     else {
         return;
     };
-    let lsp_store = workspace.project().read(cx).lsp_store();
-    lsp_store.update(cx, |lsp_store, cx| {
-        let has_running_servers = lsp_store
+    let project = workspace.project().read(cx);
+    let lsp_store = project.lsp_store();
+    let running_servers = {
+        let lsp_store = lsp_store.read(cx);
+        lsp_store
             .language_server_ids_for_opened_buffer(buffer.read(cx).remote_id())
-            .is_some_and(|server_ids| !server_ids.is_empty());
-        // Avoid restarting servers that are already running; this action only starts them.
-        if !has_running_servers {
-            lsp_store.restart_language_servers_for_buffers(vec![buffer], HashSet::default(), cx);
-        }
-    });
+            .into_iter()
+            .flatten()
+            .filter_map(|server_id| {
+                lsp_store
+                    .language_server_statuses()
+                    .find(|(id, _)| id == server_id)
+                    .map(|(_, status)| status.name.clone())
+            })
+            .collect::<HashSet<_>>()
+    };
+    let Some(startable) = startable_servers(buffer, project, &running_servers, cx) else {
+        return;
+    };
+    lsp_store.update(cx, |lsp_store, cx| start_servers(lsp_store, startable, cx));
 }
 
 impl LanguageServerState {
-    fn startable_buffer(&self, cx: &App) -> Option<Entity<Buffer>> {
+    fn startable_servers(&self, cx: &App) -> Option<StartableServers> {
         let editor = self.active_editor.as_ref()?.editor.upgrade()?;
         let workspace = self.workspace.upgrade()?;
-        startable_buffer(&editor, workspace.read(cx), &self.language_servers, cx)
+        let buffer = editor.read(cx).active_buffer(cx)?;
+        let file = project::File::from_dyn(buffer.read(cx).file())?;
+        let abs_path = file.worktree.read(cx).absolutize(&file.path);
+        let running_servers = self
+            .language_servers
+            .servers_per_buffer_abs_path
+            .get(&abs_path)
+            .map(|servers_for_path| {
+                servers_for_path
+                    .servers
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        startable_servers(buffer, workspace.read(cx).project().read(cx), &running_servers, cx)
     }
 
     fn fill_menu(&self, mut menu: ContextMenu, cx: &mut Context<Self>) -> ContextMenu {
@@ -345,25 +381,27 @@ impl LanguageServerState {
             );
         }
 
-        if !is_restricted && let Some(buffer) = self.startable_buffer(cx) {
-            let file_name = buffer
+        if !is_restricted && let Some(startable) = self.startable_servers(cx) {
+            let file_name = startable
+                .buffer
                 .read(cx)
                 .file()
                 .map(|file| file.file_name(cx).to_string())
                 .unwrap_or_default();
+            let label = match startable.servers.as_slice() {
+                [server] => format!("Start {server} for {file_name}"),
+                _ => format!("Start Language Servers for {file_name}"),
+            };
             let lsp_store = self.lsp_store.clone();
             menu = menu
                 .item(
-                    ContextMenuEntry::new(format!("Start Language Servers for {file_name}"))
+                    ContextMenuEntry::new(label)
                         .icon(IconName::PlayOutlined)
                         .handler(move |_, cx| {
+                            let startable = startable.clone();
                             lsp_store
                                 .update(cx, |lsp_store, cx| {
-                                    lsp_store.restart_language_servers_for_buffers(
-                                        vec![buffer.clone()],
-                                        HashSet::default(),
-                                        cx,
-                                    );
+                                    start_servers(lsp_store, startable, cx)
                                 })
                                 .log_err();
                         }),
@@ -1489,7 +1527,12 @@ impl Render for LspButton {
             .unwrap_or(false);
 
         let state = self.server_state.read(cx);
-        let is_not_started = !is_restricted && state.startable_buffer(cx).is_some();
+        let startable_servers = if is_restricted {
+            None
+        } else {
+            state.startable_servers(cx)
+        };
+        let is_not_started = startable_servers.is_some();
         if !is_restricted
             && ((state.language_servers.is_empty() && !is_not_started) || self.lsp_menu.is_none())
         {
@@ -1541,8 +1584,12 @@ impl Render for LspButton {
                 Some(Indicator::dot().color(Color::Modified)),
                 "Server with notifications",
             )
-        } else if is_not_started {
-            (None, "Language Servers Not Started")
+        } else if let Some(startable_servers) = &startable_servers {
+            if startable_servers.has_running_servers {
+                (None, "Some Language Servers Not Started")
+            } else {
+                (None, "Language Servers Not Started")
+            }
         } else {
             (None, "All Servers Operational")
         };

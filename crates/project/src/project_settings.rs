@@ -59,6 +59,9 @@ pub struct ProjectSettings {
     /// Whether to start language servers automatically when buffers are opened.
     pub auto_start_language_servers: bool,
 
+    /// Language servers that start automatically even when `auto_start_language_servers` is disabled.
+    pub auto_start_language_servers_exceptions: Vec<LanguageServerName>,
+
     /// Configuration for Debugger-related features
     pub dap: HashMap<DebugAdapterName, DapSettings>,
 
@@ -731,6 +734,13 @@ impl Settings for ProjectSettings {
                 .map(|(key, value)| (key, value.into()))
                 .collect(),
             auto_start_language_servers: project.auto_start_language_servers.unwrap_or(true),
+            auto_start_language_servers_exceptions: project
+                .auto_start_language_servers_exceptions
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|name| LanguageServerName(name.into()))
+                .collect(),
             context_server_timeout: project.context_server_timeout.unwrap_or(60),
             lsp: project
                 .lsp
