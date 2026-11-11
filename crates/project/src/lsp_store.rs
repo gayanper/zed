@@ -357,8 +357,10 @@ pub struct LocalLspStore {
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
     >,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
-    auto_start_language_servers: bool,
-    language_server_start_overrides: HashMap<LanguageServerName, bool>,
+    // Session-wide override set by "Stop All" / "Restart All"; takes precedence over the
+    // `auto_start_language_servers` setting.
+    auto_start_language_servers: Option<bool>,
+    language_server_start_overrides: HashMap<(WorktreeId, LanguageServerName), bool>,
     language_server_restart_tasks: Vec<Task<()>>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
@@ -401,11 +403,26 @@ impl LocalLspStore {
         }
     }
 
-    fn can_start_language_server(&self, name: &LanguageServerName) -> bool {
+    fn can_start_language_server(
+        &self,
+        name: &LanguageServerName,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> bool {
         self.language_server_start_overrides
-            .get(name)
+            .get(&(worktree_id, name.clone()))
             .copied()
-            .unwrap_or(self.auto_start_language_servers)
+            .or(self.auto_start_language_servers)
+            .unwrap_or_else(|| {
+                ProjectSettings::get(
+                    Some(SettingsLocation {
+                        worktree_id,
+                        path: RelPath::empty(),
+                    }),
+                    cx,
+                )
+                .auto_start_language_servers
+            })
     }
 
     fn get_or_insert_language_server(
@@ -428,14 +445,14 @@ impl LocalLspStore {
         };
         if start_mode == LanguageServerStartMode::Explicit {
             self.language_server_start_overrides
-                .insert(key.name.clone(), true);
+                .insert((key.worktree_id, key.name.clone()), true);
         }
         if let Some(state) = self.language_server_ids.get_mut(&key) {
             state.project_roots.insert(disposition.path.path.clone());
             Some(state.id)
         } else {
             if start_mode == LanguageServerStartMode::Automatic
-                && !self.can_start_language_server(&key.name)
+                && !self.can_start_language_server(&key.name, key.worktree_id, cx)
             {
                 return None;
             }
@@ -4981,7 +4998,7 @@ impl LspStore {
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
-                auto_start_language_servers: true,
+                auto_start_language_servers: None,
                 language_server_start_overrides: HashMap::default(),
                 language_server_restart_tasks: Vec::new(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
@@ -6504,7 +6521,7 @@ impl LspStore {
                                     language.name(),
                                 ),
                             };
-                            if local.can_start_language_server(&key.name) {
+                            if local.can_start_language_server(&key.name, worktree_id, cx) {
                                 local.language_server_ids.remove(&key);
                             }
 
@@ -13009,9 +13026,27 @@ impl LspStore {
         Task::ready(())
     }
 
+    /// Whether language servers start automatically on buffer open in the given worktree.
+    /// Always true for remote projects, where the host decides.
+    pub fn auto_starts_language_servers(&self, worktree_id: WorktreeId, cx: &App) -> bool {
+        let Some(local) = self.as_local() else {
+            return true;
+        };
+        local.auto_start_language_servers.unwrap_or_else(|| {
+            ProjectSettings::get(
+                Some(SettingsLocation {
+                    worktree_id,
+                    path: RelPath::empty(),
+                }),
+                cx,
+            )
+            .auto_start_language_servers
+        })
+    }
+
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
-            local.auto_start_language_servers = false;
+            local.auto_start_language_servers = Some(false);
             local.language_server_start_overrides.clear();
         }
         self.shutdown_all_language_servers(cx).detach();
@@ -13051,7 +13086,7 @@ impl LspStore {
 
     pub fn restart_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
-            local.auto_start_language_servers = true;
+            local.auto_start_language_servers = Some(true);
             local.language_server_start_overrides.clear();
         }
         let buffers = self.buffer_store.read(cx).buffers().collect();
@@ -13144,12 +13179,12 @@ impl LspStore {
                 Ok(())
             })
         } else {
-            let (stopped_names, task) =
+            let (stopped_servers, task) =
                 self.stop_local_language_servers_for_buffers(&buffers, also_stop_servers, cx);
             if let Some(local) = self.as_local_mut() {
                 local
                     .language_server_start_overrides
-                    .extend(stopped_names.into_iter().map(|name| (name, false)));
+                    .extend(stopped_servers.into_iter().map(|server| (server, false)));
             }
             cx.background_spawn(async move {
                 task.await;
@@ -13211,7 +13246,7 @@ impl LspStore {
         buffers: &[Entity<Buffer>],
         also_stop_servers: HashSet<LanguageServerSelector>,
         cx: &mut Context<Self>,
-    ) -> (HashSet<LanguageServerName>, Task<()>) {
+    ) -> (HashSet<(WorktreeId, LanguageServerName)>, Task<()>) {
         let Some(local) = self.as_local_mut() else {
             return (HashSet::default(), Task::ready(()));
         };
@@ -13255,14 +13290,14 @@ impl LspStore {
             );
         }
 
-        let stopped_names: HashSet<LanguageServerName> = language_servers_to_stop
+        let stopped_servers: HashSet<(WorktreeId, LanguageServerName)> = language_servers_to_stop
             .iter()
             .filter_map(|id| {
                 local
                     .language_server_ids
                     .iter()
                     .find(|(_, state)| state.id == *id)
-                    .map(|(seed, _)| seed.name.clone())
+                    .map(|(seed, _)| (seed.worktree_id, seed.name.clone()))
             })
             .collect();
 
@@ -13273,7 +13308,7 @@ impl LspStore {
             .collect::<Vec<_>>();
 
         (
-            stopped_names,
+            stopped_servers,
             cx.background_spawn(futures::future::join_all(tasks).map(|_| ())),
         )
     }

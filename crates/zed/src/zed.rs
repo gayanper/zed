@@ -625,6 +625,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 lsp_button_menu_handle.toggle(window, cx);
             }
         });
+        workspace.register_action(lsp_button::start_language_servers_for_active_buffer);
 
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));

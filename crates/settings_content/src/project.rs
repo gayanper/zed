@@ -59,6 +59,13 @@ pub struct ProjectSettingsContent {
     #[serde(default)]
     pub lsp: LspSettingsMap,
 
+    /// Whether to start language servers automatically when buffers are opened.
+    /// When disabled, language servers can be started on demand for the active
+    /// buffer from the language servers status bar button.
+    ///
+    /// Default: true
+    pub auto_start_language_servers: Option<bool>,
+
     pub terminal: Option<ProjectTerminalSettingsContent>,
 
     /// Configuration for Debugger-related features
@@ -90,7 +97,7 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        terminal, auto_start_language_servers, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
     },
     defaults: { lsp, dap, context_servers },
 });

@@ -544,6 +544,7 @@ impl VsCodeSettings {
             terminal: None,
             dap: Default::default(),
             context_servers: self.context_servers(),
+            auto_start_language_servers: None,
             context_server_timeout: None,
             load_direnv: None,
             git_hosting_providers: None,

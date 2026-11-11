@@ -14,7 +14,7 @@ use client::proto;
 use collections::HashSet;
 use editor::{Editor, EditorEvent};
 use gpui::{Action as _, Anchor, App, Entity, Subscription, Task, TaskExt, WeakEntity, actions};
-use language::{BinaryStatus, BufferId, ServerHealth};
+use language::{BinaryStatus, Buffer, BufferId, ServerHealth, language_settings::LanguageSettings};
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use path::PathStyle;
 use project::{
@@ -35,7 +35,9 @@ actions!(
     lsp_tool,
     [
         /// Toggles the language server tool menu.
-        ToggleMenu
+        ToggleMenu,
+        /// Starts the language servers for the active buffer.
+        StartLanguageServersForBuffer
     ]
 );
 
@@ -220,7 +222,82 @@ impl LanguageServerHealthStatus {
     }
 }
 
+/// Returns the active editor's buffer if it has language servers available but none running.
+fn startable_buffer(
+    editor: &Entity<Editor>,
+    workspace: &Workspace,
+    language_servers: &LanguageServers,
+    cx: &App,
+) -> Option<Entity<Buffer>> {
+    let buffer = editor.read(cx).active_buffer(cx)?;
+    let buffer_ref = buffer.read(cx);
+    let language = buffer_ref.language()?;
+    let file = project::File::from_dyn(buffer_ref.file())?;
+    let language_settings = LanguageSettings::for_buffer(buffer_ref, cx);
+    if !language_settings.enable_language_server {
+        return None;
+    }
+    let project = workspace.project().read(cx);
+    // Remote clients don't register adapters locally, so they can't tell whether a server exists.
+    if !project.is_local()
+        || project
+            .lsp_store()
+            .read(cx)
+            .auto_starts_language_servers(file.worktree_id(cx), cx)
+    {
+        return None;
+    }
+    let available_servers = project
+        .languages()
+        .lsp_adapters(&language.name())
+        .iter()
+        .map(|adapter| adapter.name())
+        .collect::<Vec<_>>();
+    if language_settings
+        .customized_language_servers(&available_servers)
+        .is_empty()
+    {
+        return None;
+    }
+    let abs_path = file.worktree.read(cx).absolutize(&file.path);
+    let has_running_servers = language_servers
+        .servers_per_buffer_abs_path
+        .get(&abs_path)
+        .is_some_and(|servers_for_path| !servers_for_path.servers.is_empty());
+    (!has_running_servers).then_some(buffer)
+}
+
+pub fn start_language_servers_for_active_buffer(
+    workspace: &mut Workspace,
+    _: &StartLanguageServersForBuffer,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(buffer) = workspace
+        .active_item_as::<Editor>(cx)
+        .and_then(|editor| editor.read(cx).active_buffer(cx))
+    else {
+        return;
+    };
+    let lsp_store = workspace.project().read(cx).lsp_store();
+    lsp_store.update(cx, |lsp_store, cx| {
+        let has_running_servers = lsp_store
+            .language_server_ids_for_opened_buffer(buffer.read(cx).remote_id())
+            .is_some_and(|server_ids| !server_ids.is_empty());
+        // Avoid restarting servers that are already running; this action only starts them.
+        if !has_running_servers {
+            lsp_store.restart_language_servers_for_buffers(vec![buffer], HashSet::default(), cx);
+        }
+    });
+}
+
 impl LanguageServerState {
+    fn startable_buffer(&self, cx: &App) -> Option<Entity<Buffer>> {
+        let editor = self.active_editor.as_ref()?.editor.upgrade()?;
+        let workspace = self.workspace.upgrade()?;
+        startable_buffer(&editor, workspace.read(cx), &self.language_servers, cx)
+    }
+
     fn fill_menu(&self, mut menu: ContextMenu, cx: &mut Context<Self>) -> ContextMenu {
         let lsp_logs = cx
             .try_global::<GlobalLogStore>()
@@ -266,6 +343,32 @@ impl LanguageServerState {
                     window.dispatch_action(ToggleWorktreeSecurity.boxed_clone(), cx);
                 },
             );
+        }
+
+        if !is_restricted && let Some(buffer) = self.startable_buffer(cx) {
+            let file_name = buffer
+                .read(cx)
+                .file()
+                .map(|file| file.file_name(cx).to_string())
+                .unwrap_or_default();
+            let lsp_store = self.lsp_store.clone();
+            menu = menu
+                .item(
+                    ContextMenuEntry::new(format!("Start Language Servers for {file_name}"))
+                        .icon(IconName::PlayOutlined)
+                        .handler(move |_, cx| {
+                            lsp_store
+                                .update(cx, |lsp_store, cx| {
+                                    lsp_store.restart_language_servers_for_buffers(
+                                        vec![buffer.clone()],
+                                        HashSet::default(),
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        }),
+                )
+                .separator();
         }
 
         let path_style = self
@@ -1385,13 +1488,14 @@ impl Render for LspButton {
             })
             .unwrap_or(false);
 
+        let state = self.server_state.read(cx);
+        let is_not_started = !is_restricted && state.startable_buffer(cx).is_some();
         if !is_restricted
-            && (self.server_state.read(cx).language_servers.is_empty() || self.lsp_menu.is_none())
+            && ((state.language_servers.is_empty() && !is_not_started) || self.lsp_menu.is_none())
         {
             return div().hidden();
         }
 
-        let state = self.server_state.read(cx);
         let is_via_ssh = state
             .workspace
             .upgrade()
@@ -1437,6 +1541,8 @@ impl Render for LspButton {
                 Some(Indicator::dot().color(Color::Modified)),
                 "Server with notifications",
             )
+        } else if is_not_started {
+            (None, "Language Servers Not Started")
         } else {
             (None, "All Servers Operational")
         };
@@ -1470,6 +1576,7 @@ impl Render for LspButton {
                         .tab_index(0isize)
                         .aria_label("Language Servers")
                         .when(is_restricted, |s| s.icon_color(Color::Warning))
+                        .when(is_not_started, |s| s.icon_color(Color::Muted))
                         .indicator_border_color(Some(cx.theme().colors().status_bar_background)),
                     move |_window, cx| {
                         Tooltip::with_meta("Language Servers", Some(&ToggleMenu), description, cx)

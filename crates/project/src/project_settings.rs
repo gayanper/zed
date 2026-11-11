@@ -56,6 +56,9 @@ pub struct ProjectSettings {
     /// Common language server settings.
     pub global_lsp_settings: GlobalLspSettings,
 
+    /// Whether to start language servers automatically when buffers are opened.
+    pub auto_start_language_servers: bool,
+
     /// Configuration for Debugger-related features
     pub dap: HashMap<DebugAdapterName, DapSettings>,
 
@@ -727,6 +730,7 @@ impl Settings for ProjectSettings {
                 .into_iter()
                 .map(|(key, value)| (key, value.into()))
                 .collect(),
+            auto_start_language_servers: project.auto_start_language_servers.unwrap_or(true),
             context_server_timeout: project.context_server_timeout.unwrap_or(60),
             lsp: project
                 .lsp
