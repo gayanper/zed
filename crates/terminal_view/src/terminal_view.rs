@@ -200,6 +200,33 @@ fn paragraph_text_indent(row: &GridRow, columns: &RangeInclusive<usize>) -> Opti
     Some(after_marker.unwrap_or(*first_column))
 }
 
+/// A row of a block with its text, worked out once for all the checks on it.
+struct BlockRow<'a> {
+    grid_row: &'a GridRow,
+    columns: &'a RangeInclusive<usize>,
+    text: Vec<(usize, char)>,
+    /// The column after the row's text, past the cell that pads a wide
+    /// character it ends in. A row the terminal wrapped reaches the end of
+    /// its columns, which shows the program doesn't wrap it at a width of
+    /// its own.
+    end: usize,
+}
+
+impl BlockRow<'_> {
+    fn first_column(&self) -> Option<usize> {
+        self.text.first().map(|(column, _)| *column)
+    }
+}
+
+/// The column after a wide character's padding cell, else after the column.
+fn cell_end(row: &GridRow, column: usize) -> usize {
+    if row.wide_char_spacers.contains(&(column + 1)) {
+        column + 2
+    } else {
+        column + 1
+    }
+}
+
 /// The rows of each paragraph in a block's `rows`. A paragraph runs over
 /// rows the terminal wrapped, the lines of the block's `paragraphs`, and
 /// rows that look like the program wrapped prose (see
@@ -209,33 +236,50 @@ fn paragraph_rows(
     block: &TextBlock,
     grid_rows: &[GridRow],
 ) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
-    let mut paragraphs: Vec<Vec<(i32, RangeInclusive<usize>)>> = Vec::new();
-    let mut previous_row: Option<(&GridRow, &RangeInclusive<usize>)> = None;
-    let mut text_indent = None;
+    let rows = block
+        .rows
+        .iter()
+        .filter_map(|(line, columns)| {
+            let grid_row = grid_rows.iter().find(|row| row.line == *line)?;
+            let text = row_text_columns(grid_row, columns);
+            let end = if grid_row.wraps {
+                columns.end() + 1
+            } else {
+                text.last()
+                    .map_or(0, |(last_column, _)| cell_end(grid_row, *last_column))
+            };
+            Some(BlockRow {
+                grid_row,
+                columns,
+                text,
+                end,
+            })
+        })
+        .collect::<Vec<_>>();
     let group_of = |line: i32| {
         block
             .paragraphs
             .iter()
             .position(|group| group.contains(&line))
     };
-    for (line, columns) in &block.rows {
-        let Some(grid_row) = grid_rows.iter().find(|row| row.line == *line) else {
-            continue;
-        };
-        let continues = previous_row.is_some_and(|(previous, previous_columns)| {
-            if previous.line.saturating_add(1) != *line {
+    let mut paragraphs: Vec<Vec<(i32, RangeInclusive<usize>)>> = Vec::new();
+    let mut paragraph_start = 0;
+    let mut text_indent = None;
+    for (index, row) in rows.iter().enumerate() {
+        let continues = index.checked_sub(1).is_some_and(|previous_index| {
+            let previous = &rows[previous_index];
+            if previous.grid_row.line.saturating_add(1) != row.grid_row.line {
                 return false;
             }
-            match (group_of(previous.line), group_of(*line)) {
+            match (group_of(previous.grid_row.line), group_of(row.grid_row.line)) {
                 (Some(previous_group), Some(group)) => previous_group == group,
                 (None, None) => {
-                    previous.wraps
+                    previous.grid_row.wraps
                         || text_indent.is_some_and(|text_indent| {
                             continues_paragraph(
-                                previous,
-                                previous_columns,
-                                grid_row,
-                                columns,
+                                &rows,
+                                paragraph_start,
+                                previous_index,
                                 text_indent,
                             )
                         })
@@ -243,14 +287,15 @@ fn paragraph_rows(
                 _ => false,
             }
         });
+        let row_lines = (row.grid_row.line, row.columns.clone());
         match paragraphs.last_mut() {
-            Some(paragraph) if continues => paragraph.push((*line, columns.clone())),
+            Some(paragraph) if continues => paragraph.push(row_lines),
             _ => {
-                paragraphs.push(vec![(*line, columns.clone())]);
-                text_indent = paragraph_text_indent(grid_row, columns);
+                paragraphs.push(vec![row_lines]);
+                paragraph_start = index;
+                text_indent = paragraph_text_indent(row.grid_row, row.columns);
             }
         }
-        previous_row = Some((grid_row, columns));
     }
     paragraphs
 }
@@ -260,66 +305,126 @@ fn paragraph_rows(
 /// code. The terminal can't tell them apart, so this guesses: the row
 /// reaches well across the terminal and ends in a word or punctuation of
 /// prose, and the next row carries on at the paragraph's indent with a
-/// word. Rows of code, listings and logs rarely look like that.
+/// word that wouldn't have fit on the row. Rows of code, listings and logs
+/// rarely look like that.
+///
+/// `rows[index]` is the row before the break, in the paragraph that starts
+/// at `rows[paragraph_start]`.
 fn continues_paragraph(
-    row: &GridRow,
-    columns: &RangeInclusive<usize>,
-    next_row: &GridRow,
-    next_columns: &RangeInclusive<usize>,
+    rows: &[BlockRow],
+    paragraph_start: usize,
+    index: usize,
     text_indent: usize,
 ) -> bool {
-    let text = row_text_columns(row, columns);
-    let next_text = row_text_columns(next_row, next_columns);
-    let Some((last_column, _)) = text.last() else {
+    let (Some(row), Some(next_row)) = (rows.get(index), rows.get(index + 1)) else {
+        return false;
+    };
+    let (text, next_text) = (&row.text, &next_row.text);
+    let Some(last_column) = text.last().map(|(column, _)| *column) else {
         return false;
     };
     // A Markdown heading stands on its own line.
     if text.first().is_some_and(|(_, character)| *character == '#') {
         return false;
     }
-    let Some((next_first_column, _)) = next_text.first() else {
+    let Some(next_first_column) = next_row.first_column() else {
         return false;
     };
     // Closing quotes and brackets after the last word don't matter.
-    let ends_in_prose = text
+    let last_character = text
         .iter()
         .rev()
         .map(|(_, character)| *character)
-        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’' | '`'))
-        .is_some_and(|character| {
-            character.is_alphabetic() || matches!(character, ',' | '.' | '?' | '!' | ':')
-        });
+        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’' | '`'));
+    let ends_in_number = last_character.is_some_and(|character| character.is_ascii_digit());
+    let ends_in_prose = last_character.is_some_and(|character| {
+        character.is_alphabetic()
+            || character.is_ascii_digit()
+            || matches!(character, ',' | '.' | '?' | '!' | ':')
+    });
+    // A wide character's padding cell doesn't end a word.
     let word_length = next_text
         .windows(2)
-        .position(|pair| pair[1].0 != pair[0].0 + 1)
+        .position(|pair| pair[1].0 != cell_end(next_row.grid_row, pair[0].0))
         .map_or(next_text.len(), |index| index + 1);
-    let next_characters = next_text[..word_length]
+    let next_word = next_text[..word_length]
         .iter()
         .map(|(_, character)| *character)
-        .collect::<Vec<_>>();
-    let next_word = next_characters.iter().collect::<String>();
+        .collect::<String>();
     // A label such as "warning:" starts a line of its own.
     if next_word.ends_with(':') {
         return false;
     }
+    let next_word_end = next_text
+        .get(word_length.saturating_sub(1))
+        .map_or(next_first_column, |(column, _)| {
+            cell_end(next_row.grid_row, *column)
+        });
     let next_word = next_word
         .trim_start_matches(['"', '“', '(', '`'])
         .trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”', ')', '`']);
-    let width = row.characters.len();
+    let width = row.grid_row.characters.len();
+    // A program wraps prose at a width of its own, which can be narrower than
+    // the terminal, and none of its rows reach past it. Only the paragraph's
+    // rows show that width, since code, tables and logs in the same block
+    // aren't wrapped by it. The rows after the break that line up with the
+    // paragraph show it too.
+    let following_rows = rows[index + 1..]
+        .iter()
+        .zip(rows[index..].iter())
+        .take_while(|(following, before)| {
+            before.grid_row.line.saturating_add(1) == following.grid_row.line
+                && following.first_column().is_some_and(|column| {
+                    column == text_indent || column == text_indent.saturating_add(1)
+                })
+        })
+        .map(|(following, _)| following);
+    let paragraph_rows = rows.get(paragraph_start..index).unwrap_or_default();
+    // Agent TUIs wrap words without trimming them, so when a row fills up to
+    // the wrap width, the space between its last word and the next one
+    // starts the next row. Another row as wide shows that the row is full,
+    // as does the terminal's edge.
+    let fills_row = row.end == width
+        || paragraph_rows
+            .iter()
+            .chain(following_rows)
+            .any(|other| other.end >= row.end);
+    let carries_space = fills_row && next_first_column == text_indent.saturating_add(1);
+    // A program that wraps words fills each row as far as it can, so a next
+    // word that would have fit after a space on this row, within the widest
+    // row of the paragraph and the next row, ends the line.
+    let wrap_width = rows
+        .get(paragraph_start..=index + 1)
+        .unwrap_or_default()
+        .iter()
+        .map(|other| other.end)
+        .max()
+        .unwrap_or(0);
+    let next_word_fits = row.end + 1 + (next_word_end - next_first_column) <= wrap_width;
     ends_in_prose
         && last_column.saturating_mul(3) >= width.saturating_mul(2)
-        && *next_first_column == text_indent
+        && (next_first_column == text_indent || carries_space)
+        && !next_word_fits
         && !next_row
+            .grid_row
             .characters
-            .get(*next_first_column..)
+            .get(next_first_column..)
             .is_some_and(starts_with_list_marker)
         && next_word.starts_with(char::is_alphabetic)
-        // Apostrophes, as in "others'" or "don't", and dots, as in
-        // "Cargo.toml", but not the hyphens of listings such as
+        // A number ends a row of prose, as in "about 3 / seconds", but also
+        // log lines such as "attempt 2", which a capitalized line follows.
+        && (!ends_in_number || next_word.starts_with(char::is_lowercase))
+        // Apostrophes, as in "others'" or "don't", dots, as in "Cargo.toml",
+        // and hyphens between parts of two letters or more, as in
+        // "ca-respawn", but not the permissions of listings such as
         // "drwxr-xr-x", nor the digits of log lines.
-        && next_word
-            .chars()
-            .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
+        && next_word.split('-').all(|part| {
+            !part.is_empty()
+                && (part.chars().count() >= 2 || !next_word.contains('-'))
+                && part
+                    .chars()
+                    .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
+        })
 }
 
 /// The rows of each sentence of a paragraph, by Unicode sentence
@@ -3680,6 +3785,154 @@ mod tests {
     }
 
     #[test]
+    fn test_paragraphs_join_full_rows_the_program_wrapped() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  The build failed because the linker said
+                   it could not find the library.
+
+                  All of them pass now.
+            "
+            )),
+            vec![
+                "The build failed because the linker said it could not find the library.",
+                "All of them pass now.",
+            ],
+            "a row the program filled to the edge carries the space between \
+             its words over to the start of the next row"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_join_rows_starting_with_a_hyphenated_word() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  I inferred that from how the old one
+                  ca-respawn cleans up stopped sessions.
+            "
+            )),
+            vec!["I inferred that from how the old one ca-respawn cleans up stopped sessions."],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_end_where_the_next_word_would_have_fit() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                Checked the parser and the lexer files
+                and both pass the full test suite.
+                All good.
+            "
+            )),
+            vec![
+                "Checked the parser and the lexer files and both pass the full test suite.",
+                "All good.",
+            ],
+            "a program filling rows up to its widest one would have put \"All\" \
+             on the row above"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_ignore_wider_rows_of_other_paragraphs() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                cargo test --package terminal_view --lib -- paragraphs
+
+                The old session may still show as a
+                running one for a moment after start.
+            "
+            )),
+            vec![
+                "cargo test --package terminal_view --lib -- paragraphs",
+                "The old session may still show as a running one for a moment after start.",
+            ],
+            "a command wider than the paragraph says nothing of its wrap width"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_join_rows_ending_in_a_number() {
+        assert_eq!(
+            paragraphs_of("Each retry waits for a while, about 3\nseconds before it gives up.\n"),
+            vec!["Each retry waits for a while, about 3 seconds before it gives up."],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_apart_rows_one_column_deeper_short_of_the_width() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  Here is what the compiler said about it
+                   error in the parser module
+            "
+            )),
+            vec![
+                "Here is what the compiler said about it",
+                "error in the parser module",
+            ],
+            "only a row that fills the width carries a space to the next row"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_apart_log_lines_ending_in_a_number() {
+        assert_eq!(
+            paragraphs_of("Retrying the request to the server, try 2\nWaiting for the server\n"),
+            vec!["Retrying the request to the server, try 2", "Waiting for the server"],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_join_full_rows_of_a_program_wrapping_narrower() {
+        let (grid_rows, block) = text_grid(
+            "The parser keeps the old API as it is\n wrapped, and the new one sits beside\nit for now.\n",
+            50,
+        );
+        assert_eq!(
+            paragraph_texts(&block, &grid_rows),
+            vec!["The parser keeps the old API as it is wrapped, and the new one sits beside it for now."],
+            "a row as wide as another row of the paragraph is full, though short of the edge"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_join_full_rows_shown_by_later_rows() {
+        let (grid_rows, block) = text_grid(
+            "The parser keeps the old API as it is\n wrapped, and the new one is in\nanother module that sits beside it in\none file.\n",
+            40,
+        );
+        assert_eq!(
+            paragraph_texts(&block, &grid_rows),
+            vec!["The parser keeps the old API as it is wrapped, and the new one is in another module that sits beside it in one file."],
+            "a later row as wide as the first shows the first is full"
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_measure_wide_characters_in_cells() {
+        let (mut grid_rows, block) = text_grid(
+            "The word for the world in Chinese is\n世 界  is how the words are written there.\n",
+            40,
+        );
+        grid_rows[1].wide_char_spacers = vec![1, 3];
+        assert_eq!(paragraph_rows(&block, &grid_rows).len(), 1);
+    }
+
+    #[test]
+    fn test_paragraphs_keep_apart_log_lines_ending_in_a_bracketed_number() {
+        assert_eq!(
+            paragraphs_of("Retrying a request to the host (try 2)\nWaiting for the server\n"),
+            vec!["Retrying a request to the host (try 2)", "Waiting for the server"],
+        );
+    }
+
+    #[test]
     fn test_paragraphs_join_rows_the_terminal_wrapped() {
         assert_eq!(
             paragraphs_of("A row the terminal wrapped at its edg\\\ne goes on.\nNext line\n"),
@@ -3720,15 +3973,15 @@ mod tests {
                 1. Move the parser into its own crate
                    so it can be tested alone.
                 2. Add tests.
-                a) Keep the old API as it is
-                   for now.
+                a) Keep the old API as it is for the
+                   time being.
                 b) Remove it.
             "
             )),
             vec![
                 "1. Move the parser into its own crate so it can be tested alone.",
                 "2. Add tests.",
-                "a) Keep the old API as it is for now.",
+                "a) Keep the old API as it is for the time being.",
                 "b) Remove it.",
             ],
         );
