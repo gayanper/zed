@@ -4757,11 +4757,6 @@ impl Sidebar {
                                      window: &mut Window,
                                      cx: &mut App| {
             agent_panel.update(cx, |panel, cx| {
-                if metadata.parent_terminal_id.is_none()
-                    && !panel.has_terminal(metadata.terminal_id)
-                {
-                    panel.show_overview_on_restore(metadata.terminal_id, cx);
-                }
                 panel.restore_terminal(
                     metadata.clone(),
                     focus,

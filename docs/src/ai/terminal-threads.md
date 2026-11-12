@@ -102,17 +102,17 @@ The overview is hidden while the panel can't also give the parent terminal 40 co
 
 Starting a sub terminal from the agent panel's new thread menu keeps the parent terminal in view and focused, and turns its overview on.
 
-Sub terminals appear only in the overview, not in the sidebar. Opening a terminal that isn't loaded from the sidebar also opens its overview. The overview button's badge shows how many a terminal has. A notification from a sub terminal marks its parent in the sidebar. The overview shows all of a terminal's sub terminals. Close one from its header.
+Sub terminals appear only in the overview, not in the sidebar. A terminal keeps its overview shown or hidden as you left it, including after restarting Zed. The overview button's badge shows how many a terminal has. A notification from a sub terminal marks its parent in the sidebar. The overview shows all of a terminal's sub terminals. Close one from its header.
 
 To save space, minimize a sub terminal from its header or with {#kb agent::ToggleMinimizeOverviewTerminal}, leaving only the header. The header then takes focus, and the same button or keys restore the sub terminal. A notification from a minimized sub terminal marks its header and its parent in the sidebar until it's restored. A sub terminal that fails to start stays in the overview as a header with a retry button.
 
 ## Showing and Navigating Sub Terminals {#terminal-overview-navigation}
 
-{#kb agent::ToggleSubTerminals} shows or hides a terminal thread's sub terminals, like the button in the panel header. This action was called `agent::ToggleTerminalOverview`, and that name still works in keymaps. If the panel is too narrow to show the sub terminals, a message asks you to widen or zoom the panel, or to widen the window when the panel is already zoomed.
+{#kb agent::ToggleSubTerminals} shows or hides a terminal thread's sub terminals, like the button in the panel header. This action was called `agent::ToggleTerminalOverview`, and that name still works in keymaps. If the panel is too narrow to show the sub terminals, the button is disabled and a message asks you to widen or zoom the panel, or to widen the window when the panel is already zoomed. The overview stays shown or hidden until the panel is wide enough to change it.
 
 While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb agent::FocusPreviousOverviewTerminal} move focus between the parent terminal and its sub terminals.
 
-{#kb agent::ToggleZoomOverviewTerminal} zooms the focused sub terminal: it swaps places with the parent, which moves into the sub terminal column with a highlighted header. Search and comments then act on the zoomed sub terminal. Press the same keys again, or select a thread in the sidebar, to undo the zoom.
+{#kb agent::ToggleZoomOverviewTerminal} zooms the focused sub terminal: it swaps places with the parent, which moves into the sub terminal column with a highlighted header. Search and comments then act on the zoomed sub terminal. Press the same keys again, hide the sub terminals, or close the zoomed sub terminal to undo the zoom. Switching to another thread and back keeps the zoom, unless you zoom a sub terminal in the other thread. The zoom isn't kept after restarting Zed.
 
 ## Commenting on Terminal Output {#terminal-comments}
 
