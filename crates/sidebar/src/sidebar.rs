@@ -52,6 +52,7 @@ use settings::{Settings as _, SettingsStore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -268,6 +269,43 @@ fn split_leading_icon_char(
     ))
 }
 
+fn title_icon_glyph(title: &str) -> Option<SharedString> {
+    pick_icon_glyph(terminal_title_prefix(title)?)
+}
+
+/// Title glyphs that agents animate while working. Add another agent's
+/// glyphs here so its busy sub terminals win over an idle glyph on the parent
+/// row.
+const BUSY_TITLE_GLYPHS: &[RangeInclusive<char>] = &[
+    // Claude Code animates braille dots while working and shows `✳` when idle.
+    '\u{2800}'..='\u{28FF}',
+];
+
+fn is_busy_title_glyph(glyph: &str) -> bool {
+    let mut chars = glyph.chars();
+    let (Some(character), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    BUSY_TITLE_GLYPHS
+        .iter()
+        .any(|range| range.contains(&character))
+}
+
+/// A working agent anywhere in the terminal or its sub terminals wins, so an
+/// idle parent can't hide a busy sub terminal.
+fn terminal_row_glyph(
+    own_glyph: Option<SharedString>,
+    sub_terminal_glyphs: &[SharedString],
+) -> Option<SharedString> {
+    own_glyph
+        .iter()
+        .chain(sub_terminal_glyphs)
+        .find(|glyph| is_busy_title_glyph(glyph))
+        .cloned()
+        .or(own_glyph)
+        .or_else(|| sub_terminal_glyphs.first().cloned())
+}
+
 /// Picks a single glyph to render as the icon from a detected title prefix.
 ///
 /// We only ever show one glyph, so this makes a best effort to choose a
@@ -384,6 +422,9 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    /// Title glyphs of live sub terminals, oldest first. Sub terminals have no
+    /// row, so their agents' working or idle state shows on the parent's.
+    sub_terminal_glyphs: Vec<SharedString>,
     highlight_positions: Vec<usize>,
 }
 
@@ -1554,6 +1595,10 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_sub_terminal_glyphs: HashMap<
+            TerminalId,
+            Vec<(DateTime<Utc>, TerminalId, SharedString)>,
+        > = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 for terminal in agent_panel.read(cx).terminals(cx) {
@@ -1561,8 +1606,21 @@ impl Sidebar {
                         live_notified_terminal_ids.insert(terminal.id);
                         live_notified_terminal_ids.extend(terminal.parent_terminal_id);
                     }
+                    if let Some(parent_id) = terminal.parent_terminal_id
+                        && let Some(glyph) = title_icon_glyph(&terminal.title)
+                    {
+                        live_sub_terminal_glyphs
+                            .entry(parent_id)
+                            .or_default()
+                            .push((terminal.created_at, terminal.id, glyph));
+                    }
                 }
             }
+        }
+        // Panel terminals come from a map, so the id breaks creation-time ties
+        // to keep the chosen glyph from flickering between rebuilds.
+        for glyphs in live_sub_terminal_glyphs.values_mut() {
+            glyphs.sort_by_key(|(created_at, terminal_id, _)| (*created_at, *terminal_id));
         }
 
         let mut all_paths: Vec<PathBuf> = groups
@@ -1625,11 +1683,16 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let sub_terminal_glyphs = live_sub_terminal_glyphs
+                        .get(&metadata.terminal_id)
+                        .map(|glyphs| glyphs.iter().map(|(_, _, glyph)| glyph.clone()).collect())
+                        .unwrap_or_default();
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
+                        sub_terminal_glyphs,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -6846,11 +6909,12 @@ impl Sidebar {
         let show_actions = is_hovered && !is_renaming;
 
         let display_title = terminal.metadata.display_title();
-        let (icon_char, title, highlight_positions) =
+        let (own_icon_char, title, highlight_positions) =
             match split_leading_icon_char(&display_title, &terminal.highlight_positions) {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
+        let icon_char = terminal_row_glyph(own_icon_char, &terminal.sub_terminal_glyphs);
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)

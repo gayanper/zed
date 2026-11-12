@@ -16082,6 +16082,26 @@ async fn test_cmd_click_project_header_returns_to_last_active_linked_worktree_wo
 }
 
 #[test]
+fn test_terminal_row_glyph() {
+    fn row_glyph(own: Option<&str>, sub_terminals: &[&str]) -> Option<SharedString> {
+        let sub_terminals: Vec<SharedString> =
+            sub_terminals.iter().map(|glyph| (*glyph).into()).collect();
+        terminal_row_glyph(own.map(SharedString::from), &sub_terminals)
+    }
+
+    assert_eq!(row_glyph(None, &[]), None);
+    assert_eq!(row_glyph(None, &["✳"]), Some("✳".into()));
+    assert_eq!(row_glyph(None, &["✳", "⠐"]), Some("⠐".into()));
+    assert_eq!(row_glyph(Some("✳"), &["⠐"]), Some("⠐".into()));
+    assert_eq!(row_glyph(Some(">"), &["✳"]), Some(">".into()));
+    assert_eq!(row_glyph(Some("⠂"), &["⠐"]), Some("⠂".into()));
+    assert!(!is_busy_title_glyph("⠂⠐"));
+    assert!(!is_busy_title_glyph("🔨"));
+    assert_eq!(title_icon_glyph("⠂ Fix the bug"), Some("⠂".into()));
+    assert_eq!(title_icon_glyph("zsh"), None);
+}
+
+#[test]
 fn test_split_leading_icon_char() {
     // A leading symbol set off by whitespace is pulled out and trimmed from the
     // title.

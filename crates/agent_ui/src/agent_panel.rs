@@ -140,6 +140,7 @@ struct TerminalOverviewButtonState {
     disabled: bool,
     tooltip: &'static str,
     sub_terminal_badge_count: Option<usize>,
+    sub_terminal_notified: bool,
 }
 
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
@@ -2838,6 +2839,15 @@ impl AgentPanel {
 
         self.register_terminal_comment_hooks(terminal_id, &terminal_view, cx);
 
+        let mut subscriptions = vec![view_subscription, terminal_subscription];
+        if parent_terminal_id.is_some() {
+            subscriptions.push(cx.on_focus_in(
+                &terminal_view.focus_handle(cx),
+                window,
+                move |this, _window, cx| this.clear_sub_terminal_notification(terminal_id, cx),
+            ));
+        }
+
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
@@ -2868,7 +2878,7 @@ impl AgentPanel {
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
-            _subscriptions: vec![view_subscription, terminal_subscription],
+            _subscriptions: subscriptions,
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
@@ -2949,7 +2959,6 @@ impl AgentPanel {
             self.dismiss_terminal_notifications(terminal_id, cx);
         }
         self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
-        self.clear_overview_notifications(terminal_id, cx);
         if had_notification {
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
@@ -3118,6 +3127,12 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if self.has_terminal(metadata.terminal_id) {
+            // Selecting the row (click, keyboard or thread navigation) focuses;
+            // the thread switcher preview passes through without focus and
+            // must not change the layout.
+            if focus && matches!(source, AgentThreadSource::Sidebar) {
+                self.reveal_notified_sub_terminals(metadata.terminal_id, window, cx);
+            }
             self.activate_terminal(metadata.terminal_id, focus, window, cx);
             return;
         }
@@ -3274,30 +3289,42 @@ impl AgentPanel {
             terminal.overview = overview;
             self.persist_terminal_metadata(terminal_id, cx);
         }
-        self.clear_overview_notifications(terminal_id, cx);
     }
 
-    /// Sub terminals have no sidebar row, so their notifications show on the
-    /// parent's and must clear once the overview brings them into view.
-    fn clear_overview_notifications(&mut self, parent_id: TerminalId, cx: &mut Context<Self>) {
-        if self.visible_overview_id(cx) != Some(parent_id) {
+    fn sub_terminals_notified(&self, parent_id: TerminalId) -> bool {
+        self.terminals.values().any(|terminal| {
+            terminal.parent_terminal_id == Some(parent_id) && terminal.has_notification
+        })
+    }
+
+    /// The parent's sidebar dot also stands for its sub terminals' bells, so
+    /// following it must reveal the headers that show which one rang.
+    fn reveal_notified_sub_terminals(
+        &mut self,
+        parent_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sub_terminals_notified(parent_id) {
             return;
         }
-        let mut cleared = false;
-        for terminal_id in self.loaded_sub_terminal_ids(parent_id) {
-            if let Some(terminal) = self.terminals.get_mut(&terminal_id)
-                && terminal.has_notification
-                && !terminal.minimized_in_overview
-            {
-                terminal.has_notification = false;
-                self.dismiss_terminal_notifications(terminal_id, cx);
-                cleared = true;
-            }
+        self.set_terminal_overview(parent_id, true, cx);
+        self.restore_overview_sub_terminals(parent_id, AgentThreadSource::Sidebar, window, cx);
+    }
+
+    /// Sub terminal notifications stay until the user focuses the sub terminal,
+    /// so the overview headers can show which one rang.
+    fn clear_sub_terminal_notification(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if !terminal.has_notification {
+            return;
         }
-        if cleared {
-            cx.emit(AgentPanelEvent::EntryChanged);
-            cx.notify();
-        }
+        terminal.has_notification = false;
+        self.dismiss_terminal_notifications(terminal_id, cx);
+        cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
     }
 
     fn set_minimized_in_overview(
@@ -3338,12 +3365,8 @@ impl AgentPanel {
         if terminal.parent_terminal_id.is_none() {
             return;
         }
-        let parent_id = terminal.parent_terminal_id;
         let minimized = !terminal.minimized_in_overview;
         self.set_minimized_in_overview(terminal_id, minimized, cx);
-        if let Some(parent_id) = parent_id {
-            self.clear_overview_notifications(parent_id, cx);
-        }
         if let Some(terminal) = self.terminals.get(&terminal_id) {
             window.focus(&Self::overview_terminal_focus_handle(terminal, cx), cx);
         }
@@ -3595,11 +3618,11 @@ impl AgentPanel {
     }
 
     /// The overview comes and goes with the panel width, with no focus change
-    /// or activation to clear notifications or move focus out of it.
+    /// or activation to move focus out of it.
     fn terminal_width_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(parent_id) = self.visible_overview_id(cx) {
-            self.clear_overview_notifications(parent_id, cx);
-        } else if let Some(parent_id) = self.active_terminal_id() {
+        if self.visible_overview_id(cx).is_none()
+            && let Some(parent_id) = self.active_terminal_id()
+        {
             let sub_terminal_focused =
                 self.loaded_sub_terminal_ids(parent_id)
                     .iter()
@@ -3887,13 +3910,29 @@ impl AgentPanel {
         }
     }
 
+    fn is_unfocused_sub_terminal(
+        &self,
+        terminal_id: TerminalId,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.terminals.get(&terminal_id).is_some_and(|terminal| {
+            terminal.parent_terminal_id.is_some()
+                && !terminal.view.focus_handle(cx).contains_focused(window, cx)
+        })
+    }
+
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_terminal_visible(terminal_id, window, cx) {
+        // A visible sub terminal still needs its header dot to show it rang,
+        // unless the user is already typing in it.
+        if !self.is_unfocused_sub_terminal(terminal_id, window, cx)
+            && self.active_terminal_visible(terminal_id, window, cx)
+        {
             return;
         }
         let newly_notified = {
@@ -4176,7 +4215,10 @@ impl AgentPanel {
         if !self.terminal_status_visible(terminal_id, window, cx) {
             return;
         }
-        if self.active_terminal_visible(terminal_id, window, cx)
+        // A sub terminal's header dot is what shows which one rang, so being
+        // on screen isn't enough to clear it; only its own focus is.
+        if !self.is_unfocused_sub_terminal(terminal_id, window, cx)
+            && self.active_terminal_visible(terminal_id, window, cx)
             && let Some(terminal) = self.terminals.get_mut(&terminal_id)
             && terminal.has_notification
         {
@@ -5671,7 +5713,6 @@ impl AgentPanel {
                                 if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
                                     terminal.has_notification = false;
                                 }
-                                this.clear_overview_notifications(terminal_id, cx);
                                 cx.emit(AgentPanelEvent::ActiveViewFocused);
                                 cx.notify();
                             }),
@@ -7666,10 +7707,14 @@ impl AgentPanel {
         let terminal_id = self.overview_candidate_id(cx)?;
         let overview = self.terminals.get(&terminal_id)?.overview;
         let fits = self.terminal_overview_fits(terminal_id, cx);
+        let overview_visible = self.visible_overview_id(cx) == Some(terminal_id);
+        let needs_attention = fits && !overview && self.sub_terminals_notified(terminal_id);
         let tooltip = if !fits {
             self.sub_terminals_too_narrow_message()
         } else if overview {
             "Hide Sub Terminals"
+        } else if needs_attention {
+            "Show Sub Terminals (Needs Attention)"
         } else {
             "Show Sub Terminals"
         };
@@ -7678,8 +7723,9 @@ impl AgentPanel {
             toggled: overview,
             disabled: !fits,
             tooltip,
-            sub_terminal_badge_count: (self.visible_overview_id(cx) != Some(terminal_id))
+            sub_terminal_badge_count: (!overview_visible)
                 .then(|| self.sub_terminal_count(terminal_id, cx)),
+            sub_terminal_notified: needs_attention,
         })
     }
 
@@ -7715,6 +7761,15 @@ impl AgentPanel {
                             .right(px(-4.))
                             .size_3p5()
                             .child(CountBadge::new(count)),
+                    )
+                })
+                .when(state.sub_terminal_notified, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(-2.))
+                            .left(px(-2.))
+                            .child(Indicator::dot().color(Color::Accent)),
                     )
                 })
                 .into_any_element(),
@@ -7800,9 +7855,12 @@ impl AgentPanel {
                                         .flex_1()
                                         .min_w_0()
                                         .gap_1()
-                                        .when(minimized && sub_terminal.has_notification, |this| {
-                                            this.child(Indicator::dot().color(Color::Accent))
-                                        })
+                                        .when(
+                                            sub_terminal.has_notification && !is_zoomed_parent,
+                                            |this| {
+                                                this.child(Indicator::dot().color(Color::Accent))
+                                            },
+                                        )
                                         .child(
                                             Label::new(sub_terminal.title(cx))
                                                 .size(LabelSize::Small)
@@ -11247,41 +11305,27 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_widening_panel_clears_sub_terminal_notification(cx: &mut TestAppContext) {
+    async fn test_sub_terminal_notification_clears_only_on_focus(cx: &mut TestAppContext) {
         let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
         let [sub_terminal_id] = sub_terminal_ids[..] else {
             panic!("expected one sub terminal");
         };
         toggle_test_sub_terminals(&panel, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
-            assert_eq!(panel.visible_overview_id(cx), Some(parent_id));
             if let Some(terminal) = panel.terminals.get_mut(&sub_terminal_id) {
                 terminal.has_notification = true;
             }
-            panel.terminal_width_changed(window, cx);
-            assert!(!panel.terminals[&sub_terminal_id].has_notification);
+            let focus_handle = panel.terminals[&parent_id].view.focus_handle(cx);
+            window.focus(&focus_handle, cx);
         });
-    }
-
-    #[gpui::test]
-    async fn test_minimized_sub_terminal_keeps_notification_until_restored(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx, parent_id, sub_terminal_ids) = setup_visible_test_overview(cx, 1).await;
-        let [sub_terminal_id] = sub_terminal_ids[..] else {
-            panic!("expected one sub terminal");
-        };
-        toggle_test_sub_terminals(&panel, &mut cx);
+        cx.run_until_parked();
         panel.update_in(&mut cx, |panel, window, cx| {
-            assert!(panel.terminal_surface_visible(sub_terminal_id, cx));
-            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
-            assert!(!panel.terminal_surface_visible(sub_terminal_id, cx));
-            if let Some(terminal) = panel.terminals.get_mut(&sub_terminal_id) {
-                terminal.has_notification = true;
-            }
-            panel.clear_overview_notifications(parent_id, cx);
             assert!(panel.terminals[&sub_terminal_id].has_notification);
-            panel.toggle_overview_terminal_minimized(sub_terminal_id, window, cx);
+            let focus_handle = panel.terminals[&sub_terminal_id].view.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
             assert!(!panel.terminals[&sub_terminal_id].has_notification);
         });
     }
@@ -12263,7 +12307,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_opening_overview_clears_sub_terminal_notification(cx: &mut TestAppContext) {
+    async fn test_opening_overview_keeps_sub_terminal_notification(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
         let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
@@ -12282,8 +12326,51 @@ mod tests {
                 panel
                     .terminals
                     .get(&child_id)
-                    .is_some_and(|child| !child.has_notification)
+                    .is_some_and(|child| child.has_notification)
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_sidebar_click_shows_overview_for_notified_sub_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let parent_id = insert_test_terminal_with_parent(&panel, None, None, &mut cx);
+        let child_id = insert_test_terminal_with_parent(&panel, None, Some(parent_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, false, window, cx);
+        });
+        set_test_terminal_overview_layout(&panel, parent_id, px(1600.), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_terminal_overview(parent_id, false, cx);
+            if let Some(child) = panel.terminals.get_mut(&child_id) {
+                child.has_notification = true;
+            }
+            let button_state = panel.terminal_overview_button_state(cx);
+            assert!(button_state.is_some_and(|state| state.sub_terminal_notified));
+            let metadata = panel
+                .terminal_metadata(parent_id, cx)
+                .expect("parent should have metadata");
+            panel.restore_terminal(
+                metadata.clone(),
+                true,
+                AgentThreadSource::AgentPanel,
+                None,
+                window,
+                cx,
+            );
+            assert!(!panel.terminals[&parent_id].overview);
+            panel.restore_terminal(
+                metadata.clone(),
+                false,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+            assert!(!panel.terminals[&parent_id].overview);
+            panel.restore_terminal(metadata, true, AgentThreadSource::Sidebar, None, window, cx);
+            assert!(panel.terminals[&parent_id].overview);
+            assert!(panel.terminals[&child_id].has_notification);
         });
     }
 
@@ -12308,6 +12395,7 @@ mod tests {
                 disabled: true,
                 tooltip: "Widen or zoom the panel to show sub terminals",
                 sub_terminal_badge_count: Some(1),
+                sub_terminal_notified: false,
             })
         );
 
@@ -12320,6 +12408,7 @@ mod tests {
                 disabled: false,
                 tooltip: "Show Sub Terminals",
                 sub_terminal_badge_count: Some(1),
+                sub_terminal_notified: false,
             })
         );
 
@@ -12330,6 +12419,7 @@ mod tests {
             disabled: false,
             tooltip: "Hide Sub Terminals",
             sub_terminal_badge_count: None,
+            sub_terminal_notified: false,
         });
         assert_eq!(button_state(&mut cx), hide);
 
@@ -12342,6 +12432,7 @@ mod tests {
                 disabled: true,
                 tooltip: "Widen or zoom the panel to show sub terminals",
                 sub_terminal_badge_count: Some(1),
+                sub_terminal_notified: false,
             }),
             "a saved overview stays on while the panel is too narrow to show it"
         );
