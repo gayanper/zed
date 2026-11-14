@@ -303,10 +303,11 @@ fn paragraph_rows(
 /// Whether a line break looks like a program wrapping prose to fit the
 /// terminal, as agent TUIs do, rather than ending a line of a log or of
 /// code. The terminal can't tell them apart, so this guesses: the row
-/// reaches well across the terminal and ends in a word or punctuation of
-/// prose, and the next row carries on at the paragraph's indent with a
-/// word that wouldn't have fit on the row. Rows of code, listings and logs
-/// rarely look like that.
+/// reaches well across the terminal, counting the next word when more text
+/// follows it on its row, and ends in a word or punctuation of prose, and the
+/// next row carries on at the paragraph's indent with a word that wouldn't
+/// have fit on the row. Rows of code, listings and logs rarely look like
+/// that.
 ///
 /// `rows[index]` is the row before the break, in the paragraph that starts
 /// at `rows[paragraph_start]`.
@@ -340,7 +341,11 @@ fn continues_paragraph(
     let ends_in_prose = last_character.is_some_and(|character| {
         character.is_alphabetic()
             || character.is_ascii_digit()
-            || matches!(character, ',' | '.' | '?' | '!' | ':')
+            || matches!(character, ',' | '.' | '?' | '!' | ':' | '*' | '/')
+            // Code lines end in ";" and prose rarely does. With a single row,
+            // the fit check only compares the row with itself, so it can't
+            // keep lines of code apart.
+            || (character == ';' && index > paragraph_start)
     });
     // A wide character's padding cell doesn't end a word.
     let word_length = next_text
@@ -363,6 +368,8 @@ fn continues_paragraph(
     let next_word = next_word
         .trim_start_matches(['"', '“', '(', '`'])
         .trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”', ')', '`']);
+    // A glob such as "editor_*" ends in a star.
+    let next_word = next_word.strip_suffix('*').unwrap_or(next_word);
     let width = row.grid_row.characters.len();
     // A program wraps prose at a width of its own, which can be narrower than
     // the terminal, and none of its rows reach past it. Only the paragraph's
@@ -401,8 +408,19 @@ fn continues_paragraph(
         .max()
         .unwrap_or(0);
     let next_word_fits = row.end + 1 + (next_word_end - next_first_column) <= wrap_width;
+    // A long next word wraps early and leaves a short row, so the row counts
+    // as reaching across when it would have with that word. A next row with
+    // nothing after that word could just be a long token on a line of its own.
+    let next_word_reaches_across = last_column.saturating_mul(3) >= width.saturating_mul(2)
+        || (word_length < next_text.len()
+            && row
+                .end
+                .saturating_add(1)
+                .saturating_add(next_word_end - next_first_column)
+                .saturating_mul(3)
+                >= width.saturating_mul(2));
     ends_in_prose
-        && last_column.saturating_mul(3) >= width.saturating_mul(2)
+        && next_word_reaches_across
         && (next_first_column == text_indent || carries_space)
         && !next_word_fits
         && !next_row
@@ -414,17 +432,26 @@ fn continues_paragraph(
         // A number ends a row of prose, as in "about 3 / seconds", but also
         // log lines such as "attempt 2", which a capitalized line follows.
         && (!ends_in_number || next_word.starts_with(char::is_lowercase))
-        // Apostrophes, as in "others'" or "don't", dots, as in "Cargo.toml",
-        // and hyphens between parts of two letters or more, as in
-        // "ca-respawn", but not the permissions of listings such as
-        // "drwxr-xr-x", nor the digits of log lines.
-        && next_word.split('-').all(|part| {
-            !part.is_empty()
-                && (part.chars().count() >= 2 || !next_word.contains('-'))
-                && part
-                    .chars()
-                    .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
+        // Words of agent prose: names with apostrophes, dots, as in
+        // "Cargo.toml", digits, underscores, paths and "::", as in
+        // "agent_comments" or "Type::method". Hyphenated words need parts of
+        // two letters or more, as in "ca-respawn", which keeps out the
+        // permissions of listings such as "drwxr-xr-x".
+        && !next_word.replace("::", "").contains(':')
+        && next_word.chars().all(|character| {
+            character.is_alphanumeric()
+                || matches!(character, '_' | ':' | '/' | '.' | '\'' | '’' | '-')
         })
+        && (!next_word.contains('-')
+            || next_word.chars().any(|character| {
+                character.is_ascii_digit() || matches!(character, '_' | ':' | '/')
+            })
+            || next_word.split('-').all(|part| {
+                part.chars().count() >= 2
+                    && part
+                        .chars()
+                        .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
+            }))
 }
 
 /// The rows of each sentence of a paragraph, by Unicode sentence
@@ -3814,6 +3841,141 @@ mod tests {
             "
             )),
             vec!["I inferred that from how the old one ca-respawn cleans up stopped sessions."],
+        );
+    }
+
+    fn paragraphs_at_width(text: &str, width: usize) -> Vec<String> {
+        let (grid_rows, block) = text_grid(text, width);
+        paragraph_texts(&block, &grid_rows)
+    }
+
+    #[test]
+    fn test_paragraphs_join_rows_starting_with_code_words() {
+        let expected = vec![
+            "The reviewer approved the change in round 2 with no open findings. Agent comments still work in the code editor, the agent panel and the terminal: every agent_comments item they use still has callers. Clippy is clean, all 33 agent_comments tests pass and all 36 markdown_preview tests pass, including all four close_and_return_to_editor_* tests.",
+            "- Spec line 17 is wrong. The agent panel and terminal don't use the markdown crate's on_selection_action or selection_action_in_range_highlights. Those two, plus set_range_highlights and cursor_offset, now have no callers outside the markdown crate. Spec line 26 puts the markdown crate out of scope, so I left them; removing them could be a follow-up change.",
+            "- Removed AgentCommentStore::offset_ranges and its test test_store_offset_ranges_follow_edits; the preview was the only real caller (should-fix).",
+            "- Removed an empty impl MarkdownPreviewView {} block (nit).",
+        ];
+        let wide = "
+  The reviewer approved the change in round 2 with no open findings. Agent comments still work in the code
+  editor, the agent panel and the terminal: every agent_comments item they use still has callers. Clippy is
+  clean, all 33 agent_comments tests pass and all 36 markdown_preview tests pass, including all four
+  close_and_return_to_editor_* tests.
+
+  - Spec line 17 is wrong. The agent panel and terminal don't use the markdown crate's on_selection_action or
+    selection_action_in_range_highlights. Those two, plus set_range_highlights and cursor_offset, now have no
+    callers outside the markdown crate. Spec line 26 puts the markdown crate out of scope, so I left them;
+    removing them could be a follow-up change.
+
+  - Removed AgentCommentStore::offset_ranges and its test test_store_offset_ranges_follow_edits; the preview was
+    the only real caller (should-fix).
+  - Removed an empty impl MarkdownPreviewView {} block (nit).
+";
+        let narrow = "
+  The reviewer approved the change in round 2 with no open findings. Agent comments
+  still work in the code editor, the agent panel and the terminal: every
+  agent_comments item they use still has callers. Clippy is clean, all 33
+  agent_comments tests pass and all 36 markdown_preview tests pass, including all
+  four close_and_return_to_editor_* tests.
+
+  - Spec line 17 is wrong. The agent panel and terminal don't use the markdown
+    crate's on_selection_action or selection_action_in_range_highlights. Those two,
+    plus set_range_highlights and cursor_offset, now have no callers outside the
+    markdown crate. Spec line 26 puts the markdown crate out of scope, so I left
+    them; removing them could be a follow-up change.
+
+  - Removed AgentCommentStore::offset_ranges and its test
+    test_store_offset_ranges_follow_edits; the preview was the only real caller
+    (should-fix).
+  - Removed an empty impl MarkdownPreviewView {} block (nit).
+";
+        assert_eq!(paragraphs_at_width(wide, 114), expected);
+        assert_eq!(paragraphs_at_width(narrow, 88), expected);
+    }
+
+    #[test]
+    fn test_paragraphs_join_rows_starting_with_a_path_or_method() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  I changed the lookup in the file
+                  src/foo.rs and then the call to
+                  Store::offset_ranges as well.
+            "
+            )),
+            vec!["I changed the lookup in the file src/foo.rs and then the call to Store::offset_ranges as well."],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_code_lines_ending_in_semicolons_apart() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  let first_value = compute_value(a);
+                  let second_value = compute_other(b);
+            "
+            )),
+            vec![
+                "let first_value = compute_value(a);",
+                "let second_value = compute_other(b);",
+            ],
+        );
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  let long_binding_name = build(one, two);
+                  let another_long_name_here = make(three);
+            "
+            )),
+            vec![
+                "let long_binding_name = build(one, two);",
+                "let another_long_name_here = make(three);",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_short_rows_before_long_identifiers_apart() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  ok done
+                      some_very_long_identifier_name_here
+            "
+            )),
+            vec!["ok done", "some_very_long_identifier_name_here"],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_short_rows_before_long_tokens_apart() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  Compiling foo
+                  target/debug/build/foo-1a2b/out/gen.rs
+            "
+            )),
+            vec!["Compiling foo", "target/debug/build/foo-1a2b/out/gen.rs"],
+        );
+    }
+
+    #[test]
+    fn test_paragraphs_keep_apart_a_call_row_after_a_joined_row() {
+        assert_eq!(
+            paragraphs_of(&dedent(
+                "
+                  Then I set the value in the old
+                  place for it, a = compute(one);
+                  some_other_function_name(two);
+            "
+            )),
+            vec![
+                "Then I set the value in the old place for it, a = compute(one);",
+                "some_other_function_name(two);",
+            ],
         );
     }
 
