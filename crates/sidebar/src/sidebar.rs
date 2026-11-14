@@ -277,8 +277,8 @@ fn title_icon_glyph(title: &str) -> Option<SharedString> {
 /// glyphs here so its busy sub terminals win over an idle glyph on the parent
 /// row.
 const BUSY_TITLE_GLYPHS: &[RangeInclusive<char>] = &[
-    // Claude Code animates braille dots while working and shows `✳` when idle.
-    '\u{2800}'..='\u{28FF}',
+    // Claude Code alternates `◐` and `◑` while working and shows `✳` when idle.
+    '\u{25D0}'..='\u{25D1}',
 ];
 
 fn is_busy_title_glyph(glyph: &str) -> bool {

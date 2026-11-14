@@ -16091,13 +16091,14 @@ fn test_terminal_row_glyph() {
 
     assert_eq!(row_glyph(None, &[]), None);
     assert_eq!(row_glyph(None, &["✳"]), Some("✳".into()));
-    assert_eq!(row_glyph(None, &["✳", "⠐"]), Some("⠐".into()));
-    assert_eq!(row_glyph(Some("✳"), &["⠐"]), Some("⠐".into()));
+    assert_eq!(row_glyph(None, &["✳", "◑"]), Some("◑".into()));
+    assert_eq!(row_glyph(Some("✳"), &["◑"]), Some("◑".into()));
     assert_eq!(row_glyph(Some(">"), &["✳"]), Some(">".into()));
-    assert_eq!(row_glyph(Some("⠂"), &["⠐"]), Some("⠂".into()));
-    assert!(!is_busy_title_glyph("⠂⠐"));
+    assert_eq!(row_glyph(Some("◐"), &["◑"]), Some("◐".into()));
+    assert!(!is_busy_title_glyph("◐◑"));
     assert!(!is_busy_title_glyph("🔨"));
-    assert_eq!(title_icon_glyph("⠂ Fix the bug"), Some("⠂".into()));
+    assert!(!is_busy_title_glyph("⠋"));
+    assert_eq!(title_icon_glyph("◐ Fix the bug"), Some("◐".into()));
     assert_eq!(title_icon_glyph("zsh"), None);
 }
 
