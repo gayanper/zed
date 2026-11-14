@@ -16,7 +16,6 @@ doctest = false
 test-support = []
 
 [dependencies]
-agent_comments.workspace = true
 anyhow.workspace = true
 db.workspace = true
 editor.workspace = true

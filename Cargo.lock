@@ -10697,7 +10697,6 @@ dependencies = [
 name = "markdown_preview"
 version = "0.1.0"
 dependencies = [
- "agent_comments",
  "anyhow",
  "buffer_diff",
  "db",

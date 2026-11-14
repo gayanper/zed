@@ -405,17 +405,6 @@ impl AgentCommentStore {
         comments.into_iter().map(|(_, comment)| comment).collect()
     }
 
-    /// Non-empty offset ranges in `snapshot`, sorted by start.
-    pub fn offset_ranges(&self, snapshot: &BufferSnapshot, cx: &App) -> Vec<Range<usize>> {
-        let mut ranges = self
-            .comments_for_buffer(snapshot.remote_id(), cx)
-            .map(|comment| comment.offset_range(snapshot))
-            .filter(|range| range.start < range.end)
-            .collect::<Vec<_>>();
-        ranges.sort_by_key(|range| (range.start, range.end));
-        ranges
-    }
-
     /// The number of comments that apply to the visible thread: every buffer
     /// comment, and the terminal comments of `visible_terminal`, since their
     /// quoted text is only in that terminal.
@@ -1735,41 +1724,6 @@ impl CommentPopover {
         ))
     }
 
-    /// Opens the first comment, in document order, overlapping `range` in
-    /// `buffer` for editing, if there is one.
-    pub fn edit_existing<V: 'static>(
-        buffer: &BufferSnapshot,
-        range: Range<usize>,
-        position: Point<Pixels>,
-        workspace: Option<&Entity<Workspace>>,
-        window: &mut Window,
-        cx: &mut Context<V>,
-        on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
-    ) -> Option<Self> {
-        let store = comment_store(workspace, cx)?;
-        let comment = store
-            .read(cx)
-            .comments_at(buffer, range, cx)
-            .into_iter()
-            .next()?;
-        let source = code_source_for_buffer_range(buffer, comment.offset_range(buffer), cx)?;
-        let store = store.downgrade();
-        let comment_id = comment.id;
-        let input = cx.new(|cx| CommentInput::editing(source.title(), &comment.body, window, cx));
-        let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
-            apply_edit_event(event, &store, comment_id, cx);
-            on_close(view, window, cx);
-        });
-        Some(Self::with_input(
-            input,
-            Some(comment_id),
-            position,
-            subscription,
-            window,
-            cx,
-        ))
-    }
-
     fn with_input<V: 'static>(
         input: Entity<CommentInput>,
         comment_id: Option<AgentCommentId>,
@@ -2035,34 +1989,6 @@ mod tests {
         let one = add(&store, &buffer, 0..3, "One.", cx);
 
         assert_eq!(ids_at(&store, &buffer, 0..18, cx), [one, three]);
-    }
-
-    #[gpui::test]
-    fn test_store_offset_ranges_follow_edits(cx: &mut TestAppContext) {
-        let buffer = cx.new(|cx| Buffer::local("one two three", cx));
-        let (store, _) = new_store(cx);
-        add(&store, &buffer, 8..13, "Three.", cx);
-        add(&store, &buffer, 0..3, "One.", cx);
-
-        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "zero ")], None, cx));
-        let ranges = cx.update(|cx| {
-            store
-                .read(cx)
-                .offset_ranges(&buffer.read(cx).snapshot(), cx)
-        });
-        assert_eq!(ranges, [5..8, 13..18]);
-
-        buffer.update(cx, |buffer, cx| buffer.edit([(8..8, "!")], None, cx));
-        let ranges = cx.update(|cx| {
-            store
-                .read(cx)
-                .offset_ranges(&buffer.read(cx).snapshot(), cx)
-        });
-        assert_eq!(
-            ranges,
-            [5..8, 14..19],
-            "text typed at an edge isn't included"
-        );
     }
 
     #[gpui::test]
