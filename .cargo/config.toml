@@ -22,3 +22,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+
+[profile.dev]
+debug = "line-tables-only"

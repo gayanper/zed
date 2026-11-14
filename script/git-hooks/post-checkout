@@ -1,0 +1,6 @@
+#!/bin/sh
+# Seed a new worktree's target/ from the main worktree via APFS clone.
+# $1 is the null SHA only for a fresh checkout, which includes `git worktree add`.
+[ "$1" = "0000000000000000000000000000000000000000" ] || exit 0
+main="$(git rev-parse --path-format=absolute --git-common-dir)/.."
+[ -d target ] || [ ! -d "$main/target" ] || cp -c -R "$main/target" target
