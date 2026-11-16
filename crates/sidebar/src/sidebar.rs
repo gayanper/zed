@@ -29,7 +29,7 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, PromptLevel, Render, SharedString, Task,
     TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
@@ -156,8 +156,9 @@ enum ActiveEntry {
         session_id: Option<acp::SessionId>,
         workspace: Entity<Workspace>,
     },
+    /// A terminal group's row, which stays active whichever member holds the main slot.
     Terminal {
-        terminal_id: TerminalId,
+        group_id: TerminalId,
         workspace: Entity<Workspace>,
     },
 }
@@ -175,8 +176,8 @@ impl ActiveEntry {
         matches!(self, ActiveEntry::Thread { thread_id: active_thread_id, .. } if active_thread_id == thread_id)
     }
 
-    fn is_active_terminal(&self, terminal_id: TerminalId) -> bool {
-        matches!(self, ActiveEntry::Terminal { terminal_id: active_terminal_id, .. } if *active_terminal_id == terminal_id)
+    fn is_active_terminal_group(&self, group_id: TerminalId) -> bool {
+        matches!(self, ActiveEntry::Terminal { group_id: active_group_id, .. } if *active_group_id == group_id)
     }
 
     fn matches_entry(&self, entry: &ListEntry) -> bool {
@@ -195,8 +196,8 @@ impl ActiveEntry {
                         .zip(thread.metadata.session_id.as_ref())
                         .is_some_and(|(a, b)| a == b)
             }
-            (ActiveEntry::Terminal { terminal_id, .. }, ListEntry::Terminal(terminal)) => {
-                *terminal_id == terminal.metadata.terminal_id
+            (ActiveEntry::Terminal { group_id, .. }, ListEntry::Terminal(terminal)) => {
+                *group_id == terminal.metadata.group_id
             }
             _ => false,
         }
@@ -274,8 +275,7 @@ fn title_icon_glyph(title: &str) -> Option<SharedString> {
 }
 
 /// Title glyphs that agents animate while working. Add another agent's
-/// glyphs here so its busy sub terminals win over an idle glyph on the parent
-/// row.
+/// glyphs here so its busy group members win over an idle glyph on the row.
 const BUSY_TITLE_GLYPHS: &[RangeInclusive<char>] = &[
     // Claude Code alternates `◐` and `◑` while working and shows `✳` when idle.
     '\u{25D0}'..='\u{25D1}',
@@ -291,19 +291,39 @@ fn is_busy_title_glyph(glyph: &str) -> bool {
         .any(|range| range.contains(&character))
 }
 
-/// A working agent anywhere in the terminal or its sub terminals wins, so an
-/// idle parent can't hide a busy sub terminal.
+/// A working agent in any member of the group wins, so an idle member can't
+/// hide a busy one.
 fn terminal_row_glyph(
     own_glyph: Option<SharedString>,
-    sub_terminal_glyphs: &[SharedString],
+    member_glyphs: &[SharedString],
 ) -> Option<SharedString> {
     own_glyph
         .iter()
-        .chain(sub_terminal_glyphs)
+        .chain(member_glyphs)
         .find(|glyph| is_busy_title_glyph(glyph))
         .cloned()
         .or(own_glyph)
-        .or_else(|| sub_terminal_glyphs.first().cloned())
+        .or_else(|| member_glyphs.first().cloned())
+}
+
+/// A group's row shows its oldest member, titled with the group's custom
+/// title when it has one. The title never follows the main slot.
+fn group_row_metadata(
+    store: &TerminalThreadMetadataStore,
+    metadata: TerminalThreadMetadata,
+) -> TerminalThreadMetadata {
+    let group_id = metadata.group_id;
+    let mut row = store
+        .group_title_member(group_id)
+        .cloned()
+        .unwrap_or(metadata);
+    if let Some(custom_title) = store
+        .group(group_id)
+        .and_then(|group| group.custom_title.clone())
+    {
+        row.custom_title = Some(custom_title);
+    }
+    row
 }
 
 /// Picks a single glyph to render as the icon from a detected title prefix.
@@ -422,9 +442,11 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
-    /// Title glyphs of live sub terminals, oldest first. Sub terminals have no
-    /// row, so their agents' working or idle state shows on the parent's.
-    sub_terminal_glyphs: Vec<SharedString>,
+    /// Titles of the members whose bell rang, for the bell's tooltip.
+    notified_member_titles: Vec<SharedString>,
+    /// Title glyphs of the group's live members, oldest first. A group has one
+    /// row, so every member's working or idle state shows on it.
+    member_glyphs: Vec<SharedString>,
     highlight_positions: Vec<usize>,
 }
 
@@ -476,7 +498,7 @@ impl RenameTarget {
                 thread.metadata.display_title(),
             )),
             ListEntry::Terminal(terminal) => Some((
-                Self::Terminal(terminal.metadata.terminal_id),
+                Self::Terminal(terminal.metadata.group_id),
                 terminal.metadata.editable_title(),
             )),
             ListEntry::ProjectHeader { .. } => None,
@@ -1403,7 +1425,7 @@ impl Sidebar {
 
         if let Some(terminal_id) = panel.active_terminal_id() {
             self.active_entry = Some(ActiveEntry::Terminal {
-                terminal_id,
+                group_id: panel.terminal_group_id(terminal_id).unwrap_or(terminal_id),
                 workspace: active_workspace,
             });
         } else if let Some(thread_id) = panel.active_thread_id(cx) {
@@ -1573,7 +1595,7 @@ impl Sidebar {
         let mut current_terminal_ids: HashSet<TerminalId> = HashSet::new();
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
-        let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut seen_terminal_group_ids: HashSet<TerminalId> = HashSet::new();
 
         let has_open_projects = workspaces
             .iter()
@@ -1594,8 +1616,10 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
-        let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
-        let mut live_sub_terminal_glyphs: HashMap<
+        // Keyed by group, since a group's row stands for all of its members.
+        let mut live_notified_members: HashMap<TerminalId, Vec<(u64, SharedString)>> =
+            HashMap::new();
+        let mut live_member_glyphs: HashMap<
             TerminalId,
             Vec<(DateTime<Utc>, TerminalId, SharedString)>,
         > = HashMap::new();
@@ -1603,14 +1627,14 @@ impl Sidebar {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 for terminal in agent_panel.read(cx).terminals(cx) {
                     if terminal.has_notification {
-                        live_notified_terminal_ids.insert(terminal.id);
-                        live_notified_terminal_ids.extend(terminal.parent_terminal_id);
+                        live_notified_members
+                            .entry(terminal.group_id)
+                            .or_default()
+                            .push((terminal.notification_sequence, terminal.title.clone()));
                     }
-                    if let Some(parent_id) = terminal.parent_terminal_id
-                        && let Some(glyph) = title_icon_glyph(&terminal.title)
-                    {
-                        live_sub_terminal_glyphs
-                            .entry(parent_id)
+                    if let Some(glyph) = title_icon_glyph(&terminal.title) {
+                        live_member_glyphs
+                            .entry(terminal.group_id)
                             .or_default()
                             .push((terminal.created_at, terminal.id, glyph));
                     }
@@ -1619,8 +1643,11 @@ impl Sidebar {
         }
         // Panel terminals come from a map, so the id breaks creation-time ties
         // to keep the chosen glyph from flickering between rebuilds.
-        for glyphs in live_sub_terminal_glyphs.values_mut() {
+        for glyphs in live_member_glyphs.values_mut() {
             glyphs.sort_by_key(|(created_at, terminal_id, _)| (*created_at, *terminal_id));
+        }
+        for members in live_notified_members.values_mut() {
+            members.sort();
         }
 
         let mut all_paths: Vec<PathBuf> = groups
@@ -1681,10 +1708,13 @@ impl Sidebar {
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
-                    let has_notification =
-                        live_notified_terminal_ids.contains(&metadata.terminal_id);
-                    let sub_terminal_glyphs = live_sub_terminal_glyphs
-                        .get(&metadata.terminal_id)
+                    let notified_member_titles: Vec<SharedString> = live_notified_members
+                        .get(&metadata.group_id)
+                        .map(|members| members.iter().map(|(_, title)| title.clone()).collect())
+                        .unwrap_or_default();
+                    let has_notification = !notified_member_titles.is_empty();
+                    let member_glyphs = live_member_glyphs
+                        .get(&metadata.group_id)
                         .map(|glyphs| glyphs.iter().map(|(_, _, glyph)| glyph.clone()).collect())
                         .unwrap_or_default();
                     TerminalEntry {
@@ -1692,7 +1722,8 @@ impl Sidebar {
                         workspace,
                         worktrees,
                         has_notification,
-                        sub_terminal_glyphs,
+                        notified_member_titles,
+                        member_glyphs,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -1702,18 +1733,13 @@ impl Sidebar {
             let group_host = group_key.host();
             let mut push_terminal_metadata =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
-                    if !seen_terminal_ids.insert(metadata.terminal_id) {
+                    if !seen_terminal_group_ids.insert(metadata.group_id) {
                         return;
                     }
-                    // Sub terminals live in their parent's overview. Without a
-                    // parent, a row is the only way left to reach them.
-                    if metadata
-                        .parent_terminal_id
-                        .is_some_and(|parent_id| terminal_store.read(cx).entry(parent_id).is_some())
-                    {
-                        return;
-                    }
-                    terminals.push(make_terminal_entry(metadata, workspace));
+                    terminals.push(make_terminal_entry(
+                        group_row_metadata(terminal_store.read(cx), metadata),
+                        workspace,
+                    ));
                 };
             for row in terminal_store
                 .read(cx)
@@ -1767,7 +1793,7 @@ impl Sidebar {
             notified_terminals.extend(terminals.iter().filter_map(|terminal| {
                 terminal
                     .has_notification
-                    .then_some(terminal.metadata.terminal_id)
+                    .then_some(terminal.metadata.group_id)
             }));
             if group_key.path_list().paths().is_empty() {
                 continue;
@@ -2114,7 +2140,7 @@ impl Sidebar {
                     .any(|t| notified_threads.contains(&t.metadata.thread_id));
                 let has_terminal_notifications = matched_terminals
                     .iter()
-                    .any(|t| notified_terminals.contains(&t.metadata.terminal_id));
+                    .any(|t| notified_terminals.contains(&t.metadata.group_id));
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
@@ -2138,7 +2164,7 @@ impl Sidebar {
             } else {
                 let has_terminal_notifications = terminals
                     .iter()
-                    .any(|t| notified_terminals.contains(&t.metadata.terminal_id));
+                    .any(|t| notified_terminals.contains(&t.metadata.group_id));
 
                 // When collapsed, threads aren't loaded into `threads`, so we
                 // query the store for thread IDs to check notifications and
@@ -2301,7 +2327,7 @@ impl Sidebar {
                     .unwrap_or(false),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
-            ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.group_id),
         })
     }
 
@@ -3710,12 +3736,35 @@ impl Sidebar {
         }
     }
 
+    /// Renaming a multi-member group's row names the group and leaves its
+    /// members' titles alone. A lone terminal's row renames the terminal.
     fn apply_terminal_rename(
         &mut self,
-        terminal_id: TerminalId,
+        group_id: TerminalId,
         title: SharedString,
         cx: &mut Context<Self>,
     ) {
+        let store = TerminalThreadMetadataStore::global(cx);
+        let members = store
+            .read(cx)
+            .group_members(group_id)
+            .into_iter()
+            .map(|member| member.terminal_id)
+            .collect::<Vec<_>>();
+        // A group title outlives the members that shrank the group to one, and
+        // it still overrides the row title, so it's the one to rename.
+        let has_group_title = store
+            .read(cx)
+            .group(group_id)
+            .is_some_and(|group| group.custom_title.is_some());
+        let terminal_id = match members.as_slice() {
+            [terminal_id] if !has_group_title => *terminal_id,
+            [] => group_id,
+            _ => {
+                store.update(cx, |store, cx| store.rename_group(group_id, title, cx));
+                return;
+            }
+        };
         let mut found = false;
         if let Some(multi_workspace) = self.multi_workspace.upgrade() {
             let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
@@ -4886,10 +4935,9 @@ impl Sidebar {
             return;
         };
 
-        let terminal_id = metadata.terminal_id;
-        self.record_terminal_access(terminal_id);
+        self.record_terminal_access(metadata.terminal_id);
         self.active_entry = Some(ActiveEntry::Terminal {
-            terminal_id,
+            group_id: metadata.group_id,
             workspace: workspace.clone(),
         });
 
@@ -5263,6 +5311,8 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    /// Closes every member of the row's group, after asking when there is
+    /// more than one.
     fn close_terminal(
         &mut self,
         metadata: &TerminalThreadMetadata,
@@ -5270,19 +5320,56 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let member_count = TerminalThreadMetadataStore::try_global(cx)
+            .map_or(0, |store| store.read(cx).group_members(metadata.group_id).len());
+        if member_count < 2 {
+            self.close_terminal_group(metadata, workspace, window, cx);
+            return;
+        }
+
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close {member_count} terminals?"),
+            None,
+            &["Close", "Cancel"],
+            cx,
+        );
+        let metadata = metadata.clone();
+        let workspace = workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.close_terminal_group(&metadata, &workspace, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn close_terminal_group(
+        &mut self,
+        metadata: &TerminalThreadMetadata,
+        workspace: &ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let terminal_id = metadata.terminal_id;
-        let sub_terminal_ids = TerminalThreadMetadataStore::try_global(cx)
+        let group_id = metadata.group_id;
+        let other_member_ids = TerminalThreadMetadataStore::try_global(cx)
             .map(|store| {
                 store
                     .read(cx)
-                    .entries()
-                    .filter(|entry| entry.parent_terminal_id == Some(terminal_id))
-                    .map(|entry| entry.terminal_id)
+                    .group_members(group_id)
+                    .into_iter()
+                    .map(|member| member.terminal_id)
+                    .filter(|member_id| *member_id != terminal_id)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let closing_terminal_ids: Vec<TerminalId> = std::iter::once(terminal_id)
-            .chain(sub_terminal_ids.iter().copied())
+            .chain(other_member_ids.iter().copied())
             .collect();
 
         if let ThreadEntryWorkspace::Closed {
@@ -5305,7 +5392,7 @@ impl Sidebar {
                 window,
                 cx,
                 move |this, workspace, window, cx| {
-                    this.close_terminal(
+                    this.close_terminal_group(
                         &metadata,
                         &ThreadEntryWorkspace::Open(workspace),
                         window,
@@ -5316,12 +5403,10 @@ impl Sidebar {
             return;
         }
 
-        let is_active = self.active_entry.as_ref().is_some_and(|entry| {
-            entry.is_active_terminal(terminal_id)
-                || sub_terminal_ids
-                    .iter()
-                    .any(|sub_terminal_id| entry.is_active_terminal(*sub_terminal_id))
-        });
+        let is_active = self
+            .active_entry
+            .as_ref()
+            .is_some_and(|entry| entry.is_active_terminal_group(group_id));
         let neighbor = self
             .contents
             .entries
@@ -5330,7 +5415,7 @@ impl Sidebar {
                 matches!(
                     entry,
                     ListEntry::Terminal(terminal)
-                        if terminal.metadata.terminal_id == terminal_id
+                        if terminal.metadata.group_id == group_id
                 )
             })
             .and_then(|position| {
@@ -5377,8 +5462,8 @@ impl Sidebar {
             window,
             cx,
             move |this, window, cx| {
-                if !sub_terminal_ids.is_empty() {
-                    this.close_sub_terminals(&sub_terminal_ids, &workspace, window, cx);
+                if !other_member_ids.is_empty() {
+                    this.close_other_group_members(&other_member_ids, &workspace, window, cx);
                 }
                 if terminal_workspace_removed {
                     this.delete_empty_drafts_for_archive_paths(
@@ -5403,9 +5488,9 @@ impl Sidebar {
         );
     }
 
-    fn close_sub_terminals(
+    fn close_other_group_members(
         &mut self,
-        sub_terminal_ids: &[TerminalId],
+        member_ids: &[TerminalId],
         workspace: &ThreadEntryWorkspace,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5414,15 +5499,15 @@ impl Sidebar {
             && let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx)
         {
             panel.update(cx, |panel, cx| {
-                for sub_terminal_id in sub_terminal_ids {
-                    panel.close_terminal_without_activating_draft(*sub_terminal_id, window, cx);
+                for member_id in member_ids {
+                    panel.close_terminal_without_activating_draft(*member_id, window, cx);
                 }
             });
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
-                for sub_terminal_id in sub_terminal_ids {
-                    store.delete(*sub_terminal_id, cx);
+                for member_id in member_ids {
+                    store.delete(*member_id, cx);
                 }
             });
         }
@@ -6305,7 +6390,7 @@ impl Sidebar {
                         });
                     }
                     self.active_entry = Some(ActiveEntry::Terminal {
-                        terminal_id: metadata.terminal_id,
+                        group_id: metadata.group_id,
                         workspace: workspace.clone(),
                     });
                     self.update_entries(cx);
@@ -6441,20 +6526,20 @@ impl Sidebar {
                             }
                         }
                         Some(ActiveEntry::Terminal {
-                            terminal_id,
+                            group_id,
                             workspace,
                         }) => {
-                            let terminal_id = *terminal_id;
+                            let group_id = *group_id;
                             let workspace = workspace.clone();
                             this.active_entry = Some(ActiveEntry::Terminal {
-                                terminal_id,
+                                group_id,
                                 workspace: workspace.clone(),
                             });
                             this.update_entries(cx);
                             workspace.update(cx, |workspace, cx| {
                                 if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                                     panel.update(cx, |panel, cx| {
-                                        panel.activate_terminal(terminal_id, false, window, cx);
+                                        panel.activate_terminal_group(group_id, false, window, cx);
                                     });
                                 }
                             });
@@ -6904,7 +6989,7 @@ impl Sidebar {
         );
         let is_remote = terminal.workspace.is_remote(cx);
         let is_renaming =
-            self.rename_target == Some(RenameTarget::Terminal(terminal.metadata.terminal_id));
+            self.rename_target == Some(RenameTarget::Terminal(terminal.metadata.group_id));
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
         let show_actions = is_hovered && !is_renaming;
 
@@ -6914,7 +6999,18 @@ impl Sidebar {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
-        let icon_char = terminal_row_glyph(own_icon_char, &terminal.sub_terminal_glyphs);
+        let icon_char = terminal_row_glyph(own_icon_char, &terminal.member_glyphs);
+        let notified_tooltip = (!terminal.notified_member_titles.is_empty()).then(|| {
+            SharedString::from(format!(
+                "Bell from {}",
+                terminal
+                    .notified_member_titles
+                    .iter()
+                    .map(|title| if title.is_empty() { "Terminal" } else { title.as_ref() })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        });
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
@@ -6925,6 +7021,7 @@ impl Sidebar {
             .show_main_worktree(true)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
+            .when_some(notified_tooltip, |this, tooltip| this.notified_tooltip(tooltip))
             .highlight_positions(highlight_positions)
             .selected(is_active)
             .focused(is_focused)

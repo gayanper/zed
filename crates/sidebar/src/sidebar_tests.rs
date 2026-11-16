@@ -2244,7 +2244,7 @@ async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAp
     );
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { terminal_id: active_terminal_id, .. }) if *active_terminal_id == terminal_id),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { group_id: active_group_id, .. }) if *active_group_id == terminal_id),
             "expected active terminal entry, got {:?}",
             sidebar.active_entry,
         );
@@ -2450,8 +2450,8 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         remote_connection: None,
         working_directory: None,
         init_command: None,
-        parent_terminal_id: None,
-        overview_enabled: false,
+        group_id: terminal_id,
+        position: 0,
         minimized_in_overview: false,
     };
 
@@ -3498,7 +3498,7 @@ async fn test_terminal_close_event_activates_neighbor(cx: &mut TestAppContext) {
     });
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { terminal_id, .. }) if *terminal_id == build_terminal_id),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { group_id, .. }) if *group_id == build_terminal_id),
             "expected remaining terminal to become active, got {:?}",
             sidebar.active_entry,
         );
@@ -3628,7 +3628,7 @@ async fn test_thread_switcher_can_activate_agent_panel_terminal(cx: &mut TestApp
     });
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { terminal_id, .. }) if *terminal_id == selected_terminal_id),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { group_id, .. }) if *group_id == selected_terminal_id),
             "expected selected terminal to become active, got {:?}",
             sidebar.active_entry,
         );
@@ -3685,8 +3685,8 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         remote_connection: None,
         working_directory: None,
         init_command: None,
-        parent_terminal_id: None,
-        overview_enabled: false,
+        group_id: terminal_id,
+        position: 0,
         minimized_in_overview: false,
     };
     cx.update(|_, cx| {
@@ -3796,8 +3796,8 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         remote_connection: None,
         working_directory: None,
         init_command: None,
-        parent_terminal_id: None,
-        overview_enabled: false,
+        group_id: terminal_id,
+        position: 0,
         minimized_in_overview: false,
     };
     cx.update(|_, cx| {
@@ -3970,14 +3970,15 @@ async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &m
         remote_connection: None,
         working_directory: None,
         init_command: None,
-        parent_terminal_id: None,
-        overview_enabled: false,
+        group_id: terminal_id,
+        position: 0,
         minimized_in_overview: false,
     };
     let sub_terminal_metadata = TerminalThreadMetadata {
         terminal_id: sub_terminal_id,
         title: "Feature Sub Terminal".into(),
-        parent_terminal_id: Some(terminal_id),
+        group_id: terminal_id,
+        position: 1,
         ..metadata.clone()
     };
     cx.update(|_, cx| {
@@ -4031,6 +4032,10 @@ async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &m
         sidebar.selection = Some(terminal_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    cx.run_until_parked();
+    if with_sub_terminal {
+        cx.simulate_prompt_answer("Close");
+    }
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -4053,7 +4058,7 @@ async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &m
     });
     assert!(
         sub_terminal_metadata_deleted,
-        "sub terminal metadata should be deleted with its parent"
+        "every member's metadata should be deleted with the group's row"
     );
     let empty_draft_metadata_deleted = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -4569,7 +4574,7 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
     });
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { terminal_id, .. }) if *terminal_id == build_terminal_id),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { group_id, .. }) if *group_id == build_terminal_id),
             "expected remaining terminal to become active, got {:?}",
             sidebar.active_entry,
         );
@@ -4601,7 +4606,7 @@ fn terminal_entry(
 }
 
 #[gpui::test]
-async fn test_sub_terminals_are_hidden_from_sidebar(cx: &mut TestAppContext) {
+async fn test_terminal_group_has_one_row(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -4620,7 +4625,7 @@ async fn test_sub_terminals_are_hidden_from_sidebar(cx: &mut TestAppContext) {
     for title in ["Child 1", "Child 2"] {
         panel
             .update_in(cx, |panel, window, cx| {
-                panel.insert_test_sub_terminal(parent_id, title, window, cx)
+                panel.insert_test_group_member(parent_id, title, window, cx)
             })
             .expect("sub terminal should be inserted");
     }
@@ -4633,7 +4638,7 @@ async fn test_sub_terminals_are_hidden_from_sidebar(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_orphan_sub_terminal_renders_top_level(cx: &mut TestAppContext) {
+async fn test_terminal_group_row_outlives_its_founder(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -4647,7 +4652,7 @@ async fn test_orphan_sub_terminal_renders_top_level(cx: &mut TestAppContext) {
         .expect("parent terminal should be inserted");
     panel
         .update_in(cx, |panel, window, cx| {
-            panel.insert_test_sub_terminal(parent_id, "Orphan", window, cx)
+            panel.insert_test_group_member(parent_id, "Orphan", window, cx)
         })
         .expect("sub terminal should be inserted");
     cx.run_until_parked();
@@ -4670,7 +4675,7 @@ async fn test_orphan_sub_terminal_renders_top_level(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_sub_terminals_are_not_searchable(cx: &mut TestAppContext) {
+async fn test_only_the_group_row_title_is_searchable(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -4684,7 +4689,7 @@ async fn test_sub_terminals_are_not_searchable(cx: &mut TestAppContext) {
     for title in ["Child Alpha", "Child Beta"] {
         panel
             .update_in(cx, |panel, window, cx| {
-                panel.insert_test_sub_terminal(parent_id, title, window, cx)
+                panel.insert_test_group_member(parent_id, title, window, cx)
             })
             .expect("sub terminal should be inserted");
     }
@@ -4698,7 +4703,7 @@ async fn test_sub_terminals_are_not_searchable(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_parent_terminal_close_event_closes_sub_terminals(cx: &mut TestAppContext) {
+async fn test_member_shell_exit_closes_only_that_member(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -4711,7 +4716,7 @@ async fn test_parent_terminal_close_event_closes_sub_terminals(cx: &mut TestAppC
         .expect("parent terminal should be inserted");
     let child_id = panel
         .update_in(cx, |panel, window, cx| {
-            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+            panel.insert_test_group_member(parent_id, "Child", window, cx)
         })
         .expect("sub terminal should be inserted");
     cx.run_until_parked();
@@ -4724,8 +4729,8 @@ async fn test_parent_terminal_close_event_closes_sub_terminals(cx: &mut TestAppC
     panel.read_with(cx, |panel, _cx| {
         assert!(!panel.has_terminal(parent_id));
         assert!(
-            !panel.has_terminal(child_id),
-            "the parent shell exiting should close its sub terminals"
+            panel.has_terminal(child_id),
+            "a member's shell exiting closes only that member"
         );
     });
     sidebar.read_with(cx, |_sidebar, cx| {
@@ -4733,13 +4738,87 @@ async fn test_parent_terminal_close_event_closes_sub_terminals(cx: &mut TestAppC
             TerminalThreadMetadataStore::global(cx)
                 .read(cx)
                 .entry(child_id)
-                .is_none()
+                .is_some()
         );
     });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Child"],
+        "the group keeps its row, titled by its oldest open member"
+    );
 }
 
 #[gpui::test]
-async fn test_closing_parent_closes_sub_terminals(cx: &mut TestAppContext) {
+async fn test_terminal_group_row_title_rename_and_bell(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let lone_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Lone", true, window, cx)
+        })
+        .expect("lone terminal should be inserted");
+    let parent_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Parent", true, window, cx)
+        })
+        .expect("parent terminal should be inserted");
+    let child_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_group_member(parent_id, "Child", window, cx)
+        })
+        .expect("group member should be inserted");
+    cx.run_until_parked();
+
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.apply_terminal_rename(parent_id, "Pair".into(), cx);
+        sidebar.apply_terminal_rename(lone_id, "Renamed Lone".into(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let store = TerminalThreadMetadataStore::global(cx).read(cx);
+        assert_eq!(
+            store.group(parent_id).and_then(|group| group.custom_title.clone()),
+            Some("Pair".into())
+        );
+        assert_eq!(store.entry(parent_id).unwrap().custom_title.as_deref(), Some("Parent"));
+        assert_eq!(store.entry(child_id).unwrap().custom_title.as_deref(), Some("Child"));
+        assert_eq!(
+            store.entry(lone_id).unwrap().custom_title.as_deref(),
+            Some("Renamed Lone")
+        );
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    let mut rows = visible_entries_as_strings(&sidebar, cx);
+    rows.sort();
+    assert_eq!(rows, vec!["  Pair", "  Renamed Lone", "v [my-project]"]);
+
+    panel.update(cx, |panel, cx| panel.emit_test_terminal_bell(child_id, cx));
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    let row = terminal_entry(&sidebar, parent_id, cx);
+    assert!(row.has_notification, "the row rolls up its members' bells");
+    assert_eq!(row.notified_member_titles, vec![SharedString::from("Child")]);
+
+    // The group title still names the row once the group shrinks to one
+    // member, so renaming the row renames the group.
+    panel.update_in(cx, |panel, window, cx| panel.close_terminal(child_id, window, cx));
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.apply_terminal_rename(parent_id, "Solo".into(), cx));
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    let mut rows = visible_entries_as_strings(&sidebar, cx);
+    rows.sort();
+    assert_eq!(rows, vec!["  Renamed Lone", "  Solo", "v [my-project]"]);
+}
+
+#[gpui::test]
+async fn test_closing_group_row_asks_then_closes_every_member(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -4757,15 +4836,29 @@ async fn test_closing_parent_closes_sub_terminals(cx: &mut TestAppContext) {
         .expect("parent terminal should be inserted");
     let child_id = panel
         .update_in(cx, |panel, window, cx| {
-            panel.insert_test_sub_terminal(parent_id, "Child", window, cx)
+            panel.insert_test_group_member(parent_id, "Child", window, cx)
         })
         .expect("sub terminal should be inserted");
     cx.run_until_parked();
 
     let parent = terminal_entry(&sidebar, parent_id, cx);
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.close_terminal(&parent.metadata, &parent.workspace, window, cx);
+    let close_row = |cx: &mut gpui::VisualTestContext| {
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.close_terminal(&parent.metadata, &parent.workspace, window, cx);
+        });
+        cx.run_until_parked();
+    };
+    close_row(cx);
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.has_terminal(parent_id));
+        assert!(panel.has_terminal(child_id));
     });
+
+    close_row(cx);
+    cx.simulate_prompt_answer("Close");
     cx.run_until_parked();
 
     panel.read_with(cx, |panel, _cx| {
@@ -5859,8 +5952,8 @@ async fn test_keyboard_confirm_on_terminal_preserves_selection(cx: &mut TestAppC
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id: active_terminal_id, .. })
-                    if *active_terminal_id == other_terminal_id
+                Some(ActiveEntry::Terminal { group_id: active_group_id, .. })
+                    if *active_group_id == other_terminal_id
             ),
             "Terminal B should be active before confirming Terminal A, got {:?}",
             sidebar.active_entry,
@@ -5875,8 +5968,8 @@ async fn test_keyboard_confirm_on_terminal_preserves_selection(cx: &mut TestAppC
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id: active_terminal_id, .. })
-                    if *active_terminal_id == terminal_id
+                Some(ActiveEntry::Terminal { group_id: active_group_id, .. })
+                    if *active_group_id == terminal_id
             ),
             "confirmed terminal should be active, got {:?}",
             sidebar.active_entry,
@@ -5935,8 +6028,8 @@ async fn test_clicking_different_terminal_clears_sidebar_selection(cx: &mut Test
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id, .. })
-                    if *terminal_id == terminal_a_id
+                Some(ActiveEntry::Terminal { group_id, .. })
+                    if *group_id == terminal_a_id
             ),
             "Terminal A should be active before clicking Terminal B, got {:?}",
             sidebar.active_entry,
@@ -5951,8 +6044,8 @@ async fn test_clicking_different_terminal_clears_sidebar_selection(cx: &mut Test
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id, .. })
-                    if *terminal_id == terminal_b_id
+                Some(ActiveEntry::Terminal { group_id, .. })
+                    if *group_id == terminal_b_id
             ),
             "Terminal B should be active after the click, got {:?}",
             sidebar.active_entry,
@@ -5976,8 +6069,8 @@ async fn test_clicking_active_terminal_clears_sidebar_selection(cx: &mut TestApp
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id: active_terminal_id, .. })
-                    if *active_terminal_id == terminal_id
+                Some(ActiveEntry::Terminal { group_id: active_group_id, .. })
+                    if *active_group_id == terminal_id
             ),
             "Terminal A should be active before clicking it, got {:?}",
             sidebar.active_entry,
@@ -5992,8 +6085,8 @@ async fn test_clicking_active_terminal_clears_sidebar_selection(cx: &mut TestApp
         assert!(
             matches!(
                 &sidebar.active_entry,
-                Some(ActiveEntry::Terminal { terminal_id: active_terminal_id, .. })
-                    if *active_terminal_id == terminal_id
+                Some(ActiveEntry::Terminal { group_id: active_group_id, .. })
+                    if *active_group_id == terminal_id
             ),
             "Terminal A should remain active after the click, got {:?}",
             sidebar.active_entry,

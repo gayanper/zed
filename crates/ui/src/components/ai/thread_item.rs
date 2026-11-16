@@ -48,6 +48,7 @@ pub struct ThreadItem {
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
     notified: bool,
+    notified_tooltip: Option<SharedString>,
     status: AgentThreadStatus,
     selected: bool,
     focused: bool,
@@ -84,6 +85,7 @@ impl ThreadItem {
             highlight_positions: Vec::new(),
             timestamp: "".into(),
             notified: false,
+            notified_tooltip: None,
             status: AgentThreadStatus::default(),
             selected: false,
             focused: false,
@@ -139,6 +141,12 @@ impl ThreadItem {
 
     pub fn notified(mut self, notified: bool) -> Self {
         self.notified = notified;
+        self
+    }
+
+    /// Shown while the item is notified, to say what the notification is about.
+    pub fn notified_tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.notified_tooltip = Some(tooltip.into());
         self
     }
 
@@ -420,6 +428,9 @@ impl RenderOnce for ThreadItem {
             self.status,
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
         );
+        let notified_tooltip = self
+            .notified_tooltip
+            .filter(|_| self.notified && !show_tooltip);
 
         let show_main_worktree = self.show_main_worktree;
         let visible_worktrees: Vec<ThreadItemWorktreeInfo> = self
@@ -648,6 +659,9 @@ impl RenderOnce for ThreadItem {
                         .into_any_element(),
                     _ => gpui::Empty.into_any_element(),
                 }))
+            })
+            .when_some(notified_tooltip, |this, tooltip| {
+                this.tooltip(Tooltip::text(tooltip))
             })
             .when_some(self.on_click, |this, on_click| this.on_click(on_click))
     }

@@ -54,11 +54,32 @@ pub struct TerminalThreadMetadata {
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
     pub init_command: Option<String>,
-    pub parent_terminal_id: Option<TerminalId>,
-    /// Whether this parent terminal shows its sub terminals beside it.
-    pub overview_enabled: bool,
-    /// Whether this sub terminal is collapsed to its header in its parent's overview.
+    /// A lone terminal uses its own id, so it stays a valid group key after
+    /// the terminal that founded the group closes.
+    pub group_id: TerminalId,
+    /// The open member with the lowest position holds the main slot. Gaps are allowed.
+    pub position: i64,
+    /// Whether this member is collapsed to its header in the group's overview.
     pub minimized_in_overview: bool,
+}
+
+/// Settings shared by every member of a terminal group, so they survive any
+/// one member closing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalGroup {
+    pub group_id: TerminalId,
+    pub overview_enabled: bool,
+    pub custom_title: Option<SharedString>,
+}
+
+impl TerminalGroup {
+    fn new(group_id: TerminalId) -> Self {
+        Self {
+            group_id,
+            overview_enabled: false,
+            custom_title: None,
+        }
+    }
 }
 
 impl TerminalThreadMetadata {
@@ -165,6 +186,8 @@ pub struct TerminalThreadMetadataStore {
     terminals: HashMap<TerminalId, TerminalThreadMetadata>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
+    terminals_by_group: HashMap<TerminalId, HashSet<TerminalId>>,
+    groups: HashMap<TerminalId, TerminalGroup>,
     reload_task: Option<Shared<Task<()>>>,
     pending_terminal_ops_tx: async_channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
@@ -174,13 +197,25 @@ pub struct TerminalThreadMetadataStore {
 enum DbOperation {
     Upsert(TerminalThreadMetadata),
     Delete(TerminalId),
+    UpsertGroup(TerminalGroup),
+    DeleteGroup(TerminalId),
+}
+
+/// A lone terminal's group id equals its terminal id, so terminal and group
+/// operations need distinct keys.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum DbOperationKey {
+    Terminal(TerminalId),
+    Group(TerminalId),
 }
 
 impl DbOperation {
-    fn id(&self) -> TerminalId {
+    fn key(&self) -> DbOperationKey {
         match self {
-            DbOperation::Upsert(metadata) => metadata.terminal_id,
-            DbOperation::Delete(terminal_id) => *terminal_id,
+            DbOperation::Upsert(metadata) => DbOperationKey::Terminal(metadata.terminal_id),
+            DbOperation::Delete(terminal_id) => DbOperationKey::Terminal(*terminal_id),
+            DbOperation::UpsertGroup(group) => DbOperationKey::Group(group.group_id),
+            DbOperation::DeleteGroup(group_id) => DbOperationKey::Group(*group_id),
         }
     }
 }
@@ -326,6 +361,100 @@ impl TerminalThreadMetadataStore {
         cx.notify();
     }
 
+    pub fn group(&self, group_id: TerminalId) -> Option<&TerminalGroup> {
+        self.groups.get(&group_id)
+    }
+
+    /// Members in main-slot order: by position, with creation time and id
+    /// breaking ties so the order is stable.
+    pub fn group_members(&self, group_id: TerminalId) -> Vec<&TerminalThreadMetadata> {
+        let mut members = self
+            .terminals_by_group
+            .get(&group_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|terminal_id| self.terminals.get(terminal_id))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| (member.position, member.created_at, member.terminal_id));
+        members
+    }
+
+    /// The oldest member, whose title names the group unless the group has a
+    /// custom title.
+    pub fn group_title_member(&self, group_id: TerminalId) -> Option<&TerminalThreadMetadata> {
+        self.terminals_by_group
+            .get(&group_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|terminal_id| self.terminals.get(terminal_id))
+            .min_by_key(|member| (member.created_at, member.position, member.terminal_id))
+    }
+
+    pub fn group_display_title(&self, group_id: TerminalId) -> Option<SharedString> {
+        let member = self.group_title_member(group_id)?;
+        match self
+            .group(group_id)
+            .and_then(|group| group.custom_title.as_ref())
+        {
+            Some(custom_title) => Some(compose_terminal_thread_title(
+                member.title.as_ref(),
+                Some(custom_title.as_ref()),
+            )),
+            None => Some(member.display_title()),
+        }
+    }
+
+    pub fn group_editable_title(&self, group_id: TerminalId) -> Option<SharedString> {
+        match self
+            .group(group_id)
+            .and_then(|group| group.custom_title.clone())
+        {
+            Some(custom_title) => Some(custom_title),
+            None => Some(self.group_title_member(group_id)?.editable_title()),
+        }
+    }
+
+    pub fn set_group_overview(
+        &mut self,
+        group_id: TerminalId,
+        overview_enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut group = self
+            .groups
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_else(|| TerminalGroup::new(group_id));
+        if self.groups.contains_key(&group_id) && group.overview_enabled == overview_enabled {
+            return;
+        }
+        group.overview_enabled = overview_enabled;
+        self.save_group_internal(group);
+        cx.notify();
+    }
+
+    /// Renames the group's sidebar row without changing any member's title.
+    pub fn rename_group(&mut self, group_id: TerminalId, title: SharedString, cx: &mut Context<Self>) {
+        let Some(member_title) = self
+            .group_title_member(group_id)
+            .map(|member| member.title.clone())
+        else {
+            return;
+        };
+        let custom_title = normalize_terminal_custom_title(member_title.as_ref(), title);
+        let mut group = self
+            .groups
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_else(|| TerminalGroup::new(group_id));
+        if self.groups.contains_key(&group_id) && group.custom_title == custom_title {
+            return;
+        }
+        group.custom_title = custom_title;
+        self.save_group_internal(group);
+        cx.notify();
+    }
+
     pub fn change_worktree_paths(
         &mut self,
         current_folder_paths: &PathList,
@@ -378,12 +507,47 @@ impl TerminalThreadMetadataStore {
             {
                 ids.remove(&metadata.terminal_id);
             }
+
+            if existing.group_id != metadata.group_id {
+                let old_group_id = existing.group_id;
+                self.remove_from_group(old_group_id, metadata.terminal_id);
+            }
         }
 
+        let group_id = metadata.group_id;
         self.cache_terminal_metadata(metadata.clone());
         self.pending_terminal_ops_tx
             .try_send(DbOperation::Upsert(metadata))
             .log_err();
+        let member_count = self
+            .terminals_by_group
+            .get(&group_id)
+            .map_or(0, |ids| ids.len());
+        if member_count > 1 && !self.groups.contains_key(&group_id) {
+            self.save_group_internal(TerminalGroup::new(group_id));
+        }
+    }
+
+    fn save_group_internal(&mut self, group: TerminalGroup) {
+        self.groups.insert(group.group_id, group.clone());
+        self.pending_terminal_ops_tx
+            .try_send(DbOperation::UpsertGroup(group))
+            .log_err();
+    }
+
+    fn remove_from_group(&mut self, group_id: TerminalId, terminal_id: TerminalId) {
+        let Some(ids) = self.terminals_by_group.get_mut(&group_id) else {
+            return;
+        };
+        ids.remove(&terminal_id);
+        if ids.is_empty() {
+            self.terminals_by_group.remove(&group_id);
+            if self.groups.remove(&group_id).is_some() {
+                self.pending_terminal_ops_tx
+                    .try_send(DbOperation::DeleteGroup(group_id))
+                    .log_err();
+            }
+        }
     }
 
     fn cache_terminal_metadata(&mut self, metadata: TerminalThreadMetadata) {
@@ -392,6 +556,11 @@ impl TerminalThreadMetadataStore {
 
         self.terminals_by_paths
             .entry(metadata.folder_paths().clone())
+            .or_default()
+            .insert(metadata.terminal_id);
+
+        self.terminals_by_group
+            .entry(metadata.group_id)
             .or_default()
             .insert(metadata.terminal_id);
 
@@ -415,10 +584,15 @@ impl TerminalThreadMetadataStore {
             {
                 ids.remove(&terminal_id);
             }
+            self.pending_terminal_ops_tx
+                .try_send(DbOperation::Delete(terminal_id))
+                .log_err();
+            self.remove_from_group(terminal.group_id, terminal_id);
+        } else {
+            self.pending_terminal_ops_tx
+                .try_send(DbOperation::Delete(terminal_id))
+                .log_err();
         }
-        self.pending_terminal_ops_tx
-            .try_send(DbOperation::Delete(terminal_id))
-            .log_err();
         cx.notify();
     }
 
@@ -441,6 +615,12 @@ impl TerminalThreadMetadataStore {
                             DbOperation::Delete(terminal_id) => {
                                 db.delete(terminal_id).await.log_err();
                             }
+                            DbOperation::UpsertGroup(group) => {
+                                db.save_group(group).await.log_err();
+                            }
+                            DbOperation::DeleteGroup(group_id) => {
+                                db.delete_group(group_id).await.log_err();
+                            }
                         }
                     }
                 }
@@ -452,6 +632,8 @@ impl TerminalThreadMetadataStore {
             terminals: HashMap::default(),
             terminals_by_paths: HashMap::default(),
             terminals_by_main_paths: HashMap::default(),
+            terminals_by_group: HashMap::default(),
+            groups: HashMap::default(),
             reload_task: None,
             pending_terminal_ops_tx: tx,
             _db_operations_task,
@@ -463,22 +645,27 @@ impl TerminalThreadMetadataStore {
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
         let mut ops = HashMap::default();
         for operation in operations.into_iter().rev() {
-            if ops.contains_key(&operation.id()) {
+            if ops.contains_key(&operation.key()) {
                 continue;
             }
-            ops.insert(operation.id(), operation);
+            ops.insert(operation.key(), operation);
         }
         ops.into_values().collect()
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let db = self.db.clone();
         self.reload_task = Some(
             cx.spawn(async move |this, cx| {
-                let rows = cx
+                let (rows, groups) = cx
                     .background_spawn(async move {
-                        db.list()
-                            .context("Failed to fetch terminal thread metadata")
+                        let rows = db
+                            .list()
+                            .context("Failed to fetch terminal thread metadata")?;
+                        let groups = db
+                            .list_groups()
+                            .context("Failed to fetch terminal groups")?;
+                        anyhow::Ok((rows, groups))
                     })
                     .await
                     .log_err()
@@ -488,9 +675,14 @@ impl TerminalThreadMetadataStore {
                     this.terminals.clear();
                     this.terminals_by_paths.clear();
                     this.terminals_by_main_paths.clear();
+                    this.terminals_by_group.clear();
+                    this.groups.clear();
 
                     for row in rows {
                         this.cache_terminal_metadata(row);
+                    }
+                    for group in groups {
+                        this.groups.insert(group.group_id, group);
                     }
 
                     cx.notify();
@@ -535,21 +727,107 @@ impl Domain for TerminalThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_terminal_threads ADD COLUMN minimized_in_overview INTEGER NOT NULL DEFAULT 0;
         ),
+        // A sub terminal joins its parent's group. One whose parent is gone
+        // becomes a group of one, as it already showed as its own row.
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN group_id TEXT;
+            UPDATE sidebar_terminal_threads SET group_id = CASE
+                WHEN EXISTS (
+                    SELECT parent.terminal_id FROM sidebar_terminal_threads AS parent
+                    WHERE parent.terminal_id = sidebar_terminal_threads.parent_terminal_id
+                ) THEN parent_terminal_id
+                ELSE terminal_id
+            END;
+        ),
+        // The old parent keeps position 0 and its sub terminals follow in
+        // creation order, matching the order the overview showed them in.
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+            UPDATE sidebar_terminal_threads SET position = (
+                SELECT COUNT(*) FROM sidebar_terminal_threads AS sibling
+                WHERE sibling.group_id = sidebar_terminal_threads.group_id
+                    AND NOT (sibling.terminal_id = sibling.group_id)
+                    AND NOT (
+                        sibling.created_at > sidebar_terminal_threads.created_at
+                        OR (
+                            sibling.created_at = sidebar_terminal_threads.created_at
+                            AND sibling.terminal_id > sidebar_terminal_threads.terminal_id
+                        )
+                    )
+            )
+            WHERE NOT (group_id = terminal_id);
+        ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS terminal_groups(
+                group_id TEXT PRIMARY KEY,
+                overview_enabled INTEGER NOT NULL DEFAULT 0,
+                custom_title TEXT
+            ) STRICT;
+            INSERT INTO terminal_groups(group_id, overview_enabled, custom_title)
+            SELECT parent.terminal_id, parent.overview_enabled, parent.custom_title
+            FROM sidebar_terminal_threads AS parent
+            WHERE EXISTS (
+                SELECT member.terminal_id FROM sidebar_terminal_threads AS member
+                WHERE member.group_id = parent.terminal_id
+                    AND NOT (member.terminal_id = parent.terminal_id)
+            );
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads DROP COLUMN parent_terminal_id;
+            ALTER TABLE sidebar_terminal_threads DROP COLUMN overview_enabled;
+        ),
     ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
 
+const LIST_TERMINALS_QUERY: &str = "SELECT terminal_id, title, custom_title, created_at, \
+    working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
+    main_worktree_paths_order, remote_connection, init_command, group_id, position, \
+    minimized_in_overview \
+    FROM sidebar_terminal_threads \
+    ORDER BY created_at DESC";
+
+const LIST_GROUPS_QUERY: &str =
+    "SELECT group_id, overview_enabled, custom_title FROM terminal_groups";
+
 impl TerminalThreadMetadataDb {
     pub fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
-        self.select::<TerminalThreadMetadata>(
-            "SELECT terminal_id, title, custom_title, created_at, \
-            working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-             main_worktree_paths_order, remote_connection, init_command, parent_terminal_id, \
-             overview_enabled, minimized_in_overview \
-            FROM sidebar_terminal_threads \
-            ORDER BY created_at DESC",
-        )?()
+        self.select::<TerminalThreadMetadata>(LIST_TERMINALS_QUERY)?()
+    }
+
+    pub fn list_groups(&self) -> anyhow::Result<Vec<TerminalGroup>> {
+        self.select::<TerminalGroup>(LIST_GROUPS_QUERY)?()
+    }
+
+    pub async fn save_group(&self, group: TerminalGroup) -> anyhow::Result<()> {
+        let group_id = group.group_id.to_key_string();
+        let overview_enabled = group.overview_enabled;
+        let custom_title = group.custom_title.as_ref().map(ToString::to_string);
+        self.write(move |conn| {
+            let sql = "INSERT INTO terminal_groups(group_id, overview_enabled, custom_title) \
+                       VALUES (?1, ?2, ?3) \
+                       ON CONFLICT(group_id) DO UPDATE SET \
+                           overview_enabled = excluded.overview_enabled, \
+                           custom_title = excluded.custom_title";
+            let mut stmt = Statement::prepare(conn, sql)?;
+            let mut i = stmt.bind(&group_id, 1)?;
+            i = stmt.bind(&overview_enabled, i)?;
+            stmt.bind(&custom_title, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    pub async fn delete_group(&self, group_id: TerminalId) -> anyhow::Result<()> {
+        let group_id = group_id.to_key_string();
+        self.write(move |conn| {
+            let mut stmt =
+                Statement::prepare(conn, "DELETE FROM terminal_groups WHERE group_id = ?")?;
+            stmt.bind(&group_id, 1)?;
+            stmt.exec()
+        })
+        .await
     }
 
     pub async fn save(&self, row: TerminalThreadMetadata) -> anyhow::Result<()> {
@@ -581,14 +859,12 @@ impl TerminalThreadMetadataDb {
             .transpose()
             .context("serialize terminal thread remote connection")?;
         let init_command = row.init_command;
-        let parent_terminal_id = row
-            .parent_terminal_id
-            .map(|terminal_id| terminal_id.to_key_string());
-        let overview_enabled = row.overview_enabled;
+        let group_id = row.group_id.to_key_string();
+        let position = row.position;
         let minimized_in_overview = row.minimized_in_overview;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, parent_terminal_id, overview_enabled, minimized_in_overview) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, group_id, position, minimized_in_overview) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
@@ -601,8 +877,8 @@ impl TerminalThreadMetadataDb {
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                             remote_connection = excluded.remote_connection, \
                             init_command = excluded.init_command, \
-                            parent_terminal_id = excluded.parent_terminal_id, \
-                            overview_enabled = excluded.overview_enabled, \
+                            group_id = excluded.group_id, \
+                            position = excluded.position, \
                             minimized_in_overview = excluded.minimized_in_overview";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
@@ -616,8 +892,8 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&init_command, i)?;
-            i = stmt.bind(&parent_terminal_id, i)?;
-            i = stmt.bind(&overview_enabled, i)?;
+            i = stmt.bind(&group_id, i)?;
+            i = stmt.bind(&position, i)?;
             stmt.bind(&minimized_in_overview, i)?;
             stmt.exec()
         })
@@ -655,8 +931,8 @@ impl Column for TerminalThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (init_command, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (parent_terminal_id, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (overview_enabled, next): (bool, i32) = Column::column(statement, next)?;
+        let (group_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (position, next): (i64, i32) = Column::column(statement, next)?;
         let (minimized_in_overview, next): (bool, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
@@ -686,9 +962,15 @@ impl Column for TerminalThreadMetadata {
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
 
+        let terminal_id = TerminalId::from_key_string(&terminal_id)?;
+        let group_id = match group_id.as_deref() {
+            Some(group_id) => TerminalId::from_key_string(group_id)?,
+            None => terminal_id,
+        };
+
         Ok((
             TerminalThreadMetadata {
-                terminal_id: TerminalId::from_key_string(&terminal_id)?,
+                terminal_id,
                 title: SharedString::from(title),
                 custom_title: custom_title
                     .filter(|title| !title.trim().is_empty())
@@ -698,12 +980,27 @@ impl Column for TerminalThreadMetadata {
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
                 init_command,
-                parent_terminal_id: parent_terminal_id
-                    .as_deref()
-                    .map(TerminalId::from_key_string)
-                    .transpose()?,
-                overview_enabled,
+                group_id,
+                position,
                 minimized_in_overview,
+            },
+            next,
+        ))
+    }
+}
+
+impl Column for TerminalGroup {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (group_id, next): (String, i32) = Column::column(statement, start_index)?;
+        let (overview_enabled, next): (bool, i32) = Column::column(statement, next)?;
+        let (custom_title, next): (Option<String>, i32) = Column::column(statement, next)?;
+        Ok((
+            TerminalGroup {
+                group_id: TerminalId::from_key_string(&group_id)?,
+                overview_enabled,
+                custom_title: custom_title
+                    .filter(|title| !title.trim().is_empty())
+                    .map(SharedString::from),
             },
             next,
         ))
@@ -725,8 +1022,9 @@ mod tests {
 
     fn metadata(title: &str, worktree_paths: WorktreePaths) -> TerminalThreadMetadata {
         let now = Utc::now();
+        let terminal_id = TerminalId::new();
         TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
+            terminal_id,
             title: SharedString::from(title.to_string()),
             custom_title: None,
             created_at: now,
@@ -734,10 +1032,29 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             init_command: None,
-            parent_terminal_id: None,
-            overview_enabled: false,
+            group_id: terminal_id,
+            position: 0,
             minimized_in_overview: false,
         }
+    }
+
+    fn member_of(
+        title: &str,
+        group: &TerminalThreadMetadata,
+        position: i64,
+    ) -> TerminalThreadMetadata {
+        let mut member = metadata(title, group.worktree_paths.clone());
+        member.group_id = group.group_id;
+        member.position = position;
+        member
+    }
+
+    fn reload_store(cx: &mut TestAppContext) {
+        cx.run_until_parked();
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx));
+        });
+        cx.run_until_parked();
     }
 
     #[test]
@@ -843,95 +1160,210 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_terminal_parent_id_persists(cx: &mut TestAppContext) {
+    async fn test_terminal_group_persists(cx: &mut TestAppContext) {
         init_test(cx);
-        let parent = metadata(
-            "Parent",
+        let founder = metadata(
+            "Founder",
             WorktreePaths::from_folder_paths(&PathList::default()),
         );
-        let mut child = metadata(
-            "Child",
-            WorktreePaths::from_folder_paths(&PathList::default()),
-        );
-        child.parent_terminal_id = Some(parent.terminal_id);
-        let parent_id = parent.terminal_id;
-        let child_id = child.terminal_id;
+        let member = member_of("Member", &founder, 1);
+        let group_id = founder.group_id;
+        let founder_id = founder.terminal_id;
+        let member_id = member.terminal_id;
 
         cx.update(|cx| {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.save(parent, cx);
-                store.save(child, cx);
+                store.save(founder, cx);
+                assert!(
+                    store.group(group_id).is_none(),
+                    "a lone terminal has no group row"
+                );
+                store.save(member, cx);
+                store.set_group_overview(group_id, true, cx);
+                store.set_minimized_in_overview(member_id, true, cx);
             });
         });
-        cx.run_until_parked();
-        cx.update(|cx| {
-            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx));
-        });
-        cx.run_until_parked();
+        reload_store(cx);
 
         cx.update(|cx| {
             let store = TerminalThreadMetadataStore::global(cx);
             let store = store.read(cx);
             assert_eq!(
                 store
-                    .entry(child_id)
-                    .expect("child terminal metadata should exist")
-                    .parent_terminal_id,
-                Some(parent_id)
+                    .group_members(group_id)
+                    .iter()
+                    .map(|member| (member.terminal_id, member.position))
+                    .collect::<Vec<_>>(),
+                vec![(founder_id, 0), (member_id, 1)]
             );
-            assert_eq!(
-                store
-                    .entry(parent_id)
-                    .expect("parent terminal metadata should exist")
-                    .parent_terminal_id,
-                None
-            );
+            assert!(store.group(group_id).expect("group row").overview_enabled);
+            assert!(store.entry(member_id).unwrap().minimized_in_overview);
+            assert!(!store.entry(founder_id).unwrap().minimized_in_overview);
         });
     }
 
     #[gpui::test]
-    async fn test_terminal_overview_state_persists(cx: &mut TestAppContext) {
+    async fn test_terminal_group_outlives_founder(cx: &mut TestAppContext) {
         init_test(cx);
-        let mut parent = metadata(
-            "Parent",
+        let founder = metadata(
+            "Founder",
             WorktreePaths::from_folder_paths(&PathList::default()),
         );
-        parent.overview_enabled = true;
-        let mut child = metadata(
-            "Child",
-            WorktreePaths::from_folder_paths(&PathList::default()),
-        );
-        child.parent_terminal_id = Some(parent.terminal_id);
-        let parent_id = parent.terminal_id;
-        let child_id = child.terminal_id;
+        let member = member_of("Member", &founder, 1);
+        let group_id = founder.group_id;
+        let founder_id = founder.terminal_id;
+        let member_id = member.terminal_id;
 
         cx.update(|cx| {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.save(parent, cx);
-                store.save(child, cx);
-                store.set_minimized_in_overview(child_id, true, cx);
+                store.save(founder, cx);
+                store.save(member, cx);
+                store.set_group_overview(group_id, true, cx);
+                store.rename_group(group_id, "Pair".into(), cx);
+                store.delete(founder_id, cx);
             });
         });
-        cx.run_until_parked();
-        cx.update(|cx| {
-            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx));
-        });
-        cx.run_until_parked();
+        reload_store(cx);
 
         cx.update(|cx| {
             let store = TerminalThreadMetadataStore::global(cx);
             let store = store.read(cx);
-            let parent = store
-                .entry(parent_id)
-                .expect("parent terminal metadata should exist");
-            assert!(parent.overview_enabled);
-            assert!(!parent.minimized_in_overview);
-            let child = store
-                .entry(child_id)
-                .expect("child terminal metadata should exist");
-            assert!(!child.overview_enabled);
-            assert!(child.minimized_in_overview);
+            let group = store.group(group_id).expect("group outlives its founder");
+            assert!(group.overview_enabled);
+            assert_eq!(group.custom_title.as_deref(), Some("Pair"));
+            assert_eq!(
+                store.group_display_title(group_id).as_deref(),
+                Some("Pair")
+            );
+            assert_eq!(store.entry(member_id).unwrap().custom_title, None);
         });
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(member_id, cx);
+            });
+        });
+        reload_store(cx);
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert!(store.read(cx).group(group_id).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_group_title_uses_oldest_member(cx: &mut TestAppContext) {
+        init_test(cx);
+        let founder = metadata(
+            "Founder",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let mut member = member_of("Member", &founder, 1);
+        member.created_at = founder.created_at + chrono::Duration::seconds(1);
+        // Swapping the main slot must not change the row title.
+        let mut founder = founder;
+        founder.position = 2;
+        let group_id = founder.group_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(founder, cx);
+                store.save(member, cx);
+            });
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert_eq!(
+                store.read(cx).group_display_title(group_id).as_deref(),
+                Some("Founder")
+            );
+        });
+    }
+
+    #[test]
+    fn test_migration_converts_sub_terminals_to_groups() {
+        use db::sqlez::connection::Connection;
+
+        let connection = Connection::open_memory(Some("terminal_group_migration"));
+        let migrations = TerminalThreadMetadataDb::MIGRATIONS;
+        let old_migration_count = 5;
+        connection
+            .migrate(
+                TerminalThreadMetadataDb::NAME,
+                &migrations[..old_migration_count],
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+
+        let parent = TerminalId::new();
+        let older_child = TerminalId::new();
+        let newer_child = TerminalId::new();
+        let orphan = TerminalId::new();
+        let lone = TerminalId::new();
+        let missing_parent = TerminalId::new();
+        let rows = [
+            (parent, "Parent", Some("Custom"), "2026-01-01T00:00:00+00:00", None, true),
+            (newer_child, "Newer", None, "2026-01-03T00:00:00+00:00", Some(parent), false),
+            (older_child, "Older", None, "2026-01-02T00:00:00+00:00", Some(parent), false),
+            (orphan, "Orphan", None, "2026-01-04T00:00:00+00:00", Some(missing_parent), false),
+            (lone, "Lone", None, "2026-01-05T00:00:00+00:00", None, true),
+        ];
+        for (terminal_id, title, custom_title, created_at, parent_id, overview) in rows {
+            let custom_title = custom_title.map_or("NULL".to_string(), |title| format!("'{title}'"));
+            let parent_id = parent_id.map_or("NULL".to_string(), |parent_id| {
+                format!("'{}'", parent_id.to_key_string())
+            });
+            connection
+                .exec(&format!(
+                    "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, \
+                     created_at, parent_terminal_id, overview_enabled) \
+                     VALUES ('{}', '{title}', {custom_title}, '{created_at}', {parent_id}, {})",
+                    terminal_id.to_key_string(),
+                    overview as i32,
+                ))
+                .unwrap()()
+            .unwrap();
+        }
+
+        connection
+            .migrate(TerminalThreadMetadataDb::NAME, migrations, &mut |_, _, _| {
+                false
+            })
+            .unwrap();
+
+        let terminals = connection
+            .select::<TerminalThreadMetadata>(LIST_TERMINALS_QUERY)
+            .unwrap()()
+        .unwrap();
+        let group_and_position = |terminal_id: TerminalId| {
+            let terminal = terminals
+                .iter()
+                .find(|terminal| terminal.terminal_id == terminal_id)
+                .expect("migrated terminal should exist");
+            (terminal.group_id, terminal.position)
+        };
+        assert_eq!(group_and_position(parent), (parent, 0));
+        assert_eq!(group_and_position(older_child), (parent, 1));
+        assert_eq!(group_and_position(newer_child), (parent, 2));
+        assert_eq!(group_and_position(orphan), (orphan, 0));
+        assert_eq!(group_and_position(lone), (lone, 0));
+
+        let groups = connection
+            .select::<TerminalGroup>(LIST_GROUPS_QUERY)
+            .unwrap()()
+        .unwrap();
+        assert_eq!(
+            groups,
+            vec![TerminalGroup {
+                group_id: parent,
+                overview_enabled: true,
+                custom_title: Some("Custom".into()),
+            }]
+        );
+
+        let columns = connection
+            .select::<String>("SELECT name FROM pragma_table_info('sidebar_terminal_threads')")
+            .unwrap()()
+        .unwrap();
+        assert!(!columns.iter().any(|column| column == "parent_terminal_id"));
+        assert!(!columns.iter().any(|column| column == "overview_enabled"));
     }
 
     #[gpui::test]

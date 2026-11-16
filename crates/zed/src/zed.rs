@@ -6489,11 +6489,11 @@ mod tests {
         );
     }
 
-    /// The terminal binds `cmd-k` to `terminal::Clear` on macOS. The sub terminals chord has to
+    /// The terminal binds `cmd-k` to `terminal::Clear` on macOS. The terminal group chord has to
     /// stay pending in agent panel terminals instead of clearing them.
     /// Only macOS can regress: Linux and Windows have no terminal `ctrl-k` binding.
     #[gpui::test]
-    async fn test_toggle_sub_terminals_chord_in_agent_panel_terminals(
+    async fn test_toggle_group_terminals_chord_in_agent_panel_terminals(
         cx: &mut gpui::TestAppContext,
     ) {
         let _app_state = init_keymap_test(cx);
@@ -6521,7 +6521,7 @@ mod tests {
                     keymap.bindings_for_input(&[first.clone(), second.clone()], &context_stack);
                 assert_eq!(
                     bindings.first().map(|binding| binding.action().name()),
-                    Some("agent::ToggleSubTerminals"),
+                    Some("agent::ToggleGroupTerminals"),
                     "{modifier}-k {modifier}-o in {focused}"
                 );
             }

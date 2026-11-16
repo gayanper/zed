@@ -414,17 +414,18 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
-        /// Shows or hides the sub terminals of a terminal thread.
-        #[action(deprecated_aliases = ["agent::ToggleTerminalOverview"])]
-        ToggleSubTerminals,
+        /// Shows or hides the other terminals of a terminal group beside its main terminal.
+        #[action(deprecated_aliases = ["agent::ToggleTerminalOverview", "agent::ToggleSubTerminals"])]
+        ToggleGroupTerminals,
         /// Moves focus to the next terminal in the terminal overview.
         FocusNextOverviewTerminal,
         /// Moves focus to the previous terminal in the terminal overview.
         FocusPreviousOverviewTerminal,
-        /// Swaps the focused sub terminal with its parent in the terminal overview,
-        /// or swaps them back.
-        ToggleZoomOverviewTerminal,
-        /// Minimizes the focused sub terminal to its header, or restores it.
+        /// Moves the focused terminal of a terminal group into the main slot,
+        /// swapping places with the terminal there.
+        #[action(deprecated_aliases = ["agent::ToggleZoomOverviewTerminal"])]
+        MoveToMainTerminal,
+        /// Minimizes the focused terminal of a terminal group to its header, or restores it.
         ToggleMinimizeOverviewTerminal,
     ]
 );
