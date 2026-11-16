@@ -912,6 +912,18 @@ fn init_command_startup_marker(marker_id: u64) -> String {
     format!("{INIT_COMMAND_STARTUP_MARKER_PREFIX}{marker_id}{INIT_COMMAND_STARTUP_MARKER_SUFFIX}")
 }
 
+fn init_command_exit_suffix(shell_kind: ShellKind) -> Option<&'static str> {
+    match shell_kind {
+        ShellKind::Posix => Some("; exit $?"),
+        ShellKind::Fish | ShellKind::Csh | ShellKind::Tcsh | ShellKind::Rc => {
+            Some("; exit $status")
+        }
+        ShellKind::PowerShell | ShellKind::Pwsh => Some("; exit $LASTEXITCODE"),
+        ShellKind::Nushell => Some("; exit $env.LAST_EXIT_CODE"),
+        ShellKind::Cmd | ShellKind::Xonsh | ShellKind::Elvish => None,
+    }
+}
+
 fn init_command_startup_marker_command(shell_kind: ShellKind, marker_id: u64) -> String {
     // Split the marker across the command so its echo can't satisfy the
     // handshake; only the command's output contains the contiguous marker.
@@ -1083,6 +1095,7 @@ impl TerminalBuilder {
             },
             child_exited: None,
             keyboard_input_sent: false,
+            close_only_on_success: false,
             init_command_startup_marker: None,
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
@@ -1373,6 +1386,7 @@ impl TerminalBuilder {
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
+                close_only_on_success: false,
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
@@ -1570,6 +1584,9 @@ pub struct Terminal {
     activation_script: Vec<String>,
     child_exited: Option<ExitStatus>,
     keyboard_input_sent: bool,
+    /// Set once an agent init command (with an exit suffix) has been written,
+    /// so the shell's exit status is the agent's exit status.
+    close_only_on_success: bool,
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
@@ -2309,9 +2326,12 @@ impl Terminal {
         matches!(self.terminal_type, TerminalType::Pty { .. })
     }
 
+    /// Writes `command`, followed by a shell exit that forwards its exit code
+    /// when the shell kind supports it, so the terminal then closes only when
+    /// the command exits with code 0.
     pub fn write_init_command_after_startup(
         &mut self,
-        input: impl Into<Cow<'static, [u8]>>,
+        command: String,
         cx: &mut Context<Self>,
     ) -> bool {
         // Ends the handshake even if the marker was never seen (timeout
@@ -2322,8 +2342,24 @@ impl Terminal {
             return false;
         }
 
+        let shell_kind = self.template.shell.shell_kind(self.path_style.is_windows());
+        // For remote terminals the shell kind describes the `ssh` wrapper, not
+        // the remote shell, so a suffix could be a syntax error there.
+        let exit_suffix = if self.is_remote_terminal {
+            None
+        } else {
+            init_command_exit_suffix(shell_kind)
+        };
+        let mut input = command;
+        if let Some(exit_suffix) = exit_suffix {
+            input.push_str(exit_suffix);
+        }
+        // CR, not "\r\n": "\r\n" puts PowerShell into continuation mode.
+        input.push('\r');
+
         self.clear_for_init_command(cx);
-        self.write_init_command(input);
+        self.write_init_command(input.into_bytes());
+        self.close_only_on_success = exit_suffix.is_some();
         true
     }
 
@@ -3257,6 +3293,28 @@ impl Terminal {
         self.complete_init_command_startup_handshake();
         let task = match &mut self.task {
             Some(task) => task,
+            None if self.close_only_on_success => {
+                // Only `ChildExit` carries the agent's status, and it arrives
+                // once; the status-less `Exit` event is ignored. If no status
+                // can be read, the terminal stays open without a summary.
+                let Some(child_exited) = exit_status else {
+                    return;
+                };
+                match child_exited.code() {
+                    Some(0) => cx.emit(Event::CloseTerminal),
+                    code => {
+                        let line = match code {
+                            Some(code) => format!("{TASK_DELIMITER}Agent exited with code {code}"),
+                            None => format!("{TASK_DELIMITER}Agent exited"),
+                        };
+                        // SAFETY: the child has exited, so no more output is
+                        // written to the terminal after this line.
+                        unsafe { append_text_to_term(&mut self.term.lock(), &[line.as_str()]) };
+                        cx.emit(Event::Wakeup);
+                    }
+                }
+                return;
+            }
             None => {
                 // For interactive shells (no task), we need to differentiate:
                 // 1. User-initiated exits (typed "exit", Ctrl+D, etc.) - always close,
@@ -4795,7 +4853,7 @@ mod tests {
                 scrollback_position: 42,
                 working_directory: PathBuf::from("/stale/cwd"),
             });
-            terminal.write_init_command_after_startup(b"agent\r".to_vec(), cx)
+            terminal.write_init_command_after_startup("agent".to_string(), cx)
         });
         assert!(wrote);
         let (content, cwd_history) = terminal.update(cx, |terminal, _| {
@@ -4807,7 +4865,134 @@ mod tests {
             "startup output should be cleared internally before writing the init command"
         );
         let input_log = terminal.update(cx, |terminal, _| terminal.take_input_log());
+        let suffix = init_command_exit_suffix(Shell::System.shell_kind(cfg!(windows)))
+            .expect("system shell should support the exit suffix");
+        assert_eq!(input_log, vec![format!("agent{suffix}\r").into_bytes()]);
+    }
+
+    #[test]
+    fn test_init_command_exit_suffix_per_shell_kind() {
+        let cases = [
+            (ShellKind::Posix, Some("; exit $?")),
+            (ShellKind::Fish, Some("; exit $status")),
+            (ShellKind::Csh, Some("; exit $status")),
+            (ShellKind::Tcsh, Some("; exit $status")),
+            (ShellKind::Rc, Some("; exit $status")),
+            (ShellKind::PowerShell, Some("; exit $LASTEXITCODE")),
+            (ShellKind::Pwsh, Some("; exit $LASTEXITCODE")),
+            (ShellKind::Nushell, Some("; exit $env.LAST_EXIT_CODE")),
+            (ShellKind::Cmd, None),
+            (ShellKind::Xonsh, None),
+            (ShellKind::Elvish, None),
+        ];
+        for (shell_kind, expected) in cases {
+            assert_eq!(
+                init_command_exit_suffix(shell_kind),
+                expected,
+                "{shell_kind:?}"
+            );
+        }
+    }
+
+    fn exit_status_with_code(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        return <ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(code << 8);
+        #[cfg(windows)]
+        return <ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(code as u32);
+    }
+
+    fn agent_exit_events(
+        write_init_command: bool,
+        keyboard_input: bool,
+        remote: bool,
+        code: i32,
+        cx: &mut TestAppContext,
+    ) -> (Vec<Event>, String, Vec<Vec<u8>>) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        cx.update({
+            let events = events.clone();
+            |cx| {
+                cx.subscribe(&terminal, move |_, event, _| {
+                    events.lock().push(event.clone());
+                })
+            }
+        })
+        .detach();
+        terminal.update(cx, |terminal, cx| {
+            if keyboard_input {
+                terminal.input(b"user input".to_vec());
+            }
+            terminal.is_remote_terminal = remote;
+            if write_init_command {
+                terminal.write_init_command_after_startup("agent".to_string(), cx);
+            }
+            terminal.write_output(b"agent output\r\n", cx);
+            terminal.register_task_finished(None, cx);
+            terminal.register_task_finished(Some(exit_status_with_code(code)), cx);
+            terminal.register_task_finished(None, cx);
+        });
+        cx.run_until_parked();
+        let (content, input_log) = terminal.update(cx, |terminal, _| {
+            let content = content_text(&terminal.term.lock_unfair());
+            (content, terminal.take_input_log())
+        });
+        let events = events.lock().clone();
+        (events, content, input_log)
+    }
+
+    #[gpui::test]
+    async fn test_agent_init_command_exit_zero_closes(cx: &mut TestAppContext) {
+        let (events, content, _) = agent_exit_events(true, false, false, 0, cx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == Event::CloseTerminal)
+                .count(),
+            1
+        );
+        assert!(!content.contains("Agent exited"));
+    }
+
+    #[gpui::test]
+    async fn test_agent_init_command_nonzero_exit_stays_open_with_summary(cx: &mut TestAppContext) {
+        let (events, content, _) = agent_exit_events(true, false, false, 2, cx);
+        assert!(!events.contains(&Event::CloseTerminal), "{events:?}");
+        assert!(content.contains("agent output"), "{content:?}");
+        assert_eq!(
+            content.matches("Agent exited with code 2").count(),
+            1,
+            "{content:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_agent_init_command_has_no_suffix_and_keeps_old_rule(
+        cx: &mut TestAppContext,
+    ) {
+        let (events, content, _) = agent_exit_events(true, false, true, 0, cx);
+        assert!(events.contains(&Event::CloseTerminal), "{events:?}");
+        assert!(!content.contains("Agent exited"));
+        let (_, content, input_log) = agent_exit_events(true, false, true, 2, cx);
         assert_eq!(input_log, vec![b"agent\r".to_vec()]);
+        assert!(!content.contains("Agent exited"));
+    }
+
+    #[gpui::test]
+    async fn test_skipped_agent_init_command_keeps_old_close_rule(cx: &mut TestAppContext) {
+        let (events, content, _) = agent_exit_events(true, true, false, 2, cx);
+        assert!(events.contains(&Event::CloseTerminal), "{events:?}");
+        assert!(!content.contains("Agent exited"));
     }
 
     #[gpui::test]
@@ -4829,7 +5014,7 @@ mod tests {
         let wrote = terminal.update(cx, |terminal, cx| {
             terminal.write_output(b"startup output\nprompt", cx);
             terminal.input(b"user input".to_vec());
-            terminal.write_init_command_after_startup(b"agent\r".to_vec(), cx)
+            terminal.write_init_command_after_startup("agent".to_string(), cx)
         });
         assert!(!wrote);
         let content = terminal.update(cx, |terminal, _| terminal.get_content());
@@ -4866,7 +5051,7 @@ mod tests {
         });
 
         let wrote = terminal.update(cx, |terminal, cx| {
-            terminal.write_init_command_after_startup(b"agent\r".to_vec(), cx)
+            terminal.write_init_command_after_startup("agent".to_string(), cx)
         });
         assert!(!wrote);
         let content = terminal.update(cx, |terminal, _| terminal.get_content());

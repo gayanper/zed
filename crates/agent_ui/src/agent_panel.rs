@@ -2806,9 +2806,8 @@ impl AgentPanel {
                 _ = timeout.fuse() => {}
             }
 
-            let input = Self::terminal_init_command_input(command);
             if let Err(error) = terminal.update(cx, move |terminal, cx| {
-                if !terminal.write_init_command_after_startup(input, cx) {
+                if !terminal.write_init_command_after_startup(command, cx) {
                     log::debug!(
                         "skipping terminal init command because the terminal is no longer eligible"
                     );
@@ -13396,7 +13395,7 @@ mod tests {
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
         assert_eq!(
             input_log,
-            vec![b"printf 'init_ran_%s\\n' 42\r".to_vec()],
+            vec![b"printf 'init_ran_%s\\n' 42; exit $?\r".to_vec()],
             "init command should be written only after terminal startup has settled"
         );
         assert!(
