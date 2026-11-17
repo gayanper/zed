@@ -135,6 +135,8 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- Always scope `cargo check`, `cargo test` and clippy to the changed crates with `-p <crate>`; never run them across the whole workspace, since every crate's test binary is linked and kept on disk.
+- At the end of each task, run `./script/prune-target --days 1`. If it refuses because cargo or rustc is running, report that and do not retry.
 
 # Pull request hygiene
 

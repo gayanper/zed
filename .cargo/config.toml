@@ -25,3 +25,15 @@ MACOSX_DEPLOYMENT_TARGET = "10.15.7"
 
 [profile.dev]
 debug = "line-tables-only"
+
+# Debuginfo of dependencies, build scripts and proc-macros dominates target/ size;
+# workspace crates keep line tables for backtraces.
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+debug = false
+
+# `dbg` inherits dev, including the override above, so restore full debuginfo for it.
+[profile.dbg.package."*"]
+debug = "full"
