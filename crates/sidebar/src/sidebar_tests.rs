@@ -4780,11 +4780,19 @@ async fn test_terminal_group_row_title_rename_and_bell(cx: &mut TestAppContext) 
     cx.update(|_, cx| {
         let store = TerminalThreadMetadataStore::global(cx).read(cx);
         assert_eq!(
-            store.group(parent_id).and_then(|group| group.custom_title.clone()),
+            store
+                .group(parent_id)
+                .and_then(|group| group.custom_title.clone()),
             Some("Pair".into())
         );
-        assert_eq!(store.entry(parent_id).unwrap().custom_title.as_deref(), Some("Parent"));
-        assert_eq!(store.entry(child_id).unwrap().custom_title.as_deref(), Some("Child"));
+        assert_eq!(
+            store.entry(parent_id).unwrap().custom_title.as_deref(),
+            Some("Parent")
+        );
+        assert_eq!(
+            store.entry(child_id).unwrap().custom_title.as_deref(),
+            Some("Child")
+        );
         assert_eq!(
             store.entry(lone_id).unwrap().custom_title.as_deref(),
             Some("Renamed Lone")
@@ -4802,13 +4810,20 @@ async fn test_terminal_group_row_title_rename_and_bell(cx: &mut TestAppContext) 
     cx.run_until_parked();
     let row = terminal_entry(&sidebar, parent_id, cx);
     assert!(row.has_notification, "the row rolls up its members' bells");
-    assert_eq!(row.notified_member_titles, vec![SharedString::from("Child")]);
+    assert_eq!(
+        row.notified_member_titles,
+        vec![SharedString::from("Child")]
+    );
 
     // The group title still names the row once the group shrinks to one
     // member, so renaming the row renames the group.
-    panel.update_in(cx, |panel, window, cx| panel.close_terminal(child_id, window, cx));
+    panel.update_in(cx, |panel, window, cx| {
+        panel.close_terminal(child_id, window, cx)
+    });
     cx.run_until_parked();
-    sidebar.update(cx, |sidebar, cx| sidebar.apply_terminal_rename(parent_id, "Solo".into(), cx));
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.apply_terminal_rename(parent_id, "Solo".into(), cx)
+    });
     cx.run_until_parked();
     sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
@@ -16193,6 +16208,20 @@ fn test_terminal_row_glyph() {
     assert!(!is_busy_title_glyph("⠋"));
     assert_eq!(title_icon_glyph("◐ Fix the bug"), Some("◐".into()));
     assert_eq!(title_icon_glyph("zsh"), None);
+}
+
+#[test]
+fn test_terminal_row_notified() {
+    let busy_own = terminal_row_glyph(Some("◐".into()), &[]);
+    let busy_member = terminal_row_glyph(Some("✳".into()), &["◑".into()]);
+    let idle = terminal_row_glyph(Some("✳".into()), &[]);
+
+    assert!(!terminal_row_notified(true, busy_own.as_ref()));
+    assert!(!terminal_row_notified(true, busy_member.as_ref()));
+    assert!(terminal_row_notified(true, idle.as_ref()));
+    assert!(terminal_row_notified(true, None));
+    assert!(!terminal_row_notified(false, idle.as_ref()));
+    assert!(!terminal_row_notified(false, None));
 }
 
 #[test]

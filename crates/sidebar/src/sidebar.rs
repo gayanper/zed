@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, PromptLevel, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, PromptLevel, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -304,6 +304,12 @@ fn terminal_row_glyph(
         .cloned()
         .or(own_glyph)
         .or_else(|| member_glyphs.first().cloned())
+}
+
+/// A busy glyph is the agent's progress indicator, so it wins over the bell
+/// dot; an idle glyph still yields so an unread bell stays visible.
+fn terminal_row_notified(has_notification: bool, row_glyph: Option<&SharedString>) -> bool {
+    has_notification && !row_glyph.is_some_and(|glyph| is_busy_title_glyph(glyph))
 }
 
 /// A group's row shows its oldest member, titled with the group's custom
@@ -5320,8 +5326,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let member_count = TerminalThreadMetadataStore::try_global(cx)
-            .map_or(0, |store| store.read(cx).group_members(metadata.group_id).len());
+        let member_count = TerminalThreadMetadataStore::try_global(cx).map_or(0, |store| {
+            store.read(cx).group_members(metadata.group_id).len()
+        });
         if member_count < 2 {
             self.close_terminal_group(metadata, workspace, window, cx);
             return;
@@ -7000,17 +7007,23 @@ impl Sidebar {
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
         let icon_char = terminal_row_glyph(own_icon_char, &terminal.member_glyphs);
-        let notified_tooltip = (!terminal.notified_member_titles.is_empty()).then(|| {
-            SharedString::from(format!(
-                "Bell from {}",
-                terminal
-                    .notified_member_titles
-                    .iter()
-                    .map(|title| if title.is_empty() { "Terminal" } else { title.as_ref() })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        });
+        let notified = terminal_row_notified(terminal.has_notification, icon_char.as_ref());
+        let notified_tooltip =
+            (notified && !terminal.notified_member_titles.is_empty()).then(|| {
+                SharedString::from(format!(
+                    "Bell from {}",
+                    terminal
+                        .notified_member_titles
+                        .iter()
+                        .map(|title| if title.is_empty() {
+                            "Terminal"
+                        } else {
+                            title.as_ref()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            });
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
@@ -7020,8 +7033,10 @@ impl Sidebar {
             .worktrees(worktrees)
             .show_main_worktree(true)
             .timestamp(timestamp)
-            .notified(terminal.has_notification)
-            .when_some(notified_tooltip, |this, tooltip| this.notified_tooltip(tooltip))
+            .notified(notified)
+            .when_some(notified_tooltip, |this, tooltip| {
+                this.notified_tooltip(tooltip)
+            })
             .highlight_positions(highlight_positions)
             .selected(is_active)
             .focused(is_focused)
