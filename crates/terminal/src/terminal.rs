@@ -61,11 +61,12 @@ use gpui::{
 
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
+pub use crate::alacritty::is_word_separator;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, grid_rows,
+    display_only_term_config, find_from_terminal_point, full_content_range, grid_cells, grid_rows,
     last_non_empty_lines, make_content, new_term, open_pty, pty_options, pty_term_config, resize,
     row_text, screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
     set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
@@ -2584,6 +2585,13 @@ impl Terminal {
     pub fn grid_rows(&self, lines: RangeInclusive<i32>) -> Vec<GridRow> {
         let term = self.term.lock_unfair();
         grid_rows(&term, lines)
+    }
+
+    /// Every cell of the grid, from the top of the scrollback history to the
+    /// bottom of the screen.
+    pub fn grid_cells(&self) -> Vec<IndexedCell> {
+        let term = self.term.lock_unfair();
+        grid_cells(&term)
     }
 
     /// The text of each row's columns, with wide and zero-width characters as

@@ -78,9 +78,14 @@ actions!(
         /// Adds the picked terminal text to the texts to comment on together,
         /// or takes it out, and moves the pick to the next one.
         ExtendTerminalCommentPickDown,
-        /// Clears the texts picked to comment on together, else goes back to
-        /// the paragraph or the message the pick is in, else ends the pick.
+        /// Clears the extension of the picked terminal text, else the texts
+        /// picked to comment on together, else goes back to the paragraph or
+        /// the message the pick is in, else ends the pick.
         BackOutOfTerminalCommentPick,
+        /// Extends the end of the picked terminal text by one word.
+        ExtendTerminalCommentPickEnd,
+        /// Moves the end of the picked terminal text back by one word.
+        ShrinkTerminalCommentPickEnd,
     ]
 );
 
@@ -320,6 +325,22 @@ impl AgentCommentStore {
         let len = self.terminal_comments.len();
         self.terminal_comments
             .retain(|comment| comment.terminal_id != terminal_id);
+        if self.terminal_comments.len() != len {
+            cx.emit(AgentCommentStoreEvent::Changed);
+        }
+    }
+
+    /// Removes a terminal's comments that `is_present` doesn't find in it
+    /// anymore.
+    pub fn retain_terminal_comments(
+        &mut self,
+        terminal_id: EntityId,
+        is_present: impl Fn(&TerminalComment) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.terminal_comments.len();
+        self.terminal_comments
+            .retain(|comment| comment.terminal_id != terminal_id || is_present(comment));
         if self.terminal_comments.len() != len {
             cx.emit(AgentCommentStoreEvent::Changed);
         }

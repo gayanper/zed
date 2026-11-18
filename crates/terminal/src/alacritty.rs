@@ -120,6 +120,9 @@ fn window_size_from_terminal_bounds(bounds: TerminalBounds) -> WindowSize {
     }
 }
 
+/// Ends words in addition to alacritty's own word separators.
+const EXTRA_WORD_SEPARATOR: char = '─';
+
 pub(super) fn display_only_term_config(
     scrolling_history: usize,
     cursor_shape: SettingsCursorShape,
@@ -127,7 +130,7 @@ pub(super) fn display_only_term_config(
     Config {
         scrolling_history,
         default_cursor_style: alacritty_cursor_style(cursor_shape),
-        semantic_escape_chars: format!("{SEMANTIC_ESCAPE_CHARS}─"),
+        semantic_escape_chars: format!("{SEMANTIC_ESCAPE_CHARS}{EXTRA_WORD_SEPARATOR}"),
         osc52: Osc52::Disabled,
         ..Config::default()
     }
@@ -140,7 +143,7 @@ pub(super) fn pty_term_config(
     Config {
         scrolling_history,
         default_cursor_style: alacritty_cursor_style(cursor_shape),
-        semantic_escape_chars: format!("{SEMANTIC_ESCAPE_CHARS}─"),
+        semantic_escape_chars: format!("{SEMANTIC_ESCAPE_CHARS}{EXTRA_WORD_SEPARATOR}"),
         ..Config::default()
     }
 }
@@ -986,6 +989,28 @@ pub(super) fn grid_rows(term: &Term<ZedListener>, lines: RangeInclusive<i32>) ->
             }
         })
         .collect()
+}
+
+pub(super) fn grid_cells(term: &Term<ZedListener>) -> Vec<IndexedCell> {
+    let grid = term.grid();
+    let mut cells = Vec::new();
+    for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let row = &grid[Line(line)];
+        for (column, cell) in row[..Column(row.len())].iter().enumerate() {
+            cells.push(IndexedCell {
+                point: Point::new(line, column),
+                cell: terminal_cell_from_alacritty(cell),
+            });
+        }
+    }
+    cells
+}
+
+/// Whether a character ends a word, as double-click selection splits words.
+pub fn is_word_separator(character: char) -> bool {
+    character.is_whitespace()
+        || character == EXTRA_WORD_SEPARATOR
+        || SEMANTIC_ESCAPE_CHARS.contains(character)
 }
 
 pub(super) fn row_text(

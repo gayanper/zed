@@ -1831,6 +1831,8 @@
       "shift-k": "agent_comments::ExtendTerminalCommentPickUp",
       "shift-down": "agent_comments::ExtendTerminalCommentPickDown",
       "shift-j": "agent_comments::ExtendTerminalCommentPickDown",
+      "shift-right": "agent_comments::ExtendTerminalCommentPickEnd",
+      "shift-left": "agent_comments::ShrinkTerminalCommentPickEnd",
       "enter": "agent_comments::ConfirmTerminalCommentTarget",
       "shift-enter": "agent_comments::ConfirmTerminalCommentTargetAndContinue",
       "right": "agent_comments::NarrowTerminalCommentPick",

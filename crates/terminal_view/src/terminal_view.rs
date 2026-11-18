@@ -135,6 +135,30 @@ fn unit_start(unit: &TextBlock) -> Point {
         })
 }
 
+/// The text of `rows`, where a row the program wrapped is joined to the next
+/// with a space.
+fn joined_rows_text(
+    terminal: &Terminal,
+    rows: &[(i32, RangeInclusive<usize>)],
+    grid_rows: &[terminal::GridRow],
+) -> String {
+    let mut text = String::new();
+    for ((line, _), row_text) in rows.iter().zip(terminal.rows_text(rows)) {
+        // A row the program wrapped ends at a space it left out.
+        let terminal_wrapped = grid_rows
+            .iter()
+            .any(|row| row.line + 1 == *line && row.wraps);
+        if !text.is_empty() && !terminal_wrapped {
+            text.truncate(text.trim_end().len());
+            text.push(' ');
+            text.push_str(row_text.trim_start());
+        } else {
+            text.push_str(&row_text);
+        }
+    }
+    text
+}
+
 fn unit_contains(unit: &TextBlock, point: Point) -> bool {
     unit.rows
         .iter()
@@ -548,6 +572,10 @@ fn push_paragraph_sentences(
 
 pub(crate) type TextBlockProvider = Rc<dyn Fn(&Terminal, Point, &App) -> Option<TextBlock>>;
 
+/// Why a picked text can't be extended, or none when it can.
+pub(crate) type TextBlockExtendBlocker =
+    Rc<dyn Fn(&Terminal, &TextBlock, TextBlockLevel, &App) -> Option<SharedString>>;
+
 /// A marker in the gutter over grid `lines`. `count` is the number of
 /// marked items it stands for, shown when there's more than one.
 #[derive(Clone, Debug, PartialEq)]
@@ -593,6 +621,12 @@ pub(crate) struct PickedTextBlock {
     /// Where the pick points on the block, which the action's popover
     /// opens next to.
     pub(crate) anchor: Point,
+    /// The rows that extending added past the picked text's own end, which
+    /// are drawn fainter.
+    pub(crate) extension: Vec<(i32, RangeInclusive<usize>)>,
+    /// Whether the picked text's own boundary is shown briefly, after an
+    /// extension was cleared.
+    pub(crate) flashing: bool,
 }
 
 /// Picking a text block for the selection action, which the host starts on
@@ -605,7 +639,12 @@ struct TextBlockPick {
     /// Where the other texts picked to act on together start, as scrollback
     /// rows and columns.
     collected: Vec<(i64, usize)>,
+    /// Where the user moved the picked text's end to, as a scrollback row
+    /// and column.
+    extend_to: Option<(i64, usize)>,
 }
+
+const TEXT_BLOCK_BOUNDARY_FLASH: Duration = Duration::from_millis(400);
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -696,6 +735,10 @@ pub struct TerminalView {
     pub(crate) gutter_marker_click: Option<GutterMarkerClick>,
     text_block_provider: Option<TextBlockProvider>,
     text_block_suspended: bool,
+    text_block_extend_blocker: Option<TextBlockExtendBlocker>,
+    /// Set while a drag from the picked text's end extends it.
+    pub(crate) extending_text_block: bool,
+    text_block_boundary_flash: Option<Task<()>>,
     /// The viewport row and column under the pointer, while it's over the
     /// terminal.
     pointer_cell: Option<(usize, usize)>,
@@ -858,6 +901,9 @@ impl TerminalView {
             gutter_marker_click: None,
             text_block_provider: None,
             text_block_suspended: false,
+            text_block_extend_blocker: None,
+            extending_text_block: false,
+            text_block_boundary_flash: None,
             pointer_cell: None,
             text_block_pick: None,
             picked_text_block: None,
@@ -1071,8 +1117,20 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Refuses extending a picked text when it returns a reason, which
+    /// shows as a tooltip on the picked text's end.
+    pub fn set_text_block_extend_blocker(
+        &mut self,
+        blocker: impl Fn(&Terminal, &TextBlock, TextBlockLevel, &App) -> Option<SharedString> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_block_extend_blocker = Some(Rc::new(blocker));
+        cx.notify();
+    }
+
     pub fn clear_text_block_provider(&mut self, cx: &mut Context<Self>) {
         self.text_block_provider = None;
+        self.text_block_extend_blocker = None;
         self.cancel_text_block_pick(cx);
     }
 
@@ -1119,6 +1177,7 @@ impl TerminalView {
             position,
             level: TextBlockLevel::Paragraph,
             collected: Vec::new(),
+            extend_to: None,
         });
         cx.notify();
     }
@@ -1154,6 +1213,7 @@ impl TerminalView {
             pick.level = level;
             pick.position = position;
             pick.collected.clear();
+            pick.extend_to = None;
         }
         cx.notify();
     }
@@ -1248,9 +1308,18 @@ impl TerminalView {
         }
     }
 
-    /// Clears the texts picked to act on together, else goes back to the
-    /// paragraph or the message the pick is in, else ends the pick.
+    /// Clears the extension, else the texts picked to act on together,
+    /// else goes back to the paragraph or the message the pick is in, else
+    /// ends the pick.
     pub fn back_out_of_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        self.extending_text_block = false;
+        if let Some(pick) = &mut self.text_block_pick
+            && pick.extend_to.take().is_some()
+        {
+            self.flash_text_block_boundary(cx);
+            cx.notify();
+            return;
+        }
         if let Some(pick) = &mut self.text_block_pick
             && !pick.collected.is_empty()
         {
@@ -1265,6 +1334,8 @@ impl TerminalView {
     }
 
     pub fn cancel_text_block_pick(&mut self, cx: &mut Context<Self>) {
+        self.extending_text_block = false;
+        self.text_block_boundary_flash = None;
         if self.text_block_pick.take().is_some() {
             self.picked_text_block = None;
             cx.notify();
@@ -1283,6 +1354,7 @@ impl TerminalView {
         };
         if let Some(pick) = &mut self.text_block_pick {
             pick.position = Some(position);
+            pick.extend_to = None;
         }
         cx.notify();
     }
@@ -1429,6 +1501,7 @@ impl TerminalView {
             self.cancel_text_block_pick(cx);
         } else if let Some(pick) = &mut self.text_block_pick {
             pick.collected.clear();
+            pick.extend_to = None;
         }
         let kind = PickedTextKind {
             level,
@@ -1441,7 +1514,16 @@ impl TerminalView {
     fn picked_text(&self, cx: &App) -> Option<PickedTextBlock> {
         let pick = self.text_block_pick.as_ref()?;
         let point = self.pick_point(cx)?;
-        let (unit, block) = self.unit_at(point, pick.level, cx)?;
+        let (mut unit, block) = self.unit_at(point, pick.level, cx)?;
+        let mut extension = Vec::new();
+        if let Some(end) = pick
+            .extend_to
+            .and_then(|position| self.grid_point(position, cx))
+            && let Some((extended, added)) = self.extended_unit(&unit, &block, end, cx)
+        {
+            unit = extended;
+            extension = added;
+        }
         let anchor = if unit_contains(&unit, point) {
             point
         } else {
@@ -1461,6 +1543,8 @@ impl TerminalView {
             parent: (pick.level != TextBlockLevel::Message).then_some(block),
             collected,
             anchor,
+            extension,
+            flashing: self.text_block_boundary_flash.is_some(),
         })
     }
 
@@ -1504,29 +1588,296 @@ impl TerminalView {
         };
         unit_rows
             .into_iter()
-            .map(|rows| {
-                let mut text = String::new();
-                for ((line, _), row_text) in rows.iter().zip(terminal.rows_text(&rows)) {
-                    // A row the program wrapped ends at a space it left out.
-                    let terminal_wrapped = grid_rows
-                        .iter()
-                        .any(|row| row.line + 1 == *line && row.wraps);
-                    if !text.is_empty() && !terminal_wrapped {
-                        text.truncate(text.trim_end().len());
-                        text.push(' ');
-                        text.push_str(row_text.trim_start());
-                    } else {
-                        text.push_str(&row_text);
-                    }
-                }
-                TextBlock {
-                    rows,
-                    text,
-                    label: None,
-                    paragraphs: Vec::new(),
-                }
+            .map(|rows| TextBlock {
+                text: joined_rows_text(terminal, &rows, &grid_rows),
+                rows,
+                label: None,
+                paragraphs: Vec::new(),
             })
             .collect()
+    }
+
+    /// The picked text from its start to `end`, which is kept inside its
+    /// block, with the rows past the text's own end.
+    fn extended_unit(
+        &self,
+        unit: &TextBlock,
+        block: &TextBlock,
+        end: Point,
+        cx: &App,
+    ) -> Option<(TextBlock, Vec<(i32, RangeInclusive<usize>)>)> {
+        let start = unit_start(unit);
+        let own_end = unit.range()?.end();
+        let end = end.min(block.range()?.end());
+        let rows = block
+            .rows
+            .iter()
+            .filter(|(line, _)| (start.line..=end.line).contains(line))
+            .filter_map(|(line, columns)| {
+                let first = if *line == start.line {
+                    start.column
+                } else {
+                    *columns.start()
+                };
+                let last = if *line == end.line {
+                    end.column.min(*columns.end())
+                } else {
+                    *columns.end()
+                };
+                (first <= last).then_some((*line, first..=last))
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+        let added = rows
+            .iter()
+            .filter_map(|(line, columns)| {
+                let first = match line.cmp(&own_end.line) {
+                    std::cmp::Ordering::Less => return None,
+                    std::cmp::Ordering::Equal => (own_end.column + 1).max(*columns.start()),
+                    std::cmp::Ordering::Greater => *columns.start(),
+                };
+                (first <= *columns.end()).then_some((*line, first..=*columns.end()))
+            })
+            .collect();
+        let terminal = self.terminal.read(cx);
+        let grid_rows = terminal.grid_rows(rows.first()?.0..=rows.last()?.0);
+        let text = joined_rows_text(terminal, &rows, &grid_rows);
+        Some((
+            TextBlock {
+                rows,
+                text,
+                label: None,
+                paragraphs: Vec::new(),
+            },
+            added,
+        ))
+    }
+
+    /// Where words end in a block from `start` on, in order. A word runs to
+    /// a word separator, or to the end of a row unless the terminal wrapped
+    /// the row.
+    fn word_ends(&self, block: &TextBlock, start: Point, cx: &App) -> Vec<Point> {
+        let Some(lines) = block.lines() else {
+            return Vec::new();
+        };
+        let grid_rows = self.terminal.read(cx).grid_rows(lines);
+        let mut ends = Vec::new();
+        for (line, columns) in &block.rows {
+            let Some(row) = grid_rows.iter().find(|row| row.line == *line) else {
+                continue;
+            };
+            let is_word = |column: usize| {
+                row.characters
+                    .get(column)
+                    .is_some_and(|character| !terminal::is_word_separator(*character))
+            };
+            for column in *columns.start()..=*columns.end() {
+                if row.wide_char_spacers.contains(&column) || !is_word(column) {
+                    continue;
+                }
+                let mut next = column + 1;
+                while row.wide_char_spacers.contains(&next) {
+                    next += 1;
+                }
+                let continues = if next <= *columns.end() {
+                    is_word(next)
+                } else {
+                    row.wraps
+                };
+                let end = Point::new(*line, column);
+                if !continues && end >= start {
+                    ends.push(end);
+                }
+            }
+        }
+        ends
+    }
+
+    /// The picked text at its own boundary, the block it's in and its end
+    /// now, which is where it was extended to, if it was.
+    fn extendable_unit(&self, cx: &App) -> Option<(TextBlock, TextBlock, Point)> {
+        let pick = self.text_block_pick.as_ref()?;
+        let (unit, block) = self.unit_at(self.pick_point(cx)?, pick.level, cx)?;
+        let end = match pick
+            .extend_to
+            .and_then(|position| self.grid_point(position, cx))
+        {
+            Some(end) => end,
+            None => unit.range()?.end(),
+        };
+        Some((unit, block, end))
+    }
+
+    /// Why the picked text can't be extended: it's combined with other
+    /// texts, which an extension could run into, or the host refuses it.
+    fn text_block_extend_blocked(&self, cx: &App) -> Option<SharedString> {
+        let pick = self.text_block_pick.as_ref()?;
+        if !pick.collected.is_empty() {
+            return Some("Combined highlights can't be extended".into());
+        }
+        let blocker = self.text_block_extend_blocker.as_ref()?;
+        let (unit, _) = self.unit_at(self.pick_point(cx)?, pick.level, cx)?;
+        blocker(self.terminal.read(cx), &unit, pick.level, cx)
+    }
+
+    fn set_text_block_extend_to(&mut self, end: Point, cx: &mut Context<Self>) {
+        let Some(position) = self.scrollback_position(end, cx) else {
+            return;
+        };
+        if let Some(pick) = &mut self.text_block_pick
+            && pick.extend_to != Some(position)
+        {
+            pick.extend_to = Some(position);
+            self.text_block_boundary_flash = None;
+            cx.notify();
+        }
+    }
+
+    /// Moves the picked text's end to the end of the word at `point`, or of
+    /// the row's last word when `point` is past it. The end stays within the
+    /// block and after the text's first word.
+    fn drag_text_block_end(&mut self, point: Point, cx: &mut Context<Self>) {
+        let Some((unit, block, _)) = self.extendable_unit(cx) else {
+            return;
+        };
+        let ends = self.word_ends(&block, unit_start(&unit), cx);
+        let (Some(first), Some(last)) = (ends.first().copied(), ends.last().copied()) else {
+            return;
+        };
+        let end = if point <= first {
+            first
+        } else if point >= last {
+            last
+        } else {
+            ends.iter()
+                .find(|end| end.line == point.line && **end >= point)
+                .or_else(|| ends.iter().rev().find(|end| end.line == point.line))
+                .or_else(|| ends.iter().rev().find(|end| **end <= point))
+                .copied()
+                .unwrap_or(first)
+        };
+        self.set_text_block_extend_to(end, cx);
+    }
+
+    /// Moves the picked text's end by one word, never past its block or
+    /// before the end of its first word.
+    pub fn extend_text_block_pick_end(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.takes_mouse_for_text_block_pick() || self.text_block_extend_blocked(cx).is_some() {
+            return;
+        }
+        let Some((unit, block, end)) = self.extendable_unit(cx) else {
+            return;
+        };
+        let ends = self.word_ends(&block, unit_start(&unit), cx);
+        let next = if forward {
+            ends.iter().find(|other| **other > end)
+        } else {
+            ends.iter().rev().find(|other| **other < end)
+        };
+        if let Some(next) = next.copied() {
+            self.set_text_block_extend_to(next, cx);
+        }
+    }
+
+    /// The cells a drag extends the picked text from: its last cell and the
+    /// one after it, which is the next row's first when the last cell ends
+    /// its row.
+    fn text_block_grab_zone(&self, cx: &App) -> Option<[Point; 2]> {
+        let end = self.picked_text(cx)?.block.range()?.end();
+        let columns = self
+            .terminal
+            .read(cx)
+            .last_content()
+            .terminal_bounds
+            .num_columns();
+        let next = if end.column + 1 < columns {
+            Point::new(end.line, end.column + 1)
+        } else {
+            Point::new(end.line + 1, 0)
+        };
+        Some([end, next])
+    }
+
+    fn pointer_in_text_block_grab_zone(&self, cx: &App) -> bool {
+        self.pointer_point(cx).is_some_and(|pointer| {
+            self.text_block_grab_zone(cx)
+                .is_some_and(|zone| zone.contains(&pointer))
+        })
+    }
+
+    /// Whether the pointer shows that a drag extends the picked text.
+    pub fn shows_text_block_extend_cursor(&self, cx: &App) -> bool {
+        self.takes_mouse_for_text_block_pick()
+            && (self.extending_text_block
+                || (self.pointer_in_text_block_grab_zone(cx)
+                    && self.text_block_extend_blocked(cx).is_none()))
+    }
+
+    /// Why the picked text under the pointer can't be extended.
+    pub fn text_block_extend_tooltip(&self, cx: &App) -> Option<SharedString> {
+        if !self.takes_mouse_for_text_block_pick() || !self.pointer_in_text_block_grab_zone(cx) {
+            return None;
+        }
+        self.text_block_extend_blocked(cx)
+    }
+
+    /// A press while picking: in the picked text's grab zone it starts
+    /// extending the text, which the release ends. Elsewhere, outside an
+    /// extended text, it moves the pick to the pointer. Returns whether it
+    /// started extending.
+    pub(crate) fn press_text_block_pick(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pointer_in_text_block_grab_zone(cx) && self.text_block_extend_blocked(cx).is_none()
+        {
+            self.extending_text_block = true;
+            cx.notify();
+            return true;
+        }
+        let extended = self
+            .text_block_pick
+            .as_ref()
+            .is_some_and(|pick| pick.extend_to.is_some());
+        let Some(pointer) = self.pointer_point(cx) else {
+            return false;
+        };
+        let on_picked = self
+            .picked_text(cx)
+            .is_some_and(|picked| unit_contains(&picked.block, pointer));
+        if extended
+            && !on_picked
+            && let Some(position) = self.scrollback_position(pointer, cx)
+            && let Some(pick) = &mut self.text_block_pick
+        {
+            pick.position = Some(position);
+            pick.extend_to = None;
+            cx.notify();
+        }
+        false
+    }
+
+    pub fn is_extending_text_block(&self) -> bool {
+        self.extending_text_block
+    }
+
+    pub(crate) fn release_text_block_extend(&mut self, cx: &mut Context<Self>) {
+        if self.extending_text_block {
+            self.extending_text_block = false;
+            cx.notify();
+        }
+    }
+
+    fn flash_text_block_boundary(&mut self, cx: &mut Context<Self>) {
+        self.text_block_boundary_flash = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(TEXT_BLOCK_BOUNDARY_FLASH)
+                .await;
+            this.update(cx, |this, cx| {
+                this.text_block_boundary_flash = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The first line's text block, as the point that a keyboard pick rests
@@ -1583,6 +1934,23 @@ impl TerminalView {
         if !self.takes_mouse_for_text_block_pick() {
             return;
         }
+        if self.extending_text_block {
+            if let Some(point) = self.pointer_point(cx) {
+                self.drag_text_block_end(point, cx);
+            }
+            cx.notify();
+            return;
+        }
+        // An extended pick stays put until a press elsewhere, and so does a
+        // pick while the pointer is on the cells that extend it.
+        let extended = self
+            .text_block_pick
+            .as_ref()
+            .is_some_and(|pick| pick.extend_to.is_some());
+        if extended || self.pointer_in_text_block_grab_zone(cx) {
+            cx.notify();
+            return;
+        }
         // A pointer leaving the terminal keeps the pick where it was, so
         // the keyboard can carry on from there.
         let Some(position) = self
@@ -1614,6 +1982,10 @@ impl TerminalView {
             Some(format!(" {}/{}", index + 1, units.len()))
         });
         let collected = picked.as_ref().map_or(0, |picked| picked.collected.len());
+        let extended_lines = picked
+            .as_ref()
+            .filter(|_| pick.extend_to.is_some())
+            .map(|picked| picked.block.rows.len());
         let label = picked.map(|picked| picked.block).map(|block| {
             block.label.or_else(|| {
                 self.selection_action
@@ -1621,7 +1993,9 @@ impl TerminalView {
                     .map(|action| action.label.clone())
             })
         });
-        let escape = if collected > 0 {
+        let escape = if pick.extend_to.is_some() {
+            "Esc to reset".to_string()
+        } else if collected > 0 {
             "Esc to clear".to_string()
         } else {
             match self.next_distinct_level(false, cx) {
@@ -1638,7 +2012,11 @@ impl TerminalView {
         } else {
             String::new()
         };
-        let place = format!("{level_name}{}{picked_count}", position.unwrap_or_default());
+        let place = match extended_lines {
+            Some(1) => "Extending · 1 line".to_string(),
+            Some(lines) => format!("Extending · {lines} lines"),
+            None => format!("{level_name}{}{picked_count}", position.unwrap_or_default()),
+        };
         Some(match label {
             Some(Some(label)) => format!(
                 "{place} · {label}: click or Enter · Shift+↑↓ to add · ↑↓ to move · ←→ for message, paragraph or sentence · {escape}"
@@ -2738,6 +3116,10 @@ impl TerminalView {
     }
 
     fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.extending_text_block = false;
+        if let Some(pick) = &mut self.text_block_pick {
+            pick.extend_to = None;
+        }
         self.blink_manager.update(cx, BlinkManager::disable);
         self.terminal.update(cx, |terminal, _| {
             if !self.read_only {

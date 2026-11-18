@@ -981,9 +981,13 @@ impl TerminalElement {
                 }
 
                 if terminal_view.read(cx).takes_mouse_for_text_block_pick() {
-                    terminal_view.update(cx, |terminal_view, _| {
+                    let extending = terminal_view.update(cx, |terminal_view, cx| {
                         terminal_view.swallow_left_mouse_up = true;
+                        terminal_view.press_text_block_pick(cx)
                     });
+                    if extending {
+                        return;
+                    }
                     pick_text_block(&terminal_view.downgrade(), e.modifiers.shift, window, cx);
                     return;
                 }
@@ -1073,8 +1077,9 @@ impl TerminalElement {
                     && !hitbox.is_hovered(window)
                     && terminal_view.read(cx).swallow_left_mouse_up
                 {
-                    terminal_view.update(cx, |terminal_view, _| {
+                    terminal_view.update(cx, |terminal_view, cx| {
                         terminal_view.swallow_left_mouse_up = false;
+                        terminal_view.release_text_block_extend(cx);
                     });
                 }
             }
@@ -1087,8 +1092,9 @@ impl TerminalElement {
                 let focus = focus.clone();
                 move |event, window, cx| {
                     if button == MouseButton::Left && terminal_view.read(cx).swallow_left_mouse_up {
-                        terminal_view.update(cx, |terminal_view, _| {
+                        terminal_view.update(cx, |terminal_view, cx| {
                             terminal_view.swallow_left_mouse_up = false;
+                            terminal_view.release_text_block_extend(cx);
                         });
                         return;
                     }
@@ -1446,10 +1452,13 @@ impl Element for TerminalElement {
                         .map(|picked| {
                             (
                                 picked.block.clone(),
-                                picked.parent.clone(),
+                                picked.extension.clone(),
                                 picked.collected.clone(),
+                                picked.flashing,
                             )
                         });
+                let extend_tooltip = self.terminal_view.read(cx).text_block_extend_tooltip(cx);
+                let hover_tooltip = hover_tooltip.or(extend_tooltip.map(String::from));
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
@@ -1483,7 +1492,7 @@ impl Element for TerminalElement {
                         .push((selection.point_range(), player_color.selection));
                 }
                 let text_block_marker_color = theme.colors().text_accent;
-                if let Some((block, _, collected)) = &text_block {
+                if let Some((block, extension, collected, flashing)) = &text_block {
                     // Only the picked texts are highlighted, not the block
                     // around them.
                     let tint = theme.colors().ghost_element_selected;
@@ -1492,13 +1501,42 @@ impl Element for TerminalElement {
                         .flat_map(|collected| &collected.rows)
                         .chain(&block.rows);
                     for (line, columns) in rows {
+                        // An extension is a row's end, drawn on its own.
+                        let last = extension
+                            .iter()
+                            .find(|(extended_line, _)| extended_line == line)
+                            .map_or(Some(*columns.end()), |(_, extended)| {
+                                extended.start().checked_sub(1)
+                            });
+                        if let Some(last) = last.filter(|last| *last >= *columns.start()) {
+                            relative_highlighted_ranges.push((
+                                Range::new(
+                                    Point::new(*line, *columns.start()),
+                                    Point::new(*line, last),
+                                ),
+                                tint,
+                            ));
+                        }
+                    }
+                    for (line, columns) in extension {
                         relative_highlighted_ranges.push((
                             Range::new(
                                 Point::new(*line, *columns.start()),
                                 Point::new(*line, *columns.end()),
                             ),
-                            tint,
+                            tint.opacity(0.5),
                         ));
+                    }
+                    if *flashing {
+                        for (line, columns) in &block.rows {
+                            relative_highlighted_ranges.push((
+                                Range::new(
+                                    Point::new(*line, *columns.start()),
+                                    Point::new(*line, *columns.end()),
+                                ),
+                                theme.colors().text_accent.opacity(0.3),
+                            ));
+                        }
                     }
                 }
 
@@ -1670,7 +1708,7 @@ impl Element for TerminalElement {
                     Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
                     None => Vec::new(),
                 };
-                let text_block_marker = text_block.as_ref().and_then(|(block, _, _)| {
+                let text_block_marker = text_block.as_ref().and_then(|(block, _, _, _)| {
                     Some(GutterMarker {
                         lines: block.lines()?,
                         color: text_block_marker_color,
@@ -1756,6 +1794,12 @@ impl Element for TerminalElement {
                 && self.terminal_view.read(cx).hover.is_some()
             {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
+            } else if self
+                .terminal_view
+                .read(cx)
+                .shows_text_block_extend_cursor(cx)
+            {
+                window.set_cursor_style(gpui::CursorStyle::ResizeLeftRight, &layout.hitbox);
             } else if self
                 .terminal_view
                 .read(cx)
