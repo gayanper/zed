@@ -191,6 +191,10 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
 
+## Git Repo
+1. This is a fork
+2. `main` or `master` branch is `myzed`
+
 ## Feature Development
 1. Make sure `myzed` branch is clean
   - If Not On `myzed`: stop and tell user
