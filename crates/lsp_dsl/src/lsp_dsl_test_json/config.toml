@@ -1,0 +1,8 @@
+name = "DSL Test JSON"
+grammar = "lsp_dsl_test_json"
+path_suffixes = ["dsljson"]
+line_comments = ["// "]
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+]

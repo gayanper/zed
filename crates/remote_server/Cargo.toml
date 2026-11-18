@@ -49,6 +49,7 @@ language_extension.workspace = true
 languages.workspace = true
 log.workspace = true
 lsp.workspace = true
+lsp_dsl.workspace = true
 net.workspace = true
 node_runtime.workspace = true
 paths.workspace = true

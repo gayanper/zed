@@ -10510,6 +10510,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsp_dsl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "collections",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "parking_lot",
+ "project",
+ "release_channel",
+ "rust-embed",
+ "semver",
+ "serde_json",
+ "settings",
+ "tree-sitter",
+ "tree-sitter-json",
+ "util",
+ "zlog",
+]
+
+[[package]]
 name = "lsp_locations"
 version = "0.1.0"
 dependencies = [
@@ -15177,6 +15203,7 @@ dependencies = [
  "libc",
  "log",
  "lsp",
+ "lsp_dsl",
  "net",
  "node_runtime",
  "paths",
@@ -22672,6 +22699,7 @@ dependencies = [
  "line_ending_selector",
  "log",
  "lsp_command_selector",
+ "lsp_dsl",
  "lsp_locations",
  "markdown",
  "markdown_preview",

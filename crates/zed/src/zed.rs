@@ -6140,6 +6140,7 @@ mod tests {
         let node_runtime = node_runtime::NodeRuntime::unavailable();
         cx.update(|cx| {
             languages::init(languages.clone(), fs, node_runtime, cx);
+            lsp_dsl::init(languages.clone(), cx);
         });
         for name in languages.language_names() {
             languages
