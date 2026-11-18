@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use fs::FakeFs;
 use futures::{FutureExt as _, StreamExt as _, channel::mpsc::UnboundedReceiver};
-use gpui::{AsyncApp, Entity, TestAppContext, UpdateGlobal as _};
+use gpui::{AppContext as _, AsyncApp, Entity, TestAppContext, UpdateGlobal as _};
 use language::{
     FakeLspAdapter, LanguageMatcher, LanguageName, LanguageRegistry, LanguageServerName,
     LoadedLanguage, LspAdapter, LspAdapterDelegate, LspInstaller,
@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use project::Project;
 use serde_json::{Value, json};
 use settings::SettingsStore;
+use tree_sitter::StreamingIterator as _;
 use util::path;
 
 use crate::{LanguageDecl, LspServerDecl};
@@ -392,4 +393,223 @@ async fn test_collisions_are_won_by_lsp_dsl(cx: &mut TestAppContext) {
         1,
         "lsp_dsl server replaced the earlier adapter instead of being added next to it"
     );
+}
+
+fn swift_query_files() -> Vec<(String, String)> {
+    crate::LanguageDir::iter()
+        .filter(|path| path.starts_with("swift/") && path.ends_with(".scm"))
+        .map(|path| {
+            let file = crate::LanguageDir::get(&path).expect("embedded query file");
+            let source = String::from_utf8(file.data.into_owned()).expect("utf-8 query file");
+            (path.into_owned(), source)
+        })
+        .collect()
+}
+
+#[test]
+fn test_swift_queries_compile() {
+    let grammar = tree_sitter::Language::from(tree_sitter_swift::LANGUAGE);
+    let files = swift_query_files();
+    let mut names = files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "swift/brackets.scm",
+            "swift/highlights.scm",
+            "swift/indents.scm",
+            "swift/injections.scm",
+            "swift/outline.scm",
+            "swift/overrides.scm",
+            "swift/textobjects.scm",
+        ]
+    );
+    for (path, source) in &files {
+        if let Err(error) = tree_sitter::Query::new(&grammar, source) {
+            panic!("{path} does not compile against tree-sitter-swift: {error}");
+        }
+    }
+}
+
+#[test]
+fn test_swift_regex_literal_is_injected_as_regex() {
+    let grammar = tree_sitter::Language::from(tree_sitter_swift::LANGUAGE);
+    let (_, source) = swift_query_files()
+        .into_iter()
+        .find(|(path, _)| path == "swift/injections.scm")
+        .expect("injections.scm");
+    let query = tree_sitter::Query::new(&grammar, &source).expect("valid injections query");
+    let content_index = query
+        .capture_index_for_name("injection.content")
+        .expect("injection.content capture");
+
+    let text = "let pattern = /[a-z]+/\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).expect("compatible grammar");
+    let tree = parser.parse(text, None).expect("parsed");
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    let mut injected = Vec::new();
+    while let Some(query_match) = matches.next() {
+        let language = query
+            .property_settings(query_match.pattern_index)
+            .iter()
+            .find(|property| property.key.as_ref() == "injection.language")
+            .and_then(|property| property.value.as_deref().map(str::to_owned));
+        for capture in query_match.captures {
+            if capture.index == content_index {
+                injected.push((
+                    capture.node.kind().to_owned(),
+                    capture
+                        .node
+                        .utf8_text(text.as_bytes())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    language.clone(),
+                ));
+            }
+        }
+    }
+    assert_eq!(
+        injected,
+        [(
+            "regex_literal".to_owned(),
+            "/[a-z]+/".to_owned(),
+            Some("regex".to_owned())
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_swift_language_and_outline(cx: &mut TestAppContext) {
+    init_test(cx);
+    let registry = Arc::new(LanguageRegistry::test(cx.executor()));
+    register(&registry, &[crate::swift::LANGUAGE], &[], cx);
+
+    let language = registry
+        .load_language_for_file_path(std::path::Path::new("Sources/App/main.swift"))
+        .await
+        .expect(".swift files resolve to Swift");
+    assert_eq!(language.name(), LanguageName::new_static("Swift"));
+
+    let text = r#"
+class Animal {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func speak() -> String {
+        return name
+    }
+}
+
+struct Point {
+    let x: Int
+}
+
+enum Direction {
+    case north
+}
+
+protocol Shape {
+    func area() -> Double
+}
+
+extension Point {
+    func moved() -> Point {
+        return self
+    }
+}
+
+actor Counter {
+    var value = 0
+}
+
+typealias Distance = Double
+"#;
+    let buffer = cx.new(|cx| {
+        let mut buffer = language::Buffer::local(text, cx);
+        buffer.set_language(Some(language), cx);
+        buffer
+    });
+    buffer
+        .read_with(cx, |buffer, _| buffer.parsing_idle())
+        .await;
+    let outline = buffer.read_with(cx, |buffer, _| buffer.snapshot().outline(None));
+    assert_eq!(
+        outline
+            .items
+            .iter()
+            .map(|item| (item.text.as_str(), item.depth))
+            .collect::<Vec<_>>(),
+        [
+            ("class Animal", 0),
+            ("var name", 1),
+            ("init", 1),
+            ("func speak", 1),
+            ("struct Point", 0),
+            ("let x", 1),
+            ("enum Direction", 0),
+            ("case north", 1),
+            ("protocol Shape", 0),
+            ("func area", 1),
+            ("extension Point", 0),
+            ("func moved", 1),
+            ("actor Counter", 0),
+            ("var value", 1),
+            ("typealias Distance", 0),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_sourcekit_lsp_requires_binary_path(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "main.swift": "let x = 1\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    let (mut servers, initialization_options) = fake_server(&registry, "sourcekit-lsp");
+    register(
+        &registry,
+        &[crate::swift::LANGUAGE],
+        &[crate::swift::LSP_SERVER],
+        cx,
+    );
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/root/main.swift"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        servers.try_recv().is_err(),
+        "sourcekit-lsp should not start without a binary path"
+    );
+    assert_eq!(running_servers(&project, cx), 0);
+
+    set_user_settings(
+        cx,
+        json!({ "lsp": { "sourcekit-lsp": { "binary": { "path": path!("/usr/bin/sourcekit-lsp") } } } }),
+    );
+    cx.run_until_parked();
+    let server = servers
+        .next()
+        .await
+        .expect("sourcekit-lsp started after setting the path");
+    assert_eq!(
+        server.binary.path,
+        PathBuf::from(path!("/usr/bin/sourcekit-lsp"))
+    );
+    assert_eq!(*initialization_options.lock(), None);
+    assert_eq!(running_servers(&project, cx), 1);
 }

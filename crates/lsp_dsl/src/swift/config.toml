@@ -1,0 +1,12 @@
+name = "Swift"
+grammar = "swift"
+path_suffixes = ["swift"]
+line_comments = ["// ", "/// "]
+block_comment = { start = "/*", prefix = "* ", end = "*/", tab_size = 1 }
+tab_size = 4
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+]

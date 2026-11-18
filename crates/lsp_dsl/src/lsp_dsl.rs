@@ -20,6 +20,8 @@ use settings::{Settings as _, SettingsStore};
 #[doc(hidden)]
 pub use serde_json;
 
+pub mod swift;
+
 #[derive(RustEmbed)]
 #[folder = "src/"]
 #[exclude = "*.rs"]
@@ -106,7 +108,7 @@ macro_rules! register {
 }
 
 pub fn init(languages: Arc<LanguageRegistry>, cx: &mut App) {
-    register!(languages, cx, [], []);
+    register!(languages, cx, [swift::LANGUAGE], [swift::LSP_SERVER]);
 }
 
 #[doc(hidden)]
