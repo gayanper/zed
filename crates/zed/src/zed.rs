@@ -6490,13 +6490,11 @@ mod tests {
         );
     }
 
-    /// The terminal binds `cmd-k` to `terminal::Clear` on macOS. The terminal group chord has to
-    /// stay pending in agent panel terminals instead of clearing them.
+    /// The terminal binds `cmd-k` to `terminal::Clear` on macOS. The agent panel's terminal
+    /// chords have to stay pending in agent panel terminals instead of clearing them.
     /// Only macOS can regress: Linux and Windows have no terminal `ctrl-k` binding.
     #[gpui::test]
-    async fn test_toggle_group_terminals_chord_in_agent_panel_terminals(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_terminal_split_chords_in_agent_panel_terminals(cx: &mut gpui::TestAppContext) {
         let _app_state = init_keymap_test(cx);
         cx.update(load_default_keymap);
         let modifier = if cfg!(target_os = "macos") {
@@ -6505,25 +6503,30 @@ mod tests {
             "ctrl"
         };
         let first = gpui::Keystroke::parse(&format!("{modifier}-k")).unwrap();
-        let second = gpui::Keystroke::parse(&format!("{modifier}-o")).unwrap();
+        let mut chords = vec![
+            ("o".to_string(), "agent::ToggleTerminalSplit"),
+            (format!("{modifier}-]"), "pane::ActivateNextItem"),
+            (format!("{modifier}-["), "pane::ActivatePreviousItem"),
+        ];
+        if cfg!(target_os = "macos") {
+            chords.push(("cmd-left".to_string(), "workspace::ActivatePaneLeft"));
+            chords.push(("cmd-right".to_string(), "workspace::ActivatePaneRight"));
+        }
         cx.update(|cx| {
             let keymap = cx.key_bindings();
             let keymap = keymap.borrow();
-            for focused in ["Terminal", "OverviewTerminalHeader", "Editor"] {
-                let context_stack = ["Workspace", "Dock", "AgentPanel", focused]
-                    .map(|context| gpui::KeyContext::parse(context).unwrap());
-                let (_, pending) =
-                    keymap.bindings_for_input(std::slice::from_ref(&first), &context_stack);
-                assert!(
-                    pending,
-                    "{modifier}-k should wait for a second key in {focused}"
-                );
+            let context_stack = ["Workspace", "Dock", "AgentPanel", "Terminal"]
+                .map(|context| gpui::KeyContext::parse(context).unwrap());
+            let (_, pending) =
+                keymap.bindings_for_input(std::slice::from_ref(&first), &context_stack);
+            assert!(pending, "{modifier}-k should wait for a second key");
+            for (second, action) in &chords {
+                let second = gpui::Keystroke::parse(second).unwrap();
                 let (bindings, _) =
-                    keymap.bindings_for_input(&[first.clone(), second.clone()], &context_stack);
+                    keymap.bindings_for_input(&[first.clone(), second], &context_stack);
                 assert_eq!(
                     bindings.first().map(|binding| binding.action().name()),
-                    Some("agent::ToggleGroupTerminals"),
-                    "{modifier}-k {modifier}-o in {focused}"
+                    Some(*action),
                 );
             }
         });

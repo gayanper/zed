@@ -6,7 +6,8 @@ use agent_settings::AgentSettings;
 use agent_ui::{
     ThreadId,
     terminal_thread_metadata_store::{
-        TerminalThreadMetadata, TerminalThreadMetadataStore, TestTerminalMetadataDbName,
+        TerminalSplitSide, TerminalThreadMetadata, TerminalThreadMetadataStore,
+        TestTerminalMetadataDbName,
     },
     test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -2260,11 +2261,8 @@ async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAp
         let metadata = store
             .entry(terminal_id)
             .expect("terminal metadata should be persisted");
-        assert_eq!(metadata.title.as_ref(), "");
-        assert_eq!(
-            metadata.custom_title.as_ref().map(|title| title.as_ref()),
-            Some("Dev Server")
-        );
+        assert_eq!(metadata.title.as_ref(), "Dev Server");
+        assert_eq!(metadata.custom_title, None);
         assert_eq!(metadata.display_title().as_ref(), "Dev Server");
         assert!(
             metadata
@@ -2452,7 +2450,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         init_command: None,
         group_id: terminal_id,
         position: 0,
-        minimized_in_overview: false,
+        split_side: TerminalSplitSide::Left,
     };
 
     cx.update(|_, cx| {
@@ -3687,7 +3685,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         init_command: None,
         group_id: terminal_id,
         position: 0,
-        minimized_in_overview: false,
+        split_side: TerminalSplitSide::Left,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3798,7 +3796,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         init_command: None,
         group_id: terminal_id,
         position: 0,
-        minimized_in_overview: false,
+        split_side: TerminalSplitSide::Left,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3972,7 +3970,7 @@ async fn archive_closed_linked_worktree_terminal(with_sub_terminal: bool, cx: &m
         init_command: None,
         group_id: terminal_id,
         position: 0,
-        minimized_in_overview: false,
+        split_side: TerminalSplitSide::Left,
     };
     let sub_terminal_metadata = TerminalThreadMetadata {
         terminal_id: sub_terminal_id,
@@ -4786,17 +4784,14 @@ async fn test_terminal_group_row_title_rename_and_bell(cx: &mut TestAppContext) 
             Some("Pair".into())
         );
         assert_eq!(
-            store.entry(parent_id).unwrap().custom_title.as_deref(),
-            Some("Parent")
+            store
+                .group(lone_id)
+                .and_then(|group| group.custom_title.clone()),
+            Some("Renamed Lone".into())
         );
-        assert_eq!(
-            store.entry(child_id).unwrap().custom_title.as_deref(),
-            Some("Child")
-        );
-        assert_eq!(
-            store.entry(lone_id).unwrap().custom_title.as_deref(),
-            Some("Renamed Lone")
-        );
+        for terminal_id in [parent_id, child_id, lone_id] {
+            assert_eq!(store.entry(terminal_id).unwrap().custom_title, None);
+        }
     });
     sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
@@ -4815,8 +4810,8 @@ async fn test_terminal_group_row_title_rename_and_bell(cx: &mut TestAppContext) 
         vec![SharedString::from("Child")]
     );
 
-    // The group title still names the row once the group shrinks to one
-    // member, so renaming the row renames the group.
+    // Once the group shrinks to one member, renaming the row still renames
+    // the group.
     panel.update_in(cx, |panel, window, cx| {
         panel.close_terminal(child_id, window, cx)
     });
@@ -6400,7 +6395,7 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
 }
 
 #[gpui::test]
-async fn test_rename_selected_thread_action_renames_terminal(cx: &mut TestAppContext) {
+async fn test_rename_selected_thread_action_renames_thread_not_terminal(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -6449,15 +6444,20 @@ async fn test_rename_selected_thread_action_renames_terminal(cx: &mut TestAppCon
             .into_iter()
             .find(|terminal| terminal.id == terminal_id)
             .expect("terminal should remain open after renaming");
-        assert_eq!(terminal.custom_title.as_deref(), Some(renamed_title));
+        assert_eq!(terminal.custom_title, None);
     });
     sidebar.read_with(cx, |_sidebar, cx| {
-        let metadata = TerminalThreadMetadataStore::global(cx)
-            .read(cx)
+        let store = TerminalThreadMetadataStore::global(cx).read(cx);
+        let metadata = store
             .entry(terminal_id)
-            .cloned()
             .expect("renamed terminal metadata should exist");
-        assert_eq!(metadata.custom_title.as_deref(), Some(renamed_title));
+        assert_eq!(metadata.custom_title, None);
+        assert_eq!(
+            store
+                .group(metadata.group_id)
+                .and_then(|group| group.custom_title.as_deref()),
+            Some(renamed_title)
+        );
     });
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),

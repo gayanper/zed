@@ -64,7 +64,7 @@ To choose from multiple CLIs in the new-thread menu, configure named commands:
 }
 ```
 
-Set `kind` to `main` (the default) for commands that start top-level Terminal Threads, or `sub` for commands offered under **New Sub Terminal**. A plain `terminal_init_command` string is a `main` command. New Sub Terminal options appear only when at least one `sub` command is configured.
+Set `kind` to `main` (the default) for commands that start top-level Terminal Threads, or `sub` for commands offered under **New Terminal in Thread**. A plain `terminal_init_command` string is a `main` command. New Terminal in Thread options appear only when at least one `sub` command is configured.
 
 In the Threads Sidebar, the project `+` menu lists each open workspace with its `main` commands, so you can choose which command starts the Terminal Thread. If a command list has no `main` entry, the menu says so, and a Terminal Thread started another way runs a plain shell.
 
@@ -86,33 +86,27 @@ The same `agent.notify_when_agent_waiting` and `agent.play_sound_when_agent_done
 
 Unlike agent threads, Terminal Threads are closed rather than archived. They do not go to Thread History. To close one, hover over it in the Threads Sidebar and click the **×** button, or select it and press {#kb agent::ArchiveSelectedThread}.
 
-## Terminal Overview Width {#terminal-overview-width}
+## Terminals in a Terminal Thread {#terminal-tabs}
 
-The terminal overview shows a terminal thread's sub terminals in a column beside it. The column is 300 pixels wide by default, and never narrower than 40 characters of the sub terminal font. To change it, set `agent.terminal_overview_width` in pixels:
+A terminal thread can hold several terminals. Add one from the agent panel's `+` menu under **New Terminal in Thread**. It opens as a new tab in the side that has focus, and takes focus.
 
-```json [settings]
-{
-  "agent": {
-    "terminal_overview_width": 400
-  }
-}
-```
+With two or more terminals, the toolbar shows one tab per terminal in place of the title. Each tab shows the terminal's title, with the full title in its tooltip. Tabs shrink as space runs out, and the tab strip then scrolls sideways with the mouse wheel or trackpad. A dot on a tab means its terminal rang the bell; it clears when the terminal gets focus. Clicking the bell in the Threads Sidebar opens the terminal that rang most recently.
 
-The overview is hidden while the panel can't also give the parent terminal 40 columns.
+The tabs follow the `tabs.show_close_button` and `tabs.activate_on_close` settings. Right-click a tab to rename or close it. {#action agent::RenameSelectedThread} renames the thread instead, with the title editor shown in place of the tabs. Renaming a tab doesn't change the terminal thread's title, and renaming the thread doesn't change any tab. Without a custom name, the thread is titled after its oldest terminal's shell or process. When a terminal's shell exits, its tab closes. A terminal that fails to start shows an error, with buttons to retry or close it.
 
-Starting a sub terminal from the agent panel's new thread menu keeps the parent terminal in view and focused, and turns its overview on.
+While a terminal has focus, the tab keys of the editor work on the tabs: {#kb pane::ActivateNextItem} and {#kb pane::ActivatePreviousItem} switch tabs, {#kb pane::ActivateLastItem} goes to the last tab, and {#kb pane::CloseActiveItem} closes the active tab. With one terminal, {#kb pane::CloseActiveItem} does nothing; it never closes the editor's active item.
 
-Sub terminals appear only in the overview, not in the sidebar. A terminal keeps its overview shown or hidden as you left it, including after restarting Zed. The overview button's badge shows how many a terminal has. A notification from a sub terminal marks its parent in the sidebar. The overview shows all of a terminal's sub terminals. Close one from its header.
+Drag a tab to reorder it. The order is kept after restarting Zed.
 
-To save space, minimize a sub terminal from its header or with {#kb agent::ToggleMinimizeOverviewTerminal}, leaving only the header. The header then takes focus, and the same button or keys restore the sub terminal. A notification from a minimized sub terminal marks its header and its parent in the sidebar until it's restored. A sub terminal that fails to start stays in the overview as a header with a retry button.
+## Split View {#terminal-split-view}
 
-## Showing and Navigating Sub Terminals {#terminal-overview-navigation}
+{#kb agent::ToggleTerminalSplit}, or the split button in the toolbar, shows a terminal thread's terminals side by side. The button needs at least two terminals. Turning split view on moves the most recently used other terminal to the right side. Each side has its own tabs. Turning it off moves the right side's tabs after the left side's.
 
-{#kb agent::ToggleSubTerminals} shows or hides a terminal thread's sub terminals, like the button in the panel header. This action was called `agent::ToggleTerminalOverview`, and that name still works in keymaps. If the panel is too narrow to show the sub terminals, the button is disabled and a message asks you to widen or zoom the panel, or to widen the window when the panel is already zoomed. The overview stays shown or hidden until the panel is wide enough to change it.
+Drag a tab onto the other side's tabs or terminal to move it there. With split view off, dropping a tab on the right half of the terminal opens split view with that tab on the right. When a side has no tabs left, split view turns off.
 
-While the overview is shown, {#kb agent::FocusNextOverviewTerminal} and {#kb agent::FocusPreviousOverviewTerminal} move focus between the parent terminal and its sub terminals.
+{#kb workspace::ActivatePaneLeft} and {#kb workspace::ActivatePaneRight} move focus between the sides, and {#action workspace::MoveItemToPaneInDirection} moves a tab to the other side. Drag the divider between the sides to resize them, and double-click it to make them equal. The split button shows a dot when a terminal whose tab isn't active rang.
 
-{#kb agent::ToggleZoomOverviewTerminal} zooms the focused sub terminal: it swaps places with the parent, which moves into the sub terminal column with a highlighted header. Search and comments then act on the zoomed sub terminal. Press the same keys again, hide the sub terminals, or close the zoomed sub terminal to undo the zoom. Switching to another thread and back keeps the zoom, unless you zoom a sub terminal in the other thread. The zoom isn't kept after restarting Zed.
+Each terminal thread keeps its split view, active tabs, divider position and focused side when you switch threads and after restarting Zed.
 
 ## Commenting on Terminal Output {#terminal-comments}
 

@@ -57,10 +57,36 @@ pub struct TerminalThreadMetadata {
     /// A lone terminal uses its own id, so it stays a valid group key after
     /// the terminal that founded the group closes.
     pub group_id: TerminalId,
-    /// The open member with the lowest position holds the main slot. Gaps are allowed.
+    /// Tab order within the member's split side. Gaps are allowed.
     pub position: i64,
-    /// Whether this member is collapsed to its header in the group's overview.
-    pub minimized_in_overview: bool,
+    pub split_side: TerminalSplitSide,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TerminalSplitSide {
+    #[default]
+    Left,
+    Right,
+}
+
+impl TerminalSplitSide {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+
+    fn to_db(self) -> i32 {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+        }
+    }
+
+    fn from_db(value: i32) -> Self {
+        if value == 1 { Self::Right } else { Self::Left }
+    }
 }
 
 /// Settings shared by every member of a terminal group, so they survive any
@@ -68,16 +94,26 @@ pub struct TerminalThreadMetadata {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalGroup {
     pub group_id: TerminalId,
-    pub overview_enabled: bool,
+    pub split_enabled: bool,
     pub custom_title: Option<SharedString>,
+    /// The left side's active tab, which is the only side while split is off.
+    pub active_terminal_id: Option<TerminalId>,
+    pub split_active_terminal_id: Option<TerminalId>,
+    pub focused_side: TerminalSplitSide,
+    /// The left side's share of the body width while split is on.
+    pub split_ratio: Option<f32>,
 }
 
 impl TerminalGroup {
-    fn new(group_id: TerminalId) -> Self {
+    pub(crate) fn new(group_id: TerminalId) -> Self {
         Self {
             group_id,
-            overview_enabled: false,
+            split_enabled: false,
             custom_title: None,
+            active_terminal_id: None,
+            split_active_terminal_id: None,
+            focused_side: TerminalSplitSide::Left,
+            split_ratio: None,
         }
     }
 }
@@ -343,20 +379,22 @@ impl TerminalThreadMetadataStore {
         cx.notify();
     }
 
-    pub fn set_minimized_in_overview(
+    pub fn set_placement(
         &mut self,
         terminal_id: TerminalId,
-        minimized_in_overview: bool,
+        split_side: TerminalSplitSide,
+        position: i64,
         cx: &mut Context<Self>,
     ) {
         let Some(mut metadata) = self.entry(terminal_id).cloned() else {
             return;
         };
-        if metadata.minimized_in_overview == minimized_in_overview {
+        if metadata.split_side == split_side && metadata.position == position {
             return;
         }
 
-        metadata.minimized_in_overview = minimized_in_overview;
+        metadata.split_side = split_side;
+        metadata.position = position;
         self.save_internal(metadata);
         cx.notify();
     }
@@ -365,8 +403,8 @@ impl TerminalThreadMetadataStore {
         self.groups.get(&group_id)
     }
 
-    /// Members in main-slot order: by position, with creation time and id
-    /// breaking ties so the order is stable.
+    /// Members in tab order: left side first, then by position, with creation
+    /// time and id breaking ties so the order is stable.
     pub fn group_members(&self, group_id: TerminalId) -> Vec<&TerminalThreadMetadata> {
         let mut members = self
             .terminals_by_group
@@ -375,12 +413,19 @@ impl TerminalThreadMetadataStore {
             .flatten()
             .filter_map(|terminal_id| self.terminals.get(terminal_id))
             .collect::<Vec<_>>();
-        members.sort_by_key(|member| (member.position, member.created_at, member.terminal_id));
+        members.sort_by_key(|member| {
+            (
+                member.split_side.to_db(),
+                member.position,
+                member.created_at,
+                member.terminal_id,
+            )
+        });
         members
     }
 
-    /// The oldest member, whose title names the group unless the group has a
-    /// custom title.
+    /// The oldest member, whose terminal title names the group unless the
+    /// group has a custom title.
     pub fn group_title_member(&self, group_id: TerminalId) -> Option<&TerminalThreadMetadata> {
         self.terminals_by_group
             .get(&group_id)
@@ -390,18 +435,17 @@ impl TerminalThreadMetadataStore {
             .min_by_key(|member| (member.created_at, member.position, member.terminal_id))
     }
 
+    /// The thread title. Renaming a member's tab never changes it: it's the
+    /// group's custom title, else the oldest member's terminal title.
     pub fn group_display_title(&self, group_id: TerminalId) -> Option<SharedString> {
         let member = self.group_title_member(group_id)?;
-        match self
+        let custom_title = self
             .group(group_id)
-            .and_then(|group| group.custom_title.as_ref())
-        {
-            Some(custom_title) => Some(compose_terminal_thread_title(
-                member.title.as_ref(),
-                Some(custom_title.as_ref()),
-            )),
-            None => Some(member.display_title()),
-        }
+            .and_then(|group| group.custom_title.as_ref());
+        Some(compose_terminal_thread_title(
+            member.title.as_ref(),
+            custom_title.map(|title| title.as_ref()),
+        ))
     }
 
     pub fn group_editable_title(&self, group_id: TerminalId) -> Option<SharedString> {
@@ -410,31 +454,38 @@ impl TerminalThreadMetadataStore {
             .and_then(|group| group.custom_title.clone())
         {
             Some(custom_title) => Some(custom_title),
-            None => Some(self.group_title_member(group_id)?.editable_title()),
+            None => Some(SharedString::from(
+                terminal_title_without_prefix(self.group_title_member(group_id)?.title.as_ref())
+                    .to_string(),
+            )),
         }
     }
 
-    pub fn set_group_overview(
+    pub fn update_group(
         &mut self,
         group_id: TerminalId,
-        overview_enabled: bool,
+        update: impl FnOnce(&mut TerminalGroup),
         cx: &mut Context<Self>,
     ) {
-        let mut group = self
-            .groups
-            .get(&group_id)
+        let existing = self.groups.get(&group_id);
+        let mut group = existing
             .cloned()
             .unwrap_or_else(|| TerminalGroup::new(group_id));
-        if self.groups.contains_key(&group_id) && group.overview_enabled == overview_enabled {
+        update(&mut group);
+        if existing == Some(&group) {
             return;
         }
-        group.overview_enabled = overview_enabled;
         self.save_group_internal(group);
         cx.notify();
     }
 
     /// Renames the group's sidebar row without changing any member's title.
-    pub fn rename_group(&mut self, group_id: TerminalId, title: SharedString, cx: &mut Context<Self>) {
+    pub fn rename_group(
+        &mut self,
+        group_id: TerminalId,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
         let Some(member_title) = self
             .group_title_member(group_id)
             .map(|member| member.title.clone())
@@ -776,6 +827,20 @@ impl Domain for TerminalThreadMetadataDb {
             ALTER TABLE sidebar_terminal_threads DROP COLUMN parent_terminal_id;
             ALTER TABLE sidebar_terminal_threads DROP COLUMN overview_enabled;
         ),
+        // Overview state says nothing about split state, so every thread
+        // starts with split off and all its terminals on the left.
+        // The SQL syntax check reads each ALTER's column from the first RENAME or
+        // DROP after it, so those come first.
+        sql!(
+            ALTER TABLE terminal_groups RENAME COLUMN overview_enabled TO split_enabled;
+            ALTER TABLE sidebar_terminal_threads DROP COLUMN minimized_in_overview;
+            UPDATE terminal_groups SET split_enabled = 0;
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN split_side INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE terminal_groups ADD COLUMN active_terminal_id TEXT;
+            ALTER TABLE terminal_groups ADD COLUMN split_active_terminal_id TEXT;
+            ALTER TABLE terminal_groups ADD COLUMN focused_side INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE terminal_groups ADD COLUMN split_ratio REAL;
+        ),
     ];
 }
 
@@ -784,12 +849,13 @@ db::static_connection!(TerminalThreadMetadataDb, []);
 const LIST_TERMINALS_QUERY: &str = "SELECT terminal_id, title, custom_title, created_at, \
     working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
     main_worktree_paths_order, remote_connection, init_command, group_id, position, \
-    minimized_in_overview \
+    split_side \
     FROM sidebar_terminal_threads \
     ORDER BY created_at DESC";
 
-const LIST_GROUPS_QUERY: &str =
-    "SELECT group_id, overview_enabled, custom_title FROM terminal_groups";
+const LIST_GROUPS_QUERY: &str = "SELECT group_id, split_enabled, custom_title, \
+    active_terminal_id, split_active_terminal_id, focused_side, split_ratio \
+    FROM terminal_groups";
 
 impl TerminalThreadMetadataDb {
     pub fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
@@ -802,18 +868,33 @@ impl TerminalThreadMetadataDb {
 
     pub async fn save_group(&self, group: TerminalGroup) -> anyhow::Result<()> {
         let group_id = group.group_id.to_key_string();
-        let overview_enabled = group.overview_enabled;
+        let split_enabled = group.split_enabled;
         let custom_title = group.custom_title.as_ref().map(ToString::to_string);
+        let active_terminal_id = group.active_terminal_id.map(TerminalId::to_key_string);
+        let split_active_terminal_id = group
+            .split_active_terminal_id
+            .map(TerminalId::to_key_string);
+        let focused_side = group.focused_side.to_db();
+        let split_ratio = group.split_ratio;
         self.write(move |conn| {
-            let sql = "INSERT INTO terminal_groups(group_id, overview_enabled, custom_title) \
-                       VALUES (?1, ?2, ?3) \
+            let sql = "INSERT INTO terminal_groups(group_id, split_enabled, custom_title, \
+                           active_terminal_id, split_active_terminal_id, focused_side, split_ratio) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                        ON CONFLICT(group_id) DO UPDATE SET \
-                           overview_enabled = excluded.overview_enabled, \
-                           custom_title = excluded.custom_title";
+                           split_enabled = excluded.split_enabled, \
+                           custom_title = excluded.custom_title, \
+                           active_terminal_id = excluded.active_terminal_id, \
+                           split_active_terminal_id = excluded.split_active_terminal_id, \
+                           focused_side = excluded.focused_side, \
+                           split_ratio = excluded.split_ratio";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&group_id, 1)?;
-            i = stmt.bind(&overview_enabled, i)?;
-            stmt.bind(&custom_title, i)?;
+            i = stmt.bind(&split_enabled, i)?;
+            i = stmt.bind(&custom_title, i)?;
+            i = stmt.bind(&active_terminal_id, i)?;
+            i = stmt.bind(&split_active_terminal_id, i)?;
+            i = stmt.bind(&focused_side, i)?;
+            stmt.bind(&split_ratio, i)?;
             stmt.exec()
         })
         .await
@@ -861,10 +942,10 @@ impl TerminalThreadMetadataDb {
         let init_command = row.init_command;
         let group_id = row.group_id.to_key_string();
         let position = row.position;
-        let minimized_in_overview = row.minimized_in_overview;
+        let split_side = row.split_side.to_db();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, group_id, position, minimized_in_overview) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, init_command, group_id, position, split_side) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
@@ -879,7 +960,7 @@ impl TerminalThreadMetadataDb {
                             init_command = excluded.init_command, \
                             group_id = excluded.group_id, \
                             position = excluded.position, \
-                            minimized_in_overview = excluded.minimized_in_overview";
+                            split_side = excluded.split_side";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -894,7 +975,7 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&init_command, i)?;
             i = stmt.bind(&group_id, i)?;
             i = stmt.bind(&position, i)?;
-            stmt.bind(&minimized_in_overview, i)?;
+            stmt.bind(&split_side, i)?;
             stmt.exec()
         })
         .await
@@ -933,7 +1014,7 @@ impl Column for TerminalThreadMetadata {
         let (init_command, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (group_id, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (position, next): (i64, i32) = Column::column(statement, next)?;
-        let (minimized_in_overview, next): (bool, i32) = Column::column(statement, next)?;
+        let (split_side, next): (i32, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -982,7 +1063,7 @@ impl Column for TerminalThreadMetadata {
                 init_command,
                 group_id,
                 position,
-                minimized_in_overview,
+                split_side: TerminalSplitSide::from_db(split_side),
             },
             next,
         ))
@@ -992,15 +1073,27 @@ impl Column for TerminalThreadMetadata {
 impl Column for TerminalGroup {
     fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
         let (group_id, next): (String, i32) = Column::column(statement, start_index)?;
-        let (overview_enabled, next): (bool, i32) = Column::column(statement, next)?;
+        let (split_enabled, next): (bool, i32) = Column::column(statement, next)?;
         let (custom_title, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (active_terminal_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (split_active_terminal_id, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (focused_side, next): (i32, i32) = Column::column(statement, next)?;
+        let (split_ratio, next): (Option<f32>, i32) = Column::column(statement, next)?;
+        // A malformed id only loses the remembered tab, so it shouldn't fail the row.
+        let parse_id =
+            |id: Option<String>| id.and_then(|id| TerminalId::from_key_string(&id).log_err());
         Ok((
             TerminalGroup {
                 group_id: TerminalId::from_key_string(&group_id)?,
-                overview_enabled,
+                split_enabled,
                 custom_title: custom_title
                     .filter(|title| !title.trim().is_empty())
                     .map(SharedString::from),
+                active_terminal_id: parse_id(active_terminal_id),
+                split_active_terminal_id: parse_id(split_active_terminal_id),
+                focused_side: TerminalSplitSide::from_db(focused_side),
+                split_ratio,
             },
             next,
         ))
@@ -1034,7 +1127,7 @@ mod tests {
             init_command: None,
             group_id: terminal_id,
             position: 0,
-            minimized_in_overview: false,
+            split_side: TerminalSplitSide::Left,
         }
     }
 
@@ -1179,8 +1272,18 @@ mod tests {
                     "a lone terminal has no group row"
                 );
                 store.save(member, cx);
-                store.set_group_overview(group_id, true, cx);
-                store.set_minimized_in_overview(member_id, true, cx);
+                store.set_placement(member_id, TerminalSplitSide::Right, 0, cx);
+                store.update_group(
+                    group_id,
+                    |group| {
+                        group.split_enabled = true;
+                        group.active_terminal_id = Some(founder_id);
+                        group.split_active_terminal_id = Some(member_id);
+                        group.focused_side = TerminalSplitSide::Right;
+                        group.split_ratio = Some(0.3);
+                    },
+                    cx,
+                );
             });
         });
         reload_store(cx);
@@ -1194,11 +1297,22 @@ mod tests {
                     .iter()
                     .map(|member| (member.terminal_id, member.position))
                     .collect::<Vec<_>>(),
-                vec![(founder_id, 0), (member_id, 1)]
+                vec![(founder_id, 0), (member_id, 0)]
             );
-            assert!(store.group(group_id).expect("group row").overview_enabled);
-            assert!(store.entry(member_id).unwrap().minimized_in_overview);
-            assert!(!store.entry(founder_id).unwrap().minimized_in_overview);
+            let group = store.group(group_id).expect("group row");
+            assert!(group.split_enabled);
+            assert_eq!(group.active_terminal_id, Some(founder_id));
+            assert_eq!(group.split_active_terminal_id, Some(member_id));
+            assert_eq!(group.focused_side, TerminalSplitSide::Right);
+            assert_eq!(group.split_ratio, Some(0.3));
+            assert_eq!(
+                store.entry(member_id).unwrap().split_side,
+                TerminalSplitSide::Right
+            );
+            assert_eq!(
+                store.entry(founder_id).unwrap().split_side,
+                TerminalSplitSide::Left
+            );
         });
     }
 
@@ -1218,7 +1332,7 @@ mod tests {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(founder, cx);
                 store.save(member, cx);
-                store.set_group_overview(group_id, true, cx);
+                store.update_group(group_id, |group| group.split_enabled = true, cx);
                 store.rename_group(group_id, "Pair".into(), cx);
                 store.delete(founder_id, cx);
             });
@@ -1229,12 +1343,9 @@ mod tests {
             let store = TerminalThreadMetadataStore::global(cx);
             let store = store.read(cx);
             let group = store.group(group_id).expect("group outlives its founder");
-            assert!(group.overview_enabled);
+            assert!(group.split_enabled);
             assert_eq!(group.custom_title.as_deref(), Some("Pair"));
-            assert_eq!(
-                store.group_display_title(group_id).as_deref(),
-                Some("Pair")
-            );
+            assert_eq!(store.group_display_title(group_id).as_deref(), Some("Pair"));
             assert_eq!(store.entry(member_id).unwrap().custom_title, None);
         });
 
@@ -1259,7 +1370,7 @@ mod tests {
         );
         let mut member = member_of("Member", &founder, 1);
         member.created_at = founder.created_at + chrono::Duration::seconds(1);
-        // Swapping the main slot must not change the row title.
+        // Reordering tabs must not change the row title.
         let mut founder = founder;
         founder.position = 2;
         let group_id = founder.group_id;
@@ -1299,14 +1410,43 @@ mod tests {
         let lone = TerminalId::new();
         let missing_parent = TerminalId::new();
         let rows = [
-            (parent, "Parent", Some("Custom"), "2026-01-01T00:00:00+00:00", None, true),
-            (newer_child, "Newer", None, "2026-01-03T00:00:00+00:00", Some(parent), false),
-            (older_child, "Older", None, "2026-01-02T00:00:00+00:00", Some(parent), false),
-            (orphan, "Orphan", None, "2026-01-04T00:00:00+00:00", Some(missing_parent), false),
+            (
+                parent,
+                "Parent",
+                Some("Custom"),
+                "2026-01-01T00:00:00+00:00",
+                None,
+                true,
+            ),
+            (
+                newer_child,
+                "Newer",
+                None,
+                "2026-01-03T00:00:00+00:00",
+                Some(parent),
+                false,
+            ),
+            (
+                older_child,
+                "Older",
+                None,
+                "2026-01-02T00:00:00+00:00",
+                Some(parent),
+                false,
+            ),
+            (
+                orphan,
+                "Orphan",
+                None,
+                "2026-01-04T00:00:00+00:00",
+                Some(missing_parent),
+                false,
+            ),
             (lone, "Lone", None, "2026-01-05T00:00:00+00:00", None, true),
         ];
         for (terminal_id, title, custom_title, created_at, parent_id, overview) in rows {
-            let custom_title = custom_title.map_or("NULL".to_string(), |title| format!("'{title}'"));
+            let custom_title =
+                custom_title.map_or("NULL".to_string(), |title| format!("'{title}'"));
             let parent_id = parent_id.map_or("NULL".to_string(), |parent_id| {
                 format!("'{}'", parent_id.to_key_string())
             });
@@ -1323,9 +1463,11 @@ mod tests {
         }
 
         connection
-            .migrate(TerminalThreadMetadataDb::NAME, migrations, &mut |_, _, _| {
-                false
-            })
+            .migrate(
+                TerminalThreadMetadataDb::NAME,
+                migrations,
+                &mut |_, _, _| false,
+            )
             .unwrap();
 
         let terminals = connection
@@ -1353,9 +1495,18 @@ mod tests {
             groups,
             vec![TerminalGroup {
                 group_id: parent,
-                overview_enabled: true,
+                split_enabled: false,
                 custom_title: Some("Custom".into()),
+                active_terminal_id: None,
+                split_active_terminal_id: None,
+                focused_side: TerminalSplitSide::Left,
+                split_ratio: None,
             }]
+        );
+        assert!(
+            terminals
+                .iter()
+                .all(|terminal| terminal.split_side == TerminalSplitSide::Left)
         );
 
         let columns = connection
@@ -1364,6 +1515,73 @@ mod tests {
         .unwrap();
         assert!(!columns.iter().any(|column| column == "parent_terminal_id"));
         assert!(!columns.iter().any(|column| column == "overview_enabled"));
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "minimized_in_overview")
+        );
+    }
+
+    #[test]
+    fn test_migration_turns_overview_state_off() {
+        use db::sqlez::connection::Connection;
+
+        let connection = Connection::open_memory(Some("terminal_split_migration"));
+        let migrations = TerminalThreadMetadataDb::MIGRATIONS;
+        let split_migration_index = migrations.len() - 1;
+        connection
+            .migrate(
+                TerminalThreadMetadataDb::NAME,
+                &migrations[..split_migration_index],
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+
+        let group = TerminalId::new();
+        let member = TerminalId::new();
+        for (terminal_id, position, minimized) in [(group, 0, 0), (member, 1, 1)] {
+            connection
+                .exec(&format!(
+                    "INSERT INTO sidebar_terminal_threads(terminal_id, title, created_at, \
+                     group_id, position, minimized_in_overview) \
+                     VALUES ('{}', 'Title', '2026-01-01T00:00:00+00:00', '{}', {position}, {minimized})",
+                    terminal_id.to_key_string(),
+                    group.to_key_string(),
+                ))
+                .unwrap()()
+            .unwrap();
+        }
+        connection
+            .exec(&format!(
+                "INSERT INTO terminal_groups(group_id, overview_enabled) VALUES ('{}', 1)",
+                group.to_key_string()
+            ))
+            .unwrap()()
+        .unwrap();
+
+        connection
+            .migrate(
+                TerminalThreadMetadataDb::NAME,
+                migrations,
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+
+        let terminals = connection
+            .select::<TerminalThreadMetadata>(LIST_TERMINALS_QUERY)
+            .unwrap()()
+        .unwrap();
+        assert_eq!(terminals.len(), 2);
+        assert!(
+            terminals
+                .iter()
+                .all(|terminal| terminal.split_side == TerminalSplitSide::Left)
+        );
+        let groups = connection
+            .select::<TerminalGroup>(LIST_GROUPS_QUERY)
+            .unwrap()()
+        .unwrap();
+        assert_eq!(groups, vec![TerminalGroup::new(group)]);
     }
 
     #[gpui::test]

@@ -414,19 +414,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
-        /// Shows or hides the other terminals of a terminal group beside its main terminal.
-        #[action(deprecated_aliases = ["agent::ToggleTerminalOverview", "agent::ToggleSubTerminals"])]
-        ToggleGroupTerminals,
-        /// Moves focus to the next terminal in the terminal overview.
-        FocusNextOverviewTerminal,
-        /// Moves focus to the previous terminal in the terminal overview.
-        FocusPreviousOverviewTerminal,
-        /// Moves the focused terminal of a terminal group into the main slot,
-        /// swapping places with the terminal there.
-        #[action(deprecated_aliases = ["agent::ToggleZoomOverviewTerminal"])]
-        MoveToMainTerminal,
-        /// Minimizes the focused terminal of a terminal group to its header, or restores it.
-        ToggleMinimizeOverviewTerminal,
+        /// Splits the terminal thread into two sides, or merges the sides back into one.
+        ToggleTerminalSplit,
     ]
 );
 
@@ -1112,7 +1101,6 @@ mod tests {
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
-            terminal_overview_width: px(300.),
             default_model: None,
             subagent_model: None,
             inline_assistant_model: None,

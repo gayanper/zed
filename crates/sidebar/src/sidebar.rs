@@ -313,7 +313,8 @@ fn terminal_row_notified(has_notification: bool, row_glyph: Option<&SharedString
 }
 
 /// A group's row shows its oldest member, titled with the group's custom
-/// title when it has one. The title never follows the main slot.
+/// title or else that member's terminal title. Tab renames and the main slot
+/// never change it.
 fn group_row_metadata(
     store: &TerminalThreadMetadataStore,
     metadata: TerminalThreadMetadata,
@@ -323,12 +324,9 @@ fn group_row_metadata(
         .group_title_member(group_id)
         .cloned()
         .unwrap_or(metadata);
-    if let Some(custom_title) = store
+    row.custom_title = store
         .group(group_id)
-        .and_then(|group| group.custom_title.clone())
-    {
-        row.custom_title = Some(custom_title);
-    }
+        .and_then(|group| group.custom_title.clone());
     row
 }
 
@@ -3742,54 +3740,16 @@ impl Sidebar {
         }
     }
 
-    /// Renaming a multi-member group's row names the group and leaves its
-    /// members' titles alone. A lone terminal's row renames the terminal.
+    /// Renaming a row names the thread and leaves its terminals' tab titles
+    /// alone.
     fn apply_terminal_rename(
         &mut self,
         group_id: TerminalId,
         title: SharedString,
         cx: &mut Context<Self>,
     ) {
-        let store = TerminalThreadMetadataStore::global(cx);
-        let members = store
-            .read(cx)
-            .group_members(group_id)
-            .into_iter()
-            .map(|member| member.terminal_id)
-            .collect::<Vec<_>>();
-        // A group title outlives the members that shrank the group to one, and
-        // it still overrides the row title, so it's the one to rename.
-        let has_group_title = store
-            .read(cx)
-            .group(group_id)
-            .is_some_and(|group| group.custom_title.is_some());
-        let terminal_id = match members.as_slice() {
-            [terminal_id] if !has_group_title => *terminal_id,
-            [] => group_id,
-            _ => {
-                store.update(cx, |store, cx| store.rename_group(group_id, title, cx));
-                return;
-            }
-        };
-        let mut found = false;
-        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
-            let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
-            for workspace in workspaces {
-                if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx)
-                    && agent_panel.update(cx, |agent_panel, cx| {
-                        agent_panel.rename_terminal(terminal_id, title.clone(), cx)
-                    })
-                {
-                    found = true;
-                }
-            }
-        }
-
-        if !found {
-            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.rename_terminal(terminal_id, title, cx);
-            });
-        }
+        TerminalThreadMetadataStore::global(cx)
+            .update(cx, |store, cx| store.rename_group(group_id, title, cx));
     }
 
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -7091,7 +7051,7 @@ impl Sidebar {
             }));
 
         let context_menu_id = SharedString::from(format!("terminal-context-menu-{ix}"));
-        let terminal_id = terminal.metadata.terminal_id;
+        let group_id = terminal.metadata.group_id;
         let rename_title = terminal.metadata.editable_title();
         let sidebar = cx.weak_entity();
 
@@ -7106,7 +7066,7 @@ impl Sidebar {
                             .update(cx, |sidebar, cx| {
                                 sidebar.start_renaming_entry(
                                     ix,
-                                    RenameTarget::Terminal(terminal_id),
+                                    RenameTarget::Terminal(group_id),
                                     rename_title.clone(),
                                     window,
                                     cx,
