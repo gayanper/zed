@@ -200,6 +200,13 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
   - If Not On `myzed`: stop and tell user
   - If Not Clean: stop and tell user
   - Otherwise: continue to next step
-2. Create a new feature branch based from `myzed` branch. Choose a new based on the feature request.
+2. Create a new feature branch based from `myzed` branch. Choose a name based on the feature request.
 3. Switch to the new feature branch.
 4. Never create worktree unless user asks to.
+
+## Fork scope
+1. Features developed on this fork are for my personal use. Do not add settings, flags or options unless the user asks for them. Hard-code the chosen behavior.
+2. Active AI features: Terminal Threads (including agent comments from editors) and Edit Predictions via local LLM providers. Treat all other AI features as inactive. Do not extend them, integrate new work with them, or write tests for them. Keep them compiling, but do not remove them unless asked.
+
+## Commit messages
+1. Do not add any Claude or agent trailer to commit messages. This includes `Co-Authored-By: Claude ...` lines, `🤖 Generated with Claude Code` text, and Claude session URLs.
