@@ -1318,19 +1318,6 @@ impl TerminalView {
         Some((range, origin))
     }
 
-    /// Moves the highlight to the line after grid line `last`, where the
-    /// mode carries on once the action started from it is done.
-    pub fn advance_line_highlight(&mut self, last: i32, cx: &mut Context<Self>) {
-        if self.line_highlight.is_none() {
-            return;
-        }
-        let next_line = last + 1;
-        if self.grid_lines(cx).contains(&next_line) {
-            let next_line = *self.logical_line(next_line, cx).start();
-            self.set_line_highlight(next_line, next_line, cx);
-        }
-    }
-
     fn confirm_line_highlight(
         &mut self,
         _: &ConfirmLineHighlight,
@@ -4295,20 +4282,13 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> SelectionActions {
         let actions = SelectionActions::default();
-        let weak_view = terminal_view.downgrade();
         terminal_view.update(cx, |terminal_view, cx| {
             let actions = actions.clone();
             terminal_view.on_selection_action(
                 "Act on Lines",
                 "Acting",
-                move |range, _, _, cx| {
+                move |range, _, _, _| {
                     actions.borrow_mut().push(range);
-                    // As a host does once its action opens.
-                    weak_view
-                        .update(cx, |terminal_view, cx| {
-                            terminal_view.advance_line_highlight(range.end().line, cx)
-                        })
-                        .log_err();
                 },
                 cx,
             );
@@ -4520,8 +4500,8 @@ mod tests {
         assert!(has_line_highlight(&terminal_view, &mut cx));
         assert_eq!(
             highlighted_lines(&terminal_view, &mut cx),
-            Some(3..=3),
-            "the highlight should move to the line after the one acted on"
+            Some(2..=2),
+            "the highlight should stay on the line acted on"
         );
     }
 

@@ -8949,21 +8949,12 @@ impl AgentPanel {
         .filter(|(_, span)| spans_overlap(*span, selected_span))
         .map(|(comment, _)| comment.clone())
         .collect();
-        let range_end_line = range.end().line;
         match CommentOverlap::new(touching) {
             CommentOverlap::One(comment) => {
                 self.edit_terminal_comment(terminal_id, &comment, position, window, cx);
-                if self.terminal_comment.is_some() {
-                    terminal_view.update(cx, |terminal_view, cx| {
-                        terminal_view.advance_line_highlight(range_end_line, cx)
-                    });
-                }
                 return;
             }
             CommentOverlap::Many(comments) => {
-                terminal_view.update(cx, |terminal_view, cx| {
-                    terminal_view.advance_line_highlight(range_end_line, cx)
-                });
                 self.show_terminal_comment_list(terminal_id, comments, position, window, cx);
                 return;
             }
@@ -9006,7 +8997,6 @@ impl AgentPanel {
         // Otherwise the pointer resting on the comment input would target
         // the text under it.
         terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.advance_line_highlight(range_end_line, cx);
             terminal_view.set_line_highlight_suspended(true, cx)
         });
         cx.notify();
@@ -15330,18 +15320,18 @@ mod tests {
         assert!(terminal_highlighting(&panel, terminal_id, &mut cx));
         assert_eq!(
             terminal_highlighted_lines(&panel, terminal_id, &mut cx),
-            Some(1..=1),
-            "the highlight should move to the line after the commented one"
+            Some(0..=0),
+            "the highlight should stay on the commented line"
         );
 
-        comment_on_highlight("ctrl-alt-m", "Two.", &mut cx);
+        comment_on_highlight("down ctrl-alt-m", "Two.", &mut cx);
         assert_eq!(
             terminal_comment_quotes(&workspace, &terminal, &mut cx),
             vec!["First.".to_string(), "Second.".to_string()],
         );
         assert_eq!(
             terminal_highlighted_lines(&panel, terminal_id, &mut cx),
-            Some(2..=2)
+            Some(1..=1)
         );
 
         cx.simulate_keystrokes("enter");
@@ -15352,6 +15342,11 @@ mod tests {
         assert!(
             terminal_highlighting(&panel, terminal_id, &mut cx),
             "discarding should keep the mode on too"
+        );
+        assert_eq!(
+            terminal_highlighted_lines(&panel, terminal_id, &mut cx),
+            Some(1..=1),
+            "discarding should keep the highlight on the commented line"
         );
     }
 
