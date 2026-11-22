@@ -1799,7 +1799,7 @@ impl ContextMenu {
             end_slot_title,
             end_slot_handler,
             show_end_slot_on_hover,
-            secondary_handler: _,
+            secondary_handler,
         } = entry;
         let this = cx.weak_entity();
         // Report the item's keyboard shortcut to assistive technology, resolving
@@ -1815,6 +1815,7 @@ impl ContextMenu {
         });
 
         let handler = handler.clone();
+        let secondary_handler = secondary_handler.clone();
         let menu = cx.entity().downgrade();
 
         let icon_color = if *disabled {
@@ -2120,7 +2121,12 @@ impl ContextMenu {
                     .on_click({
                         let context = self.action_context.clone();
                         let keep_open_on_confirm = self.keep_open_on_confirm;
-                        move |_, window, cx| {
+                        move |event, window, cx| {
+                            let handler = entry_click_handler(
+                                &handler,
+                                secondary_handler.as_ref(),
+                                event.modifiers().secondary(),
+                            );
                             handler(context.as_ref(), window, cx);
                             menu.update(cx, |menu, cx| {
                                 menu.clicked = true;
@@ -2473,9 +2479,22 @@ impl Render for ContextMenu {
     }
 }
 
+type EntryHandler = Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>;
+
+fn entry_click_handler<'a>(
+    handler: &'a EntryHandler,
+    secondary_handler: Option<&'a EntryHandler>,
+    secondary_click: bool,
+) -> &'a EntryHandler {
+    match secondary_handler {
+        Some(secondary_handler) if secondary_click => secondary_handler,
+        _ => handler,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
 
     use super::*;
 
@@ -2728,5 +2747,57 @@ mod tests {
                 "Should wrap around to first selectable entry"
             );
         });
+    }
+
+    fn click_entry(
+        with_secondary_handler: bool,
+        modifiers: Modifiers,
+        cx: &mut TestAppContext,
+    ) -> Vec<&'static str> {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let window = cx
+            .update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    let calls = calls.clone();
+                    ContextMenu::build(window, cx, move |menu, _, _| {
+                        let entry = ContextMenuEntry::new("Entry").handler({
+                            let calls = calls.clone();
+                            move |_, _| calls.borrow_mut().push("primary")
+                        });
+                        menu.item(if with_secondary_handler {
+                            let calls = calls.clone();
+                            entry
+                                .secondary_handler(move |_, _| calls.borrow_mut().push("secondary"))
+                        } else {
+                            entry
+                        })
+                    })
+                })
+            })
+            .expect("open menu window");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        // Lands on the menu's only entry, the first row below the top padding.
+        cx.simulate_click(point(px(20.), px(14.)), modifiers);
+        cx.run_until_parked();
+        calls.borrow().clone()
+    }
+
+    #[gpui::test]
+    fn secondary_click_routes_to_secondary_handler(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        assert_eq!(click_entry(true, Modifiers::none(), cx), ["primary"]);
+        assert_eq!(
+            click_entry(true, Modifiers::secondary_key(), cx),
+            ["secondary"]
+        );
+        assert_eq!(
+            click_entry(false, Modifiers::secondary_key(), cx),
+            ["primary"]
+        );
     }
 }

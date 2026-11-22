@@ -2378,12 +2378,13 @@ impl AgentPanel {
         );
     }
 
-    /// Appends a tab to the focused side of `member_id`'s terminal thread,
-    /// and activates it once it lands.
+    /// Appends a tab to the focused side of `member_id`'s terminal thread.
+    /// Unless `background` is set, the tab is activated and focused once it lands.
     pub fn new_terminal_in_group(
         &mut self,
         member_id: TerminalId,
         init_command: Option<String>,
+        background: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2413,14 +2414,101 @@ impl AgentPanel {
             None,
             None,
             None,
-            true,
-            true,
+            !background,
+            !background,
             init_command,
             Some(placement),
             source,
             window,
             cx,
         );
+    }
+
+    fn terminal_profile_menu_entry(
+        name: SharedString,
+        init_command: Option<String>,
+        showing_terminal: bool,
+        workspace: WeakEntity<Workspace>,
+    ) -> ContextMenuEntry {
+        ContextMenuEntry::new(name)
+            .when(!showing_terminal, |this| {
+                this.action(Box::new(NewTerminalThread))
+            })
+            .icon(IconName::Terminal)
+            .icon_color(Color::Muted)
+            .handler({
+                let workspace = workspace.clone();
+                let init_command = init_command.clone();
+                move |window, cx| {
+                    Self::start_profile_terminal(
+                        &workspace,
+                        init_command.clone(),
+                        showing_terminal,
+                        false,
+                        window,
+                        cx,
+                    )
+                }
+            })
+            .when(showing_terminal, |this| {
+                this.secondary_handler(move |window, cx| {
+                    Self::start_profile_terminal(
+                        &workspace,
+                        init_command.clone(),
+                        showing_terminal,
+                        true,
+                        window,
+                        cx,
+                    )
+                })
+            })
+    }
+
+    fn start_profile_terminal(
+        workspace: &WeakEntity<Workspace>,
+        init_command: Option<String>,
+        showing_terminal: bool,
+        background: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        if !showing_terminal {
+            workspace.update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.new_terminal_with_init_command(
+                        Some(workspace),
+                        init_command,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    );
+                });
+            });
+            return;
+        }
+        // The workspace isn't held here: adding to a group may read it to
+        // resolve the working directory.
+        panel.update(cx, |panel, cx| {
+            if let Some(member_id) = panel
+                .active_terminal_id()
+                .filter(|id| panel.has_terminal(*id))
+            {
+                panel.new_terminal_in_group(
+                    member_id,
+                    init_command,
+                    background,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            }
+        });
     }
 
     fn next_side_position(&self, group_id: TerminalId, side: TerminalSplitSide, cx: &App) -> i64 {
@@ -8189,54 +8277,31 @@ impl AgentPanel {
                             } else {
                                 Self::main_terminal_profiles(cx)
                             };
-                            let menu = if showing_terminal && !terminal_profiles.is_empty() {
+                            let has_group_profiles = !terminal_profiles.is_empty();
+                            let menu = if showing_terminal && has_group_profiles {
                                 menu.when(crate::agent_threads_enabled(), |menu| menu.separator())
                                     .header("New Terminal in Thread")
                             } else {
                                 menu
                             };
-                            terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
-                                menu.item(
-                                    ContextMenuEntry::new(name)
-                                        .when(!showing_terminal, |this| {
-                                            this.action(Box::new(NewTerminalThread))
-                                        })
-                                        .icon(IconName::Terminal)
-                                        .icon_color(Color::Muted)
-                                        .handler({
-                                            let workspace = workspace.clone();
-                                            move |window, cx| {
-                                                if let Some(workspace) = workspace.upgrade() {
-                                                    workspace.update(cx, |workspace, cx| {
-                                                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                                                            panel.update(cx, |panel, cx| {
-                                                                if !showing_terminal {
-                                                                    panel.new_terminal_with_init_command(
-                                                                        Some(workspace),
-                                                                        init_command.clone(),
-                                                                        AgentThreadSource::AgentPanel,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                } else if let Some(member_id) = panel
-                                                                    .active_terminal_id()
-                                                                    .filter(|id| panel.has_terminal(*id))
-                                                                {
-                                                                    panel.new_terminal_in_group(
-                                                                        member_id,
-                                                                        init_command.clone(),
-                                                                        AgentThreadSource::AgentPanel,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }),
-                                )
+                            let menu = terminal_profiles.into_iter().fold(menu, |menu, (name, init_command)| {
+                                menu.item(Self::terminal_profile_menu_entry(
+                                    name,
+                                    init_command,
+                                    showing_terminal,
+                                    workspace.clone(),
+                                ))
+                            });
+                            menu.when(showing_terminal && has_group_profiles, |menu| {
+                                menu.custom_row(|_, _| {
+                                    let modifier = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+                                    Label::new(format!(
+                                        "{modifier}-click or {modifier}-Enter to start in background"
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .into_any_element()
+                                })
                             })
                         })
                         .map(|mut menu| {
@@ -12879,6 +12944,171 @@ mod tests {
                 vec![(SharedString::from("Terminal"), None)]
             );
             assert_eq!(AgentPanel::group_terminal_profiles(cx), Vec::new());
+        });
+    }
+
+    /// A split thread of three tabs with `terminal_ids[0]` focused on the left.
+    async fn setup_split_thread_for_background_add(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AgentPanel>, VisualTestContext, Vec<TerminalId>) {
+        let (panel, mut cx, terminal_ids) = setup_test_terminal_tabs(cx, 3).await;
+        toggle_test_split(&panel, &mut cx);
+        focus_terminal(&panel, terminal_ids[0], &mut cx);
+        let group_id = terminal_ids[0];
+        assert_eq!(
+            test_side_active(&panel, group_id, TerminalSplitSide::Left, &mut cx),
+            Some(terminal_ids[0])
+        );
+        assert!(test_side_active(&panel, group_id, TerminalSplitSide::Right, &mut cx).is_some());
+        (panel, cx, terminal_ids)
+    }
+
+    fn open_test_spawn_gate(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+        let (release, gate) = futures::channel::oneshot::channel::<()>();
+        release.send(()).expect("gate receiver is alive");
+        panel.update(cx, |panel, _| panel.test_terminal_spawn_gate = Some(gate));
+    }
+
+    fn profile_menu(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) -> Entity<ContextMenu> {
+        let workspace = panel.read_with(cx, |panel, _| panel.workspace.clone());
+        cx.update(|window, cx| {
+            ContextMenu::build(window, cx, |menu, _, _| {
+                menu.item(AgentPanel::terminal_profile_menu_entry(
+                    "Reviewer".into(),
+                    Some("claude --agent reviewer".to_string()),
+                    true,
+                    workspace,
+                ))
+            })
+        })
+    }
+
+    /// Asserts the new tab landed at the end of the left side while the
+    /// previous tabs stay active on both sides and keep focus.
+    fn assert_background_tab_added(
+        panel: &Entity<AgentPanel>,
+        terminal_ids: &[TerminalId],
+        left_before: &[TerminalId],
+        right_active: Option<TerminalId>,
+        added: usize,
+        cx: &mut VisualTestContext,
+    ) {
+        let group_id = terminal_ids[0];
+        let left_tabs = test_side_tabs(panel, group_id, TerminalSplitSide::Left, cx);
+        assert_eq!(left_tabs.len(), left_before.len() + added);
+        assert_eq!(&left_tabs[..left_before.len()], left_before);
+        assert_eq!(
+            test_side_active(panel, group_id, TerminalSplitSide::Left, cx),
+            Some(terminal_ids[0])
+        );
+        assert_eq!(
+            test_side_active(panel, group_id, TerminalSplitSide::Right, cx),
+            right_active
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(terminal_ids[0]));
+            assert!(
+                panel.terminals[&terminal_ids[0]]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "focus must stay on the original tab"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_add_by_secondary_confirm(cx: &mut TestAppContext) {
+        let (panel, mut cx, terminal_ids) = setup_split_thread_for_background_add(cx).await;
+        let group_id = terminal_ids[0];
+        let right_active = test_side_active(&panel, group_id, TerminalSplitSide::Right, &mut cx);
+        let left_before = test_side_tabs(&panel, group_id, TerminalSplitSide::Left, &mut cx);
+
+        for added in 1..=2 {
+            open_test_spawn_gate(&panel, &mut cx);
+            let menu = profile_menu(&panel, &mut cx);
+            menu.update_in(&mut cx, |menu, window, cx| {
+                menu.select_first(&menu::SelectFirst, window, cx);
+                menu.secondary_confirm(&menu::SecondaryConfirm, window, cx);
+            });
+            cx.run_until_parked();
+            assert_background_tab_added(
+                &panel,
+                &terminal_ids,
+                &left_before,
+                right_active,
+                added,
+                &mut cx,
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_background_add_by_secondary_click(cx: &mut TestAppContext) {
+        let (panel, mut cx, terminal_ids) = setup_split_thread_for_background_add(cx).await;
+        let group_id = terminal_ids[0];
+        let right_active = test_side_active(&panel, group_id, TerminalSplitSide::Right, &mut cx);
+        let left_before = test_side_tabs(&panel, group_id, TerminalSplitSide::Left, &mut cx);
+        open_test_spawn_gate(&panel, &mut cx);
+
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.clone());
+        let menu_window = cx.update(|_, cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.item(AgentPanel::terminal_profile_menu_entry(
+                        "Reviewer".into(),
+                        None,
+                        true,
+                        workspace,
+                    ))
+                })
+            })
+        });
+        let menu_window = menu_window.expect("open menu window");
+        let mut menu_cx = VisualTestContext::from_window(menu_window.into(), &mut cx);
+        menu_cx.run_until_parked();
+        // Lands on the menu's only entry, the first row below the top padding.
+        menu_cx.simulate_click(gpui::point(px(20.), px(14.)), Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        assert_background_tab_added(
+            &panel,
+            &terminal_ids,
+            &left_before,
+            right_active,
+            1,
+            &mut cx,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plain_add_activates_and_focuses_new_tab(cx: &mut TestAppContext) {
+        let (panel, mut cx, terminal_ids) = setup_split_thread_for_background_add(cx).await;
+        let group_id = terminal_ids[0];
+        let left_before = test_side_tabs(&panel, group_id, TerminalSplitSide::Left, &mut cx);
+        open_test_spawn_gate(&panel, &mut cx);
+        let menu = profile_menu(&panel, &mut cx);
+        menu.update_in(&mut cx, |menu, window, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        let left_tabs = test_side_tabs(&panel, group_id, TerminalSplitSide::Left, &mut cx);
+        assert_eq!(left_tabs.len(), left_before.len() + 1);
+        let new_id = left_tabs[left_before.len()];
+        assert_eq!(
+            test_side_active(&panel, group_id, TerminalSplitSide::Left, &mut cx),
+            Some(new_id)
+        );
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(panel.active_terminal_id(), Some(new_id));
+            assert!(
+                panel.terminals[&new_id]
+                    .view
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
         });
     }
 
