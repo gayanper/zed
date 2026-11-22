@@ -30,6 +30,13 @@
     },
   },
   {
+    "context": "AgentPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-k z": "agent::ToggleCenteredLayout",
+    },
+  },
+  {
     "context": "!AcpThread > Editor && mode == full",
     "use_key_equivalents": true,
     "bindings": {

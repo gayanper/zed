@@ -56,7 +56,8 @@ use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
     NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
     ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleTerminalSplit,
+    ShowThreadMetadata, ToggleCenteredLayout, ToggleNewThreadMenu, ToggleOptionsMenu,
+    ToggleTerminalSplit,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -444,6 +445,8 @@ struct SerializedAgentPanel {
     last_active_terminal_id: Option<String>,
     #[serde(default)]
     new_draft_thread_id: Option<ThreadId>,
+    #[serde(default)]
+    centered_layout: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -557,6 +560,12 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| {
                             panel.toggle_options_menu(&ToggleOptionsMenu, window, cx);
                         });
+                    }
+                })
+                .register_action(|workspace, _: &ToggleCenteredLayout, _window, cx| {
+                    // Before the panel loads there is no state to toggle; it loads with the workspace.
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.toggle_centered_layout(cx));
                     }
                 })
                 .register_action(|workspace, _: &ToggleNewThreadMenu, window, cx| {
@@ -1351,10 +1360,8 @@ pub struct AgentPanel {
     _terminal_side_focus_subscriptions: Vec<Subscription>,
     /// The divider's ratio while it's dragged, saved when the drag ends.
     terminal_split_drag_ratio: Option<(TerminalId, f32)>,
-    /// Mirrors the workspace's centered layout mode. The panel renders in a cached
-    /// dock, so it re-renders only when this changes, not on every workspace notify.
+    /// Centered layout for terminal threads only, independent of the workspace (editor) flag.
     centered_layout: bool,
-    _workspace_observation: Option<Subscription>,
     /// Group members whose last start failed, which only a retry starts again.
     failed_group_members: HashSet<TerminalId>,
     notification_sequence: u64,
@@ -1461,6 +1468,7 @@ impl AgentPanel {
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
 
+        let centered_layout = self.centered_layout;
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(
@@ -1471,12 +1479,19 @@ impl AgentPanel {
                     last_active_thread,
                     last_active_terminal_id,
                     new_draft_thread_id,
+                    centered_layout,
                 },
                 kvp,
             )
             .await?;
             anyhow::Ok(())
         }));
+    }
+
+    fn toggle_centered_layout(&mut self, cx: &mut Context<Self>) {
+        self.centered_layout = !self.centered_layout;
+        self.serialize(cx);
+        cx.notify();
     }
 
     pub fn load(
@@ -1635,6 +1650,7 @@ impl AgentPanel {
 
                     if let Some(serialized_panel) = &serialized_panel {
                         panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
+                        panel.centered_layout = serialized_panel.centered_layout;
                     } else if let Some(entry_kind) = global_last_created_entry_kind {
                         panel.last_created_entry_kind = entry_kind;
                     }
@@ -1713,17 +1729,7 @@ impl AgentPanel {
         #[cfg(feature = "zed-cloud")]
         let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
-        let centered_layout = workspace.centered_layout;
         let workspace = workspace.weak_handle();
-        let _workspace_observation = workspace.upgrade().map(|workspace| {
-            cx.observe(&workspace, |this, workspace, cx| {
-                let centered_layout = workspace.read(cx).centered_layout;
-                if this.centered_layout != centered_layout {
-                    this.centered_layout = centered_layout;
-                    cx.notify();
-                }
-            })
-        });
         let agent_comment_store = match workspace.upgrade() {
             Some(workspace) => agent_comments::workspace_comment_store(&workspace, cx),
             // Unreachable while the panel is built from a live workspace; a
@@ -1848,8 +1854,7 @@ impl AgentPanel {
             terminal_side_focus_handles,
             _terminal_side_focus_subscriptions: terminal_side_focus_subscriptions,
             terminal_split_drag_ratio: None,
-            centered_layout,
-            _workspace_observation,
+            centered_layout: false,
             failed_group_members: HashSet::default(),
             notification_sequence: 0,
             view_selection_generation: 0,
@@ -10760,6 +10765,121 @@ mod tests {
                 "workspace B should have no active thread when it had no prior conversation"
             );
         });
+    }
+
+    async fn setup_centered_layout_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<AgentPanel>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            TerminalThreadMetadataStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+
+        let cx = VisualTestContext::from_window(multi_workspace.into(), cx).into_mut();
+        cx.simulate_resize(size(px(1200.), px(700.)));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        (workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_toggles_are_independent(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup_centered_layout_test(cx).await;
+
+        cx.dispatch_action(ToggleCenteredLayout);
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.centered_layout));
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.centered_layout));
+
+        cx.dispatch_action(workspace::ToggleCenteredLayout);
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.centered_layout));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.centered_layout));
+
+        cx.dispatch_action(ToggleCenteredLayout);
+        cx.run_until_parked();
+        assert!(!panel.read_with(cx, |panel, _| panel.centered_layout));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.centered_layout));
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_pads_only_terminal_threads(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup_centered_layout_test(cx).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+        cx.dispatch_action(ToggleCenteredLayout);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.activate_new_thread(false, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent_panel_centered_layout_left_padding")
+                .is_none(),
+            "chat threads should stay unpadded"
+        );
+
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent_panel_centered_layout_left_padding")
+                .is_some(),
+            "terminal threads should be padded"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_centered_layout_serialize_round_trip(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup_centered_layout_test(cx).await;
+        cx.dispatch_action(ToggleCenteredLayout);
+        cx.run_until_parked();
+
+        let workspace_id = workspace
+            .read_with(cx, |workspace, _cx| workspace.database_id())
+            .expect("workspace should have a database id");
+        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+        let serialized: SerializedAgentPanel = cx
+            .background_spawn(async move { read_serialized_panel(workspace_id, &kvp) })
+            .await
+            .expect("workspace should serialize panel state");
+        assert!(serialized.centered_layout);
+        drop(panel);
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+        assert!(loaded.read_with(cx, |panel, _| panel.centered_layout));
     }
 
     #[gpui::test]

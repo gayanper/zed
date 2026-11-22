@@ -301,6 +301,8 @@ pub(crate) fn agent_sidebar_side(cx: &App) -> &'static str {
 actions!(
     agent,
     [
+        /// Toggles centered layout for terminal threads in the agent panel.
+        ToggleCenteredLayout,
         /// Toggles the menu to create new agent threads.
         ToggleNewThreadMenu,
         /// Toggles the options menu for agent settings and preferences.

@@ -1636,6 +1636,7 @@ pub struct Workspace {
     _schedule_serialize_ssh_paths: Option<Task<()>>,
     pane_history_timestamp: Arc<AtomicUsize>,
     bounds: Bounds<Pixels>,
+    /// Centered layout for the editor only. The agent panel keeps its own state.
     pub centered_layout: bool,
     bounds_save_task_queued: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
@@ -8597,6 +8598,7 @@ impl Workspace {
             .update(cx, |toast_layer, cx| toast_layer.toggle_toast(cx, entity))
     }
 
+    /// Toggles centered layout for the editor only.
     pub fn toggle_centered_layout(
         &mut self,
         _: &ToggleCenteredLayout,
