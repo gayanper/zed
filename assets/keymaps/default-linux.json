@@ -215,6 +215,20 @@
     },
   },
   {
+    "context": "AgentTerminalLauncher",
+    "bindings": {
+      "1": ["agent::StartTerminalProfile", { "index": 0 }],
+      "2": ["agent::StartTerminalProfile", { "index": 1 }],
+      "3": ["agent::StartTerminalProfile", { "index": 2 }],
+      "4": ["agent::StartTerminalProfile", { "index": 3 }],
+      "5": ["agent::StartTerminalProfile", { "index": 4 }],
+      "6": ["agent::StartTerminalProfile", { "index": 5 }],
+      "7": ["agent::StartTerminalProfile", { "index": 6 }],
+      "8": ["agent::StartTerminalProfile", { "index": 7 }],
+      "9": ["agent::StartTerminalProfile", { "index": 8 }],
+    },
+  },
+  {
     "context": "AgentPanel",
     "bindings": {
       "ctrl-k o": "agent::ToggleTerminalSplit",

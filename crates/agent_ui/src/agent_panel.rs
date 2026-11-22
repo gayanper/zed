@@ -56,8 +56,8 @@ use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
     NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
     ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleCenteredLayout, ToggleNewThreadMenu, ToggleOptionsMenu,
-    ToggleTerminalSplit,
+    ShowThreadMetadata, StartTerminalProfile, ToggleCenteredLayout, ToggleNewThreadMenu,
+    ToggleOptionsMenu, ToggleTerminalSplit,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -99,9 +99,9 @@ use terminal_view::{GutterMarker, ScreenText, TerminalView, scrollback_row};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, Indicator, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, TabBar, TabCloseSide, TabPosition, Tooltip,
-    prelude::*, right_click_menu, utils::WithRemSize,
+    ButtonLike, ContextMenu, ContextMenuEntry, Divider, DividerColor, GradientFade, IconButton,
+    Indicator, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, TabBar,
+    TabCloseSide, TabPosition, Tooltip, prelude::*, right_click_menu, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -1281,6 +1281,12 @@ impl AgentTerminal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct LauncherProfile {
+    name: SharedString,
+    command: String,
+}
+
 enum BaseView {
     Uninitialized,
     AgentThread {
@@ -1364,6 +1370,16 @@ pub struct AgentPanel {
     centered_layout: bool,
     /// Group members whose last start failed, which only a retry starts again.
     failed_group_members: HashSet<TerminalId>,
+    /// Rows of the empty panel's terminal launcher, in tab order.
+    launcher_row_focus_handles: Vec<FocusHandle>,
+    /// The terminal started from a launcher profile, until it lands or fails.
+    launcher_spawn: Option<(TerminalId, LauncherProfile)>,
+    /// The launcher profile whose terminal failed to start.
+    launcher_error: Option<LauncherProfile>,
+    /// Command of the last profile started from the launcher. Closing a
+    /// thread deletes its metadata, so the store alone can't recall it.
+    last_launched_command: Option<String>,
+    _launcher_focus_subscription: Subscription,
     notification_sequence: u64,
     /// Bumped on every view selection, so an async spawn only takes the view when
     /// nothing was selected after it was requested: the user's last click wins.
@@ -1810,8 +1826,22 @@ impl AgentPanel {
 
         let _settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
             this.cleanup_retained_threads(cx);
+            this.launcher_error = None;
             cx.notify();
         });
+
+        let focus_handle = cx.focus_handle();
+        // Focusing the panel itself lands on a launcher row, so the rows'
+        // keys and focus ring work right away.
+        let _launcher_focus_subscription =
+            cx.on_focus(&focus_handle, window, |this, window, cx| {
+                if matches!(this.base_view, BaseView::Uninitialized)
+                    && this.pending_terminal_spawn.is_none()
+                    && this.shows_terminal_launcher(cx)
+                {
+                    this.focus_terminal_launcher(window, cx);
+                }
+            });
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
@@ -1840,7 +1870,7 @@ impl AgentPanel {
             fs: fs.clone(),
             language_registry,
             connection_store,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             context_server_registry,
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
@@ -1856,6 +1886,11 @@ impl AgentPanel {
             terminal_split_drag_ratio: None,
             centered_layout: false,
             failed_group_members: HashSet::default(),
+            launcher_row_focus_handles: Vec::new(),
+            launcher_spawn: None,
+            launcher_error: None,
+            last_launched_command: None,
+            _launcher_focus_subscription,
             notification_sequence: 0,
             view_selection_generation: 0,
             #[cfg(test)]
@@ -2323,6 +2358,9 @@ impl AgentPanel {
             return;
         }
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        if init_command.is_some() {
+            self.last_launched_command = init_command.clone();
+        }
         let working_directory = self.terminal_working_directory(workspace, cx);
         self.spawn_terminal(
             TerminalId::new(),
@@ -2402,6 +2440,185 @@ impl AgentPanel {
                 SharedString::from("Terminal"),
                 Self::default_terminal_init_command(cx),
             )],
+        }
+    }
+
+    /// Main profiles for the empty panel's launcher. Unlike
+    /// `main_terminal_profiles`, a missing or plain-command setting yields no
+    /// profiles rather than a "Terminal" fallback.
+    fn launcher_profiles(cx: &App) -> Vec<LauncherProfile> {
+        match &AgentSettings::get_global(cx).terminal_init_command {
+            Some(TerminalInitCommand::Profiles(profiles)) => profiles
+                .iter()
+                .filter(|profile| {
+                    Self::is_terminal_profile_of_kind(profile, settings::TerminalProfileKind::Main)
+                })
+                .map(|profile| LauncherProfile {
+                    name: SharedString::from(profile.name.clone()),
+                    command: profile.command.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Remote and collab projects keep the native draft as their empty state.
+    fn shows_terminal_launcher(&self, cx: &App) -> bool {
+        self.supports_terminal(cx) && self.project.read(cx).is_local()
+    }
+
+    fn launcher_row_focus_handle(&mut self, row: usize, cx: &mut Context<Self>) -> FocusHandle {
+        while self.launcher_row_focus_handles.len() <= row {
+            let tab_index = self.launcher_row_focus_handles.len() as isize;
+            self.launcher_row_focus_handles
+                .push(cx.focus_handle().tab_index(tab_index).tab_stop(true));
+        }
+        self.launcher_row_focus_handles[row].clone()
+    }
+
+    /// The row of the profile that started this workspace's newest terminal,
+    /// matched by command. Falls back to the first row.
+    fn last_used_launcher_row(&self, profiles: &[LauncherProfile], cx: &App) -> usize {
+        let worktree_paths = self.project.read(cx).worktree_paths(cx);
+        let store = TerminalThreadMetadataStore::try_global(cx);
+        let newest_stored_command = store.as_ref().and_then(|store| {
+            store
+                .read(cx)
+                .entries()
+                .filter(|metadata| metadata.worktree_paths == worktree_paths)
+                .max_by_key(|metadata| metadata.created_at)
+                .and_then(|metadata| metadata.init_command.clone())
+        });
+        self.last_launched_command
+            .clone()
+            .or(newest_stored_command)
+            .and_then(|command| {
+                profiles
+                    .iter()
+                    .position(|profile| profile.command == command)
+            })
+            .unwrap_or(0)
+    }
+
+    fn focus_terminal_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profiles = Self::launcher_profiles(cx);
+        let row = self.last_used_launcher_row(&profiles, cx);
+        let focus_handle = self.launcher_row_focus_handle(row, cx);
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    fn focused_launcher_row(&self, window: &Window) -> Option<usize> {
+        self.launcher_row_focus_handles
+            .iter()
+            .position(|focus_handle| focus_handle.is_focused(window))
+    }
+
+    fn launcher_row_count(cx: &App) -> usize {
+        // Profiles, then "Configure profiles...".
+        Self::launcher_profiles(cx).len() + 1
+    }
+
+    fn select_launcher_row(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let row_count = Self::launcher_row_count(cx) as isize;
+        let row = match self.focused_launcher_row(window) {
+            Some(row) => (row as isize + offset).rem_euclid(row_count) as usize,
+            None => 0,
+        };
+        let focus_handle = self.launcher_row_focus_handle(row, cx);
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    fn confirm_launcher_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.focused_launcher_row(window) else {
+            return;
+        };
+        let profiles = Self::launcher_profiles(cx);
+        match profiles.get(row) {
+            Some(profile) => self.start_launcher_profile(profile.clone(), window, cx),
+            None => Self::open_terminal_profile_settings(window, cx),
+        }
+    }
+
+    fn start_terminal_profile(
+        &mut self,
+        action: &StartTerminalProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolved at dispatch, so a settings change after render can't start
+        // a stale entry.
+        let Some(profile) = Self::launcher_profiles(cx).into_iter().nth(action.index) else {
+            return;
+        };
+        self.start_launcher_profile(profile, window, cx);
+    }
+
+    fn start_launcher_profile(
+        &mut self,
+        profile: LauncherProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The launcher stays up until the terminal lands; a second press
+        // must not start another one.
+        if !self.supports_terminal(cx)
+            || self.launcher_spawn.is_some()
+            || self.pending_terminal_spawn.is_some()
+        {
+            return;
+        }
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        let terminal_id = TerminalId::new();
+        let working_directory = self.terminal_working_directory(None, cx);
+        let init_command = Some(profile.command.clone());
+        self.launcher_spawn = Some((terminal_id, profile));
+        self.spawn_terminal(
+            terminal_id,
+            working_directory,
+            None,
+            None,
+            None,
+            true,
+            true,
+            init_command,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn open_terminal_profile_settings(window: &mut Window, cx: &mut App) {
+        window.dispatch_action(
+            Box::new(zed_actions::OpenSettingsAt {
+                path: "agent.terminal_init_command".to_string(),
+                target: None,
+            }),
+            cx,
+        );
+    }
+
+    /// Closes every tab of the terminal thread, ending their processes, so
+    /// the panel falls back to the launcher.
+    fn back_to_launcher(
+        &mut self,
+        group_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut member_ids = self.loaded_group_member_ids(group_id);
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            for member in store.read(cx).group_members(group_id) {
+                if !member_ids.contains(&member.terminal_id) {
+                    member_ids.push(member.terminal_id);
+                }
+            }
+        }
+        for member_id in member_ids {
+            self.close_terminal_internal(member_id, true, window, cx);
         }
     }
 
@@ -2514,11 +2731,26 @@ impl AgentPanel {
                 Ok(terminal) => terminal,
                 Err(error) => {
                     log::error!("failed to spawn agent panel terminal: {error:#}");
-                    workspace
-                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
-                        .log_err();
+                    let launcher_profile = this
+                        .update(cx, |this, _| {
+                            this.launcher_spawn
+                                .take_if(|(launch_id, _)| *launch_id == terminal_id)
+                                .map(|(_, profile)| profile)
+                        })
+                        .ok()
+                        .flatten();
+                    // The launcher shows its own error row instead of a toast.
+                    if launcher_profile.is_none() {
+                        workspace
+                            .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                            .log_err();
+                    }
                     this.update(cx, |this, cx| {
                         this.pending_terminal_restores.remove(&terminal_id);
+                        if let Some(profile) = launcher_profile {
+                            this.launcher_error = Some(profile);
+                            cx.notify();
+                        }
                         if this.pending_terminal_spawn == Some(terminal_id) {
                             this.pending_terminal_spawn = None;
                             cx.notify();
@@ -2532,6 +2764,13 @@ impl AgentPanel {
                 }
             };
             this.update_in(cx, |this, window, cx| {
+                if let Some((_, profile)) = this
+                    .launcher_spawn
+                    .take_if(|(launch_id, _)| *launch_id == terminal_id)
+                {
+                    this.launcher_error = None;
+                    this.last_launched_command = Some(profile.command);
+                }
                 let terminal_for_init_command = terminal.clone();
                 let terminal_view = cx.new(|cx| {
                     let mut view =
@@ -2998,7 +3237,11 @@ impl AgentPanel {
                 None => {
                     self.base_view = BaseView::Uninitialized;
                     self.refresh_base_view_subscriptions(window, cx);
-                    if activate_draft_after_close {
+                    if self.shows_terminal_launcher(cx) {
+                        if panel_focused {
+                            self.focus_terminal_launcher(window, cx);
+                        }
+                    } else if activate_draft_after_close {
                         self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
                     }
                 }
@@ -5091,8 +5334,14 @@ impl AgentPanel {
 
         if self.active_thread_id(cx) == Some(id) {
             // Activating another view must not retain the thread that was explicitly removed
+            let panel_focused = self.focus_handle.contains_focused(window, cx);
             self.base_view = BaseView::Uninitialized;
-            if activate_draft_after_remove {
+            if self.shows_terminal_launcher(cx) {
+                self.refresh_base_view_subscriptions(window, cx);
+                if panel_focused {
+                    self.focus_terminal_launcher(window, cx);
+                }
+            } else if activate_draft_after_remove {
                 self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
             } else {
                 self.refresh_base_view_subscriptions(window, cx);
@@ -6960,7 +7209,7 @@ impl Panel for AgentPanel {
 impl AgentPanel {
     fn ensure_thread_initialized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.base_view, BaseView::Uninitialized) {
-            if self.pending_terminal_spawn.is_some() {
+            if self.pending_terminal_spawn.is_some() || self.shows_terminal_launcher(cx) {
                 return;
             }
             if self.should_create_terminal_for_new_entry(cx) {
@@ -7665,6 +7914,180 @@ impl AgentPanel {
                     }))
                 }
             })
+    }
+
+    /// Rows mirror the welcome page's section buttons.
+    fn render_terminal_launcher(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let profiles = Self::launcher_profiles(cx);
+        let configure_row = profiles.len();
+        let configure_focus_handle = self.launcher_row_focus_handle(configure_row, cx);
+        let profile_rows = profiles
+            .iter()
+            .enumerate()
+            .map(|(row, profile)| {
+                let focus_handle = self.launcher_row_focus_handle(row, cx);
+                Self::render_launcher_profile_row(row, profile, focus_handle, cx)
+            })
+            .collect::<Vec<_>>();
+
+        let error_row = self.launcher_error.clone().map(|profile| {
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .justify_between()
+                .rounded_sm()
+                .bg(cx.theme().status().error_background)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::XCircle)
+                                .color(Color::Error)
+                                .size(IconSize::Small),
+                        )
+                        .child(
+                            Label::new(format!("Couldn't start \"{}\"", profile.name))
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    Button::new("terminal-launcher-retry", "Retry")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_launcher_profile(profile.clone(), window, cx);
+                        })),
+                )
+        });
+
+        let section_header = |id: &'static str, title: &'static str| {
+            h_flex()
+                .id(id)
+                .role(gpui::Role::Heading)
+                .aria_level(2)
+                .aria_label(title)
+                .px_1()
+                .mb_2()
+                .gap_2()
+                .child(
+                    Label::new(title.to_ascii_uppercase())
+                        .buffer_font(cx)
+                        .color(Color::Muted)
+                        .size(LabelSize::XSmall),
+                )
+                .child(Divider::horizontal().color(DividerColor::BorderVariant))
+        };
+
+        let configure_button = ButtonLike::new("terminal-launcher-configure")
+            .track_focus(&configure_focus_handle)
+            .tab_index(configure_row as isize)
+            .full_width()
+            .size(ButtonSize::Medium)
+            .aria_label("Configure profiles...")
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(Label::new("Configure profiles...")),
+            )
+            .on_click(|_, window, cx| Self::open_terminal_profile_settings(window, cx));
+
+        h_flex()
+            .key_context("AgentTerminalLauncher")
+            .on_action(cx.listener(Self::start_terminal_profile))
+            .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                this.select_launcher_row(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.select_launcher_row(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.confirm_launcher_row(window, cx);
+            }))
+            .size_full()
+            .min_h_0()
+            .justify_center()
+            .child(
+                v_flex()
+                    .id("terminal-launcher-content")
+                    .p_8()
+                    .max_w_128()
+                    .size_full()
+                    .gap_6()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .children(error_row)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .child(section_header(
+                                "terminal-launcher-header",
+                                "Terminal Agents",
+                            ))
+                            .when(profiles.is_empty(), |this| {
+                                this.child(div().px_2().py_1().child(
+                                    Label::new("No terminal agents configured").color(Color::Muted),
+                                ))
+                            })
+                            .children(profile_rows)
+                            .child(configure_button),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_launcher_profile_row(
+        row: usize,
+        profile: &LauncherProfile,
+        focus_handle: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let action = StartTerminalProfile { index: row };
+        let command = (profile.command != profile.name.as_ref()).then(|| profile.command.clone());
+        let tooltip_text = match &command {
+            Some(command) => SharedString::from(format!("{}: {}", profile.name, command)),
+            None => profile.name.clone(),
+        };
+        let key_binding = (row < 9).then(|| {
+            KeyBinding::for_action_in(&action, &focus_handle, cx).size(rems_from_px(12_f32))
+        });
+
+        ButtonLike::new(("terminal-launcher-profile", row))
+            .track_focus(&focus_handle)
+            .tab_index(row as isize)
+            .full_width()
+            .size(ButtonSize::Medium)
+            .aria_label(tooltip_text.clone())
+            .tooltip(Tooltip::text(tooltip_text))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::Terminal)
+                                    .color(Color::Muted)
+                                    .size(IconSize::Small),
+                            )
+                            .child(Label::new(profile.name.clone()).truncate()),
+                    )
+                    .children(key_binding),
+            )
+            .on_click(move |_, window, cx| focus_handle.dispatch_action(&action, window, cx))
+            .into_any_element()
     }
 
     fn render_no_project_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8443,6 +8866,7 @@ impl AgentPanel {
 
         let panel = cx.weak_entity();
         let can_rename = state == TerminalTabState::Loaded;
+        let shows_terminal_launcher = self.shows_terminal_launcher(cx);
         right_click_menu(SharedString::from(format!(
             "agent-terminal-tab-menu-{id_suffix}"
         )))
@@ -8460,12 +8884,28 @@ impl AgentPanel {
                             .log_err();
                     })
                 })
-                .entry("Close", None, move |window, cx| {
-                    panel
-                        .update(cx, |panel, cx| {
-                            panel.close_terminal(terminal_id, window, cx)
+                .entry("Close", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.close_terminal(terminal_id, window, cx)
+                            })
+                            .log_err();
+                    }
+                })
+                .when(shows_terminal_launcher, |menu| {
+                    let panel = panel.clone();
+                    menu.separator()
+                        .entry("Back to launcher", None, move |window, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    if let Some((group_id, _)) = panel.tab_side(terminal_id, cx) {
+                                        panel.back_to_launcher(group_id, window, cx);
+                                    }
+                                })
+                                .log_err();
                         })
-                        .log_err();
                 })
             })
         })
@@ -9674,6 +10114,9 @@ impl Render for AgentPanel {
         // - Font size works as expected and can be changed with cmd-+/cmd-
         // - Scrolling in all views works as expected
         // - Files can be dropped into the panel
+        let terminal_launcher = (matches!(self.base_view, BaseView::Uninitialized)
+            && self.shows_terminal_launcher(cx))
+        .then(|| self.render_terminal_launcher(cx));
         let content = v_flex()
             .key_context(self.key_context())
             .relative()
@@ -9735,7 +10178,7 @@ impl Render for AgentPanel {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
                     parent.child(self.render_no_project_state(cx))
                 }
-                VisibleSurface::Uninitialized => parent,
+                VisibleSurface::Uninitialized => parent.children(terminal_launcher),
                 VisibleSurface::AgentThread(conversation_view) => parent
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
@@ -11067,7 +11510,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_repeated_activation_only_creates_one_initial_terminal(cx: &mut TestAppContext) {
+    async fn test_activation_shows_launcher_without_creating_threads(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -11080,15 +11523,16 @@ mod tests {
         }
 
         panel.read_with(&cx, |panel, cx| {
-            assert_eq!(
-                panel.terminals(cx).len(),
-                1,
-                "repeated activation should only enqueue one initial terminal"
+            assert!(
+                panel.terminals(cx).is_empty(),
+                "no terminal is auto-spawned"
             );
             assert!(
-                panel.active_terminal_id().is_some(),
-                "the single initial terminal should become active"
+                panel.active_conversation_view().is_none(),
+                "no native draft is auto-created"
             );
+            assert!(matches!(panel.base_view, BaseView::Uninitialized));
+            assert!(panel.shows_terminal_launcher(cx));
         });
     }
 
@@ -12792,12 +13236,12 @@ mod tests {
 
         loaded.read_with(cx, |panel, cx| {
             assert!(
-                panel.active_terminal_id().is_some(),
-                "new workspace should initialize to a terminal when terminal was the globally last used entry kind"
+                panel.active_terminal_id().is_none(),
+                "new workspace should show the launcher rather than spawn a terminal"
             );
             assert!(
                 panel.active_conversation_view().is_none(),
-                "new workspace should not initialize to a draft when terminal is the global entry kind"
+                "new workspace should not initialize to a draft"
             );
             assert!(panel.should_create_terminal_for_new_entry(cx));
         });
@@ -16159,6 +16603,302 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    fn set_terminal_init_command(command: Option<TerminalInitCommand>, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = command;
+            AgentSettings::override_global(settings, cx);
+        });
+    }
+
+    fn launcher_test_profiles() -> TerminalInitCommand {
+        TerminalInitCommand::Profiles(vec![
+            settings::TerminalInitCommandProfile {
+                name: "Claude".to_string(),
+                command: "claude".to_string(),
+                kind: settings::TerminalProfileKind::Main,
+            },
+            settings::TerminalInitCommandProfile {
+                name: "Reviewer".to_string(),
+                command: "claude --agent reviewer".to_string(),
+                kind: settings::TerminalProfileKind::Sub,
+            },
+            settings::TerminalInitCommandProfile {
+                name: "Codex".to_string(),
+                command: "codex".to_string(),
+                kind: settings::TerminalProfileKind::Main,
+            },
+        ])
+    }
+
+    /// Makes the next spawn build a display-only terminal instead of a real
+    /// shell, so the test stays deterministic.
+    fn gate_next_terminal_spawn(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+        let (release, gate) = futures::channel::oneshot::channel();
+        release.send(()).ok();
+        panel.update(cx, |panel, _| panel.test_terminal_spawn_gate = Some(gate));
+    }
+
+    fn launched_init_commands(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> Vec<String> {
+        panel.read_with(cx, |panel, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            panel
+                .terminals(cx)
+                .iter()
+                .filter_map(|terminal| store.entry(terminal.id)?.init_command.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_launcher_shows_on_first_open(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(matches!(panel.base_view, BaseView::Uninitialized));
+            assert!(panel.terminals(cx).is_empty());
+            assert!(panel.active_conversation_view().is_none());
+            assert_eq!(
+                AgentPanel::launcher_profiles(cx)
+                    .into_iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>(),
+                vec![SharedString::from("Claude"), SharedString::from("Codex")]
+            );
+        });
+        panel.update_in(&mut cx, |panel, window, _| {
+            assert_eq!(panel.focused_launcher_row(window), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_launcher_click_starts_profile(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.run_until_parked();
+
+        // Space clicks the focused row, the same handler a mouse click runs.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            let focus_handle = panel.launcher_row_focus_handle(1, cx);
+            window.focus(&focus_handle, cx);
+        });
+        gate_next_terminal_spawn(&panel, &mut cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").expect("valid keystroke"),
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            launched_init_commands(&panel, &cx),
+            vec!["codex".to_string()]
+        );
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.active_terminal_id().is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_launcher_number_key_starts_profile(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "2",
+                StartTerminalProfile { index: 1 },
+                Some("AgentTerminalLauncher"),
+            )]);
+        });
+        cx.run_until_parked();
+
+        gate_next_terminal_spawn(&panel, &mut cx);
+        cx.simulate_keystrokes("2");
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            launched_init_commands(&panel, &cx),
+            vec!["codex".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_launcher_focuses_last_used_profile(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.run_until_parked();
+
+        gate_next_terminal_spawn(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_terminal_profile(&StartTerminalProfile { index: 1 }, window, cx);
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let terminal_id = panel
+            .read_with(&cx, |panel, _| panel.active_terminal_id())
+            .expect("profile should start a terminal");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, _| {
+            assert!(matches!(panel.base_view, BaseView::Uninitialized));
+            assert_eq!(panel.focused_launcher_row(window), Some(1));
+        });
+
+        // An edited command no longer matches, so focus falls back to the first row.
+        set_terminal_init_command(
+            Some(TerminalInitCommand::Profiles(vec![
+                settings::TerminalInitCommandProfile {
+                    name: "Claude".to_string(),
+                    command: "claude".to_string(),
+                    kind: settings::TerminalProfileKind::Main,
+                },
+                settings::TerminalInitCommandProfile {
+                    name: "Codex".to_string(),
+                    command: "codex --full-auto".to_string(),
+                    kind: settings::TerminalProfileKind::Main,
+                },
+            ])),
+            &mut cx,
+        );
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.focus_terminal_launcher(window, cx);
+            assert_eq!(panel.focused_launcher_row(window), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_launcher_arrow_keys_wrap_through_rows(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("down", menu::SelectNext, None),
+                gpui::KeyBinding::new("up", menu::SelectPrevious, None),
+            ]);
+        });
+        cx.run_until_parked();
+
+        // Two profiles, then "Configure profiles...".
+        for (keys, row) in [("down", 1), ("down", 2), ("down", 0), ("up", 2)] {
+            cx.simulate_keystrokes(keys);
+            panel.update_in(&mut cx, |panel, window, _| {
+                assert_eq!(
+                    panel.focused_launcher_row(window),
+                    Some(row),
+                    "after {keys}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_closing_last_terminal_returns_to_launcher(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.run_until_parked();
+
+        gate_next_terminal_spawn(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_terminal_profile(&StartTerminalProfile { index: 0 }, window, cx);
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let terminal_id = panel
+            .read_with(&cx, |panel, _| panel.active_terminal_id())
+            .expect("profile should start a terminal");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(matches!(panel.base_view, BaseView::Uninitialized));
+            assert!(panel.terminals(cx).is_empty());
+            assert!(panel.active_conversation_view().is_none());
+            assert_eq!(panel.focused_launcher_row(window), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_back_to_launcher_closes_terminal_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        set_terminal_init_command(Some(launcher_test_profiles()), &mut cx);
+        cx.run_until_parked();
+
+        gate_next_terminal_spawn(&panel, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_terminal_profile(&StartTerminalProfile { index: 0 }, window, cx);
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let terminal_id = panel
+            .read_with(&cx, |panel, _| panel.active_terminal_id())
+            .expect("profile should start a terminal");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.back_to_launcher(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(matches!(panel.base_view, BaseView::Uninitialized));
+            assert!(panel.terminals(cx).is_empty());
+            assert!(panel.active_conversation_view().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_launcher_without_main_profiles(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+
+        let no_profile_settings = [
+            None,
+            Some(TerminalInitCommand::Command("claude".to_string())),
+            Some(TerminalInitCommand::Profiles(vec![
+                settings::TerminalInitCommandProfile {
+                    name: "Reviewer".to_string(),
+                    command: "claude --agent reviewer".to_string(),
+                    kind: settings::TerminalProfileKind::Sub,
+                },
+            ])),
+        ];
+        for command in no_profile_settings {
+            set_terminal_init_command(command.clone(), &mut cx);
+            cx.run_until_parked();
+            panel.update_in(&mut cx, |panel, window, cx| {
+                assert!(
+                    AgentPanel::launcher_profiles(cx).is_empty(),
+                    "{command:?} should list no profiles"
+                );
+                // Only the "Configure profiles..." row remains.
+                assert_eq!(AgentPanel::launcher_row_count(cx), 1);
+                panel.focus_terminal_launcher(window, cx);
+                assert_eq!(panel.focused_launcher_row(window), Some(0));
+            });
+            cx.simulate_keystrokes("down");
+            panel.update_in(&mut cx, |panel, window, _| {
+                assert_eq!(panel.focused_launcher_row(window), Some(0));
+            });
+        }
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.terminals(cx).is_empty());
+        });
     }
 
     async fn setup_visible_panel(

@@ -431,6 +431,16 @@ actions!(
     ]
 );
 
+/// Starts the terminal agent profile at this position in the empty agent
+/// panel's launcher.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct StartTerminalProfile {
+    /// Zero-based position among the Main terminal profiles.
+    pub index: usize,
+}
+
 /// Action to authorize a tool call with a specific permission option.
 /// This is used by the permission granularity dropdown to authorize tool calls.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]

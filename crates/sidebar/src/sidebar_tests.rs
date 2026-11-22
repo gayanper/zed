@@ -2325,18 +2325,17 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     panel.read_with(cx, |panel, cx| {
         assert!(!panel.has_terminal(terminal_id));
         assert!(
-            panel.active_view_is_new_draft(cx),
-            "closing the active terminal should leave the panel on its empty draft"
+            !panel.active_view_is_new_draft(cx),
+            "closing the active terminal should leave the panel on its launcher, not a draft"
         );
+        assert!(panel.active_terminal_id().is_none());
     });
-    // Closing the terminal drops the user back onto the panel's empty
-    // draft. The sidebar mirrors that with a "New {agent} Thread"
-    // placeholder row, so the header reports having threads.
+    // The launcher is not a thread, so the header is empty again.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  New Zed Agent Thread"]
+        vec!["v [my-project]"]
     );
-    assert_project_header_has_threads(&sidebar, "my-project", true, cx);
+    assert_project_header_has_threads(&sidebar, "my-project", false, cx);
 
     let project_group_key = multi_workspace.read_with(cx, |multi_workspace, cx| {
         multi_workspace.workspace().read(cx).project_group_key(cx)
@@ -2346,13 +2345,11 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     });
     cx.run_until_parked();
 
-    // Collapsed: header hides children but still reports the placeholder
-    // as a thread present in the group.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec!["> [my-project]"]
     );
-    assert_project_header_has_threads(&sidebar, "my-project", true, cx);
+    assert_project_header_has_threads(&sidebar, "my-project", false, cx);
 }
 
 #[gpui::test]
