@@ -220,6 +220,8 @@ pub fn deploy_context_menu(
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
         let format_selections = window.is_action_available(&FormatSelections, cx);
+        let toggle_comment =
+            window.is_action_available(&zed_actions::agent_comments::ToggleComment, cx);
         let disable_ai = DisableAiSettings::is_ai_disabled_for_buffer(
             editor.buffer.read(cx).as_singleton().as_ref(),
             cx,
@@ -293,6 +295,12 @@ pub fn deploy_context_menu(
                 )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                })
+                .when(!disable_ai && toggle_comment, |this| {
+                    this.action(
+                        "Comment for Agent",
+                        Box::new(zed_actions::agent_comments::ToggleComment),
+                    )
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

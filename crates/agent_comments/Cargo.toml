@@ -35,6 +35,7 @@ language = { workspace = true, features = ["test-support"] }
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 fs.workspace = true
+menu.workspace = true
 project = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 util = { workspace = true, features = ["test-support"] }

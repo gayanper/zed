@@ -382,6 +382,7 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "menu",
  "multi_buffer",
  "project",
  "serde_json",

@@ -112,31 +112,19 @@ Each terminal thread keeps its split view, active tabs, divider position and foc
 
 Comments for the agent quote text from a terminal thread, and are added to the prompt with {#action agent_comments::InsertPendingComments}. A bar in the gutter marks the commented lines.
 
-To comment on a list item, a question, or a line, pick it:
+To comment on lines, highlight them in comment mode:
 
-1. Press {#kb agent_comments::CommentTerminalSelection} in the terminal, or click the comment button in the terminal's header. A border and a hint show while picking. The hint says Edit Comment when the picked block already has a comment.
-2. The pick starts at the vi cursor in vi mode, else under the pointer, else at the last block on screen. Hover over a block, or press {#kb agent_comments::SelectPreviousTerminalCommentTarget} and {#kb agent_comments::SelectNextTerminalCommentTarget} (or `k` and `j`), to move it.
-3. Click the block, or press {#kb agent_comments::ConfirmTerminalCommentTarget}, to write a comment on it. The pick ends then. Shift-click, or {#kb agent_comments::ConfirmTerminalCommentTargetAndContinue}, keeps picking once the comment is closed, for commenting on several blocks in a row.
+1. Press {#kb agent_comments::ToggleComment} in the terminal to start on the last line with text. You can also click or drag in the gutter left of the text, or choose Comment for Agent from the right-click menu to start on the clicked line. Hovering the gutter shows a glyph whose tooltip names the key. While the mode is on, the terminal has an accent border and a Commenting label at the top right, whose tooltip lists the keys.
+2. A highlight covers whole lines; a line the terminal wrapped counts as one. {#kb terminal::MoveLineHighlightUp} and {#kb terminal::MoveLineHighlightDown} (or `k` and `j`) move it as one line. {#kb terminal::MoveLineHighlightEndUp} and {#kb terminal::MoveLineHighlightEndDown} (or `K` and `J`) move its active end, and {#kb terminal::MoveLineHighlightFarEndUp} and {#kb terminal::MoveLineHighlightFarEndDown} move the other end. {#kb terminal::ExtendLineHighlightByWord} extends the end word by word into the next line, and {#kb terminal::TrimLineHighlightByWord} trims words off it. With the mouse, click a line, drag over lines, Shift-click to extend, or drag the top or bottom edge.
+3. Press {#kb terminal::ConfirmLineHighlight} or {#kb agent_comments::ToggleComment} to write a comment on the highlight. The quote leaves out agent decorations such as `⏺` and box borders. Once the comment is added or discarded, the mode carries on with the line after the commented ones highlighted.
 
-{#kb agent_comments::CancelTerminalCommentPick}, any other key, including shortcuts such as `ctrl-c`, or moving focus away ends the pick, and the key goes to the terminal as usual. A block that scrolls off screen can't be commented on until it's back in view. Nothing is highlighted outside a pick, and while picking clicks and pointer moves stay in Zed instead of going to the program.
+{#kb terminal::ExitLineHighlight}, any other key, or moving focus away ends the mode, and any other key goes to the terminal as usual. While the mode is on, clicks and drags stay in Zed instead of going to the program; the gutter never goes to the program. After a resize, the highlight is found again by its text, or moves to the last line when its text is gone. Clicking a bar in the gutter opens the comments on its lines.
 
-Selecting text stays for copying. To comment on a selection, press {#kb agent_comments::CommentTerminalSelection} with the text selected, or choose Comment for Agent from the right-click menu.
+Selecting text stays for copying. To comment on a selection, press {#kb agent_comments::ToggleComment} with the text selected; the comment covers the selected lines whole. A selection or highlight touching one comment opens that comment for editing; touching several lists them by their first line, to choose the one to edit. Pressing it again closes an empty comment input; an input with text stays open.
 
-Blocks follow common list markers, and the numbered questions agent skills ask, such as `Q1 - Title` and `Question 2:`. To recognize other formats, set `agent.terminal_comment_patterns` to a list of regexes, tried in order:
+`agent_comments::ToggleComment` is the same action that comments in editors. It's bound to `ctrl-alt-m` on macOS and `alt-shift-m` on Linux and Windows. While the agent shows an interactive prompt, such as a menu to choose from, it shows a message asking you to finish the prompt first.
 
-```json [settings]
-{
-  "agent": {
-    "terminal_comment_patterns": [
-      { "start": "^(⏺\\s+)?(❓\\s*)?(\\*\\*)?Q\\d+(\\*\\*)?\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
-      { "start": "^(⏺\\s+)?(\\*\\*)?Question\\s+\\d+\\s*[-–—:.)]", "end": "^[─━-]{3,}$" },
-      { "start": "^### \\d+\\.", "case_sensitive": false }
-    ]
-  }
-}
-```
-
-A block starts at a line matching `start` and ends before a line matching `end`, the next block, a less indented line, or an agent message. Setting the list replaces the defaults, so keep the first two entries to keep recognizing skill questions. Invalid patterns are skipped and reported in a notification.
+> **Note:** `agent_comments::ToggleComment` replaces `agent_comments::CommentTerminalSelection`. If your keymap binds the old name, bind `agent_comments::ToggleComment` instead.
 
 ## CLI/TUI Setup Notes {#cli-setup}
 

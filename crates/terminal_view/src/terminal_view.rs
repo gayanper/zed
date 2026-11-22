@@ -33,7 +33,7 @@ use std::{
 };
 use task::TaskId;
 use terminal::{
-    Clear, Content, Copy, Event, GridRow, HoveredWord, MaybeNavigationTarget, Modes,
+    Clear, Content, Copy, Event, HoveredWord, IndexedCell, MaybeNavigationTarget, Modes,
     MouseInputMode, Paste, PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown,
     ScrollPageUp, ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus,
     Terminal, TerminalBounds, ToggleViMode,
@@ -48,7 +48,6 @@ use ui::{
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
-use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
@@ -80,501 +79,103 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 pub(crate) type GutterMarkers = Rc<dyn Fn(&Content, &App) -> Vec<GutterMarker>>;
 
 pub(crate) type SelectionActionHandler =
-    Rc<dyn Fn(Range, String, Option<PickedTextKind>, GpuiPoint<Pixels>, &mut Window, &mut App)>;
-
-/// What a pick that runs the selection action took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PickedTextKind {
-    pub level: TextBlockLevel,
-    /// Whether texts picked to act on together were joined.
-    pub combined: bool,
-}
+    Rc<dyn Fn(Range, GpuiPoint<Pixels>, &mut Window, &mut App)>;
 
 #[derive(Clone)]
 pub(crate) struct SelectionAction {
     pub(crate) label: SharedString,
-    /// Receives the level of a picked text block, or none for a selection.
+    /// What the line highlight mode is called in the label it shows.
+    pub(crate) mode_label: SharedString,
     pub(crate) handler: SelectionActionHandler,
+    /// When set, the context menu entry dispatches this action instead of
+    /// running `handler`, so it shows the action's key binding.
+    pub(crate) menu_action: Option<SelectionMenuAction>,
 }
 
-/// A block of text in the grid that can be picked for the selection action.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TextBlock {
-    /// Grid lines, top to bottom, each with the columns its text spans.
-    pub rows: Vec<(i32, RangeInclusive<usize>)>,
-    /// The text the block's action receives, which may reach past `rows`.
-    pub text: String,
-    /// Replaces the selection action's label in the pick's hint, for
-    /// example when the action on this block differs.
-    pub label: Option<SharedString>,
-    /// Runs of grid lines that are one paragraph each, whatever their rows
-    /// look like, such as a question with its options.
-    pub paragraphs: Vec<RangeInclusive<i32>>,
+#[derive(Clone)]
+pub(crate) struct SelectionMenuAction {
+    pub(crate) action: Rc<dyn Action>,
+    /// Whether the entry shows for the terminal's current content.
+    is_available: Rc<dyn Fn(&Content) -> bool>,
 }
 
-impl TextBlock {
-    fn lines(&self) -> Option<RangeInclusive<i32>> {
-        Some(self.rows.first()?.0..=self.rows.last()?.0)
-    }
-
-    pub fn range(&self) -> Option<Range> {
-        let (first_line, first_columns) = self.rows.first()?;
-        let (last_line, last_columns) = self.rows.last()?;
-        Some(Range::new(
-            Point::new(*first_line, *first_columns.start()),
-            Point::new(*last_line, *last_columns.end()),
-        ))
-    }
+/// Box borders aren't part of the text they surround.
+pub fn is_box_drawing(character: char) -> bool {
+    ('\u{2500}'..='\u{257F}').contains(&character)
 }
 
-fn unit_start(unit: &TextBlock) -> Point {
-    unit.rows
-        .first()
-        .map_or(Point::new(0, 0), |(line, columns)| {
-            Point::new(*line, *columns.start())
-        })
+/// Characters that finding text again skips: whitespace and box borders
+/// change when a TUI redraws or the terminal resizes, and an ellipsis marks a
+/// truncated quote.
+pub fn is_ignored_by_anchor(character: char) -> bool {
+    character.is_whitespace() || is_box_drawing(character) || character == '…'
 }
 
-/// The text of `rows`, where a row the program wrapped is joined to the next
-/// with a space.
-fn joined_rows_text(
-    terminal: &Terminal,
-    rows: &[(i32, RangeInclusive<usize>)],
-    grid_rows: &[terminal::GridRow],
-) -> String {
-    let mut text = String::new();
-    for ((line, _), row_text) in rows.iter().zip(terminal.rows_text(rows)) {
-        // A row the program wrapped ends at a space it left out.
-        let terminal_wrapped = grid_rows
-            .iter()
-            .any(|row| row.line + 1 == *line && row.wraps);
-        if !text.is_empty() && !terminal_wrapped {
-            text.truncate(text.trim_end().len());
-            text.push(' ');
-            text.push_str(row_text.trim_start());
-        } else {
-            text.push_str(&row_text);
-        }
-    }
-    text
+/// The scrollback row of a grid line, which keeps its number as output
+/// scrolls it up.
+pub fn scrollback_row(content: &Content, line: i32) -> i64 {
+    content.total_lines as i64 - content.screen_lines as i64 + i64::from(line)
 }
 
-fn unit_contains(unit: &TextBlock, point: Point) -> bool {
-    unit.rows
-        .iter()
-        .any(|(line, columns)| *line == point.line && columns.contains(&point.column))
+/// The terminal's text without the characters that [`is_ignored_by_anchor`]
+/// skips, with the grid point of each byte. Text is found in it again after
+/// a resize rewrapped it or a TUI redrew it with other padding.
+pub struct ScreenText {
+    text: String,
+    byte_points: Vec<Point>,
 }
 
-/// Whether text starts with a list marker followed by a space: a bullet,
-/// an agent's message or answer marker, or a number or letter followed by
-/// `.` or `)`.
-pub fn starts_with_list_marker(text: &[char]) -> bool {
-    const BULLETS: &[char] = &['-', '*', '•', '◦', '▪', '●', '⏺', '⎿', '>', '❯'];
-    let followed_by_space =
-        |index: usize| text.get(index).is_some_and(|character| *character == ' ');
-    let Some(first) = text.first() else {
-        return false;
-    };
-    if BULLETS.contains(first) {
-        return followed_by_space(1);
-    }
-    let digits = text
-        .iter()
-        .take_while(|character| character.is_ascii_digit())
-        .count();
-    let label_length = if (1..=3).contains(&digits) {
-        digits
-    } else if first.is_ascii_alphabetic() {
-        1
-    } else {
-        return false;
-    };
-    text.get(label_length)
-        .is_some_and(|character| *character == '.' || *character == ')')
-        && followed_by_space(label_length + 1)
-}
-
-/// The columns and characters of a row's text, without whitespace and the
-/// cells that pad wide characters.
-fn row_text_columns(row: &GridRow, columns: &RangeInclusive<usize>) -> Vec<(usize, char)> {
-    columns
-        .clone()
-        .filter_map(|column| Some((column, *row.characters.get(column)?)))
-        .filter(|(column, character)| {
-            !character.is_whitespace() && !row.wide_char_spacers.contains(column)
-        })
-        .collect()
-}
-
-/// The column a paragraph's rows line up at: its first text, or the text
-/// after the list marker it starts with.
-fn paragraph_text_indent(row: &GridRow, columns: &RangeInclusive<usize>) -> Option<usize> {
-    let text = row_text_columns(row, columns);
-    let (first_column, _) = text.first()?;
-    let characters = row.characters.get(*first_column..=*columns.end())?.to_vec();
-    if !starts_with_list_marker(&characters) {
-        return Some(*first_column);
-    }
-    // The marker is the first word, and the text after it starts at the
-    // next one.
-    let after_marker = text
-        .windows(2)
-        .find(|pair| pair[1].0 != pair[0].0 + 1)
-        .map(|pair| pair[1].0);
-    Some(after_marker.unwrap_or(*first_column))
-}
-
-/// A row of a block with its text, worked out once for all the checks on it.
-struct BlockRow<'a> {
-    grid_row: &'a GridRow,
-    columns: &'a RangeInclusive<usize>,
-    text: Vec<(usize, char)>,
-    /// The column after the row's text, past the cell that pads a wide
-    /// character it ends in. A row the terminal wrapped reaches the end of
-    /// its columns, which shows the program doesn't wrap it at a width of
-    /// its own.
-    end: usize,
-}
-
-impl BlockRow<'_> {
-    fn first_column(&self) -> Option<usize> {
-        self.text.first().map(|(column, _)| *column)
-    }
-}
-
-/// The column after a wide character's padding cell, else after the column.
-fn cell_end(row: &GridRow, column: usize) -> usize {
-    if row.wide_char_spacers.contains(&(column + 1)) {
-        column + 2
-    } else {
-        column + 1
-    }
-}
-
-/// The rows of each paragraph in a block's `rows`. A paragraph runs over
-/// rows the terminal wrapped, the lines of the block's `paragraphs`, and
-/// rows that look like the program wrapped prose (see
-/// [`continues_paragraph`]). Any other line break ends a paragraph, since
-/// terminal output is mostly lines that stand on their own.
-fn paragraph_rows(
-    block: &TextBlock,
-    grid_rows: &[GridRow],
-) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
-    let rows = block
-        .rows
-        .iter()
-        .filter_map(|(line, columns)| {
-            let grid_row = grid_rows.iter().find(|row| row.line == *line)?;
-            let text = row_text_columns(grid_row, columns);
-            let end = if grid_row.wraps {
-                columns.end() + 1
-            } else {
-                text.last()
-                    .map_or(0, |(last_column, _)| cell_end(grid_row, *last_column))
-            };
-            Some(BlockRow {
-                grid_row,
-                columns,
-                text,
-                end,
-            })
-        })
-        .collect::<Vec<_>>();
-    let group_of = |line: i32| {
-        block
-            .paragraphs
-            .iter()
-            .position(|group| group.contains(&line))
-    };
-    let mut paragraphs: Vec<Vec<(i32, RangeInclusive<usize>)>> = Vec::new();
-    let mut paragraph_start = 0;
-    let mut text_indent = None;
-    for (index, row) in rows.iter().enumerate() {
-        let continues = index.checked_sub(1).is_some_and(|previous_index| {
-            let previous = &rows[previous_index];
-            if previous.grid_row.line.saturating_add(1) != row.grid_row.line {
-                return false;
-            }
-            match (group_of(previous.grid_row.line), group_of(row.grid_row.line)) {
-                (Some(previous_group), Some(group)) => previous_group == group,
-                (None, None) => {
-                    previous.grid_row.wraps
-                        || text_indent.is_some_and(|text_indent| {
-                            continues_paragraph(
-                                &rows,
-                                paragraph_start,
-                                previous_index,
-                                text_indent,
-                            )
-                        })
+impl ScreenText {
+    pub fn new(cells: &[IndexedCell]) -> Self {
+        let mut text = String::new();
+        let mut byte_points = Vec::new();
+        for cell in cells {
+            // Selected text includes a cell's zero-width characters, such as
+            // the U+FE0F in "➡️", so they must be here for text to match.
+            let characters = std::iter::once(cell.character())
+                .chain(cell.zerowidth().into_iter().flatten().copied());
+            for character in characters {
+                if !is_ignored_by_anchor(character) {
+                    text.push(character);
+                    byte_points.extend(std::iter::repeat_n(cell.point, character.len_utf8()));
                 }
-                _ => false,
-            }
-        });
-        let row_lines = (row.grid_row.line, row.columns.clone());
-        match paragraphs.last_mut() {
-            Some(paragraph) if continues => paragraph.push(row_lines),
-            _ => {
-                paragraphs.push(vec![row_lines]);
-                paragraph_start = index;
-                text_indent = paragraph_text_indent(row.grid_row, row.columns);
             }
         }
+        Self { text, byte_points }
     }
-    paragraphs
-}
 
-/// Whether a line break looks like a program wrapping prose to fit the
-/// terminal, as agent TUIs do, rather than ending a line of a log or of
-/// code. The terminal can't tell them apart, so this guesses: the row
-/// reaches well across the terminal, counting the next word when more text
-/// follows it on its row, and ends in a word or punctuation of prose, and the
-/// next row carries on at the paragraph's indent with a word that wouldn't
-/// have fit on the row. Rows of code, listings and logs rarely look like
-/// that.
-///
-/// `rows[index]` is the row before the break, in the paragraph that starts
-/// at `rows[paragraph_start]`.
-fn continues_paragraph(
-    rows: &[BlockRow],
-    paragraph_start: usize,
-    index: usize,
-    text_indent: usize,
-) -> bool {
-    let (Some(row), Some(next_row)) = (rows.get(index), rows.get(index + 1)) else {
-        return false;
-    };
-    let (text, next_text) = (&row.text, &next_row.text);
-    let Some(last_column) = text.last().map(|(column, _)| *column) else {
-        return false;
-    };
-    // A Markdown heading stands on its own line.
-    if text.first().is_some_and(|(_, character)| *character == '#') {
-        return false;
-    }
-    let Some(next_first_column) = next_row.first_column() else {
-        return false;
-    };
-    // Closing quotes and brackets after the last word don't matter.
-    let last_character = text
-        .iter()
-        .rev()
-        .map(|(_, character)| *character)
-        .find(|character| !matches!(character, ')' | ']' | '"' | '\'' | '”' | '’' | '`'));
-    let ends_in_number = last_character.is_some_and(|character| character.is_ascii_digit());
-    let ends_in_prose = last_character.is_some_and(|character| {
-        character.is_alphabetic()
-            || character.is_ascii_digit()
-            || matches!(character, ',' | '.' | '?' | '!' | ':' | '*' | '/')
-            // Code lines end in ";" and prose rarely does. With a single row,
-            // the fit check only compares the row with itself, so it can't
-            // keep lines of code apart.
-            || (character == ';' && index > paragraph_start)
-    });
-    // A wide character's padding cell doesn't end a word.
-    let word_length = next_text
-        .windows(2)
-        .position(|pair| pair[1].0 != cell_end(next_row.grid_row, pair[0].0))
-        .map_or(next_text.len(), |index| index + 1);
-    let next_word = next_text[..word_length]
-        .iter()
-        .map(|(_, character)| *character)
-        .collect::<String>();
-    // A label such as "warning:" starts a line of its own.
-    if next_word.ends_with(':') {
-        return false;
-    }
-    let next_word_end = next_text
-        .get(word_length.saturating_sub(1))
-        .map_or(next_first_column, |(column, _)| {
-            cell_end(next_row.grid_row, *column)
-        });
-    let next_word = next_word
-        .trim_start_matches(['"', '“', '(', '`'])
-        .trim_end_matches([',', '.', ';', ':', '!', '?', '"', '”', ')', '`']);
-    // A glob such as "editor_*" ends in a star.
-    let next_word = next_word.strip_suffix('*').unwrap_or(next_word);
-    let width = row.grid_row.characters.len();
-    // A program wraps prose at a width of its own, which can be narrower than
-    // the terminal, and none of its rows reach past it. Only the paragraph's
-    // rows show that width, since code, tables and logs in the same block
-    // aren't wrapped by it. The rows after the break that line up with the
-    // paragraph show it too.
-    let following_rows = rows[index + 1..]
-        .iter()
-        .zip(rows[index..].iter())
-        .take_while(|(following, before)| {
-            before.grid_row.line.saturating_add(1) == following.grid_row.line
-                && following.first_column().is_some_and(|column| {
-                    column == text_indent || column == text_indent.saturating_add(1)
-                })
-        })
-        .map(|(following, _)| following);
-    let paragraph_rows = rows.get(paragraph_start..index).unwrap_or_default();
-    // Agent TUIs wrap words without trimming them, so when a row fills up to
-    // the wrap width, the space between its last word and the next one
-    // starts the next row. Another row as wide shows that the row is full,
-    // as does the terminal's edge.
-    let fills_row = row.end == width
-        || paragraph_rows
-            .iter()
-            .chain(following_rows)
-            .any(|other| other.end >= row.end);
-    let carries_space = fills_row && next_first_column == text_indent.saturating_add(1);
-    // A program that wraps words fills each row as far as it can, so a next
-    // word that would have fit after a space on this row, within the widest
-    // row of the paragraph and the next row, ends the line.
-    let wrap_width = rows
-        .get(paragraph_start..=index + 1)
-        .unwrap_or_default()
-        .iter()
-        .map(|other| other.end)
-        .max()
-        .unwrap_or(0);
-    let next_word_fits = row.end + 1 + (next_word_end - next_first_column) <= wrap_width;
-    // A long next word wraps early and leaves a short row, so the row counts
-    // as reaching across when it would have with that word. A next row with
-    // nothing after that word could just be a long token on a line of its own.
-    let next_word_reaches_across = last_column.saturating_mul(3) >= width.saturating_mul(2)
-        || (word_length < next_text.len()
-            && row
-                .end
-                .saturating_add(1)
-                .saturating_add(next_word_end - next_first_column)
-                .saturating_mul(3)
-                >= width.saturating_mul(2));
-    ends_in_prose
-        && next_word_reaches_across
-        && (next_first_column == text_indent || carries_space)
-        && !next_word_fits
-        && !next_row
-            .grid_row
-            .characters
-            .get(next_first_column..)
-            .is_some_and(starts_with_list_marker)
-        && next_word.starts_with(char::is_alphabetic)
-        // A number ends a row of prose, as in "about 3 / seconds", but also
-        // log lines such as "attempt 2", which a capitalized line follows.
-        && (!ends_in_number || next_word.starts_with(char::is_lowercase))
-        // Words of agent prose: names with apostrophes, dots, as in
-        // "Cargo.toml", digits, underscores, paths and "::", as in
-        // "agent_comments" or "Type::method". Hyphenated words need parts of
-        // two letters or more, as in "ca-respawn", which keeps out the
-        // permissions of listings such as "drwxr-xr-x".
-        && !next_word.replace("::", "").contains(':')
-        && next_word.chars().all(|character| {
-            character.is_alphanumeric()
-                || matches!(character, '_' | ':' | '/' | '.' | '\'' | '’' | '-')
-        })
-        && (!next_word.contains('-')
-            || next_word.chars().any(|character| {
-                character.is_ascii_digit() || matches!(character, '_' | ':' | '/')
+    /// The first and last grid points of `text` where it shows closest to
+    /// scrollback row `near_row`, then closest to column `near_column`, since
+    /// short text can show several times on a row.
+    pub fn find(
+        &self,
+        text: &str,
+        near_row: i64,
+        near_column: Option<usize>,
+        content: &Content,
+    ) -> Option<(Point, Point)> {
+        let text = text
+            .chars()
+            .filter(|character| !is_ignored_by_anchor(*character))
+            .collect::<String>();
+        if text.is_empty() {
+            return None;
+        }
+        self.text
+            .match_indices(text.as_str())
+            .filter_map(|(start, matched)| {
+                let first = *self.byte_points.get(start)?;
+                let last = *self.byte_points.get(start + matched.len() - 1)?;
+                Some((first, last))
             })
-            || next_word.split('-').all(|part| {
-                part.chars().count() >= 2
-                    && part
-                        .chars()
-                        .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '.'))
-            }))
-}
-
-/// The rows of each sentence of a paragraph, by Unicode sentence
-/// boundaries.
-fn sentence_rows(
-    paragraph_rows: &[(i32, RangeInclusive<usize>)],
-    grid_rows: &[GridRow],
-) -> Vec<Vec<(i32, RangeInclusive<usize>)>> {
-    let mut paragraph = String::new();
-    let mut byte_points = Vec::new();
-    let mut previous_wraps = true;
-    for (line, columns) in paragraph_rows {
-        let Some(grid_row) = grid_rows.iter().find(|row| row.line == *line) else {
-            continue;
-        };
-        if !previous_wraps
-            && !paragraph.ends_with(char::is_whitespace)
-            && let Some(last_point) = byte_points.last().copied()
-        {
-            // The program's line break stood for a space.
-            paragraph.push(' ');
-            byte_points.push(last_point);
-        }
-        for column in columns.clone() {
-            if grid_row.wide_char_spacers.contains(&column) {
-                continue;
-            }
-            let Some(character) = grid_row.characters.get(column) else {
-                break;
-            };
-            paragraph.push(*character);
-            byte_points.extend(std::iter::repeat_n(
-                Point::new(*line, column),
-                character.len_utf8(),
-            ));
-        }
-        previous_wraps = grid_row.wraps;
-    }
-    let mut sentences = Vec::new();
-    push_paragraph_sentences(&paragraph, &byte_points, &mut sentences);
-    sentences
-}
-
-/// Abbreviations that a sentence doesn't end at, though Unicode sentence
-/// boundaries break after them before a capital.
-const ABBREVIATIONS: &[&str] = &[
-    "e.g.", "i.e.", "vs.", "cf.", "dr.", "mr.", "mrs.", "approx.",
-];
-
-fn ends_with_abbreviation(text: &str) -> bool {
-    text.split_whitespace().last().is_some_and(|word| {
-        let word = word.trim_start_matches(['(', '"', '“']).to_lowercase();
-        ABBREVIATIONS.contains(&word.as_str())
-    })
-}
-
-fn push_paragraph_sentences(
-    paragraph: &str,
-    byte_points: &[Point],
-    sentences: &mut Vec<Vec<(i32, RangeInclusive<usize>)>>,
-) {
-    let mut byte_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    for (start, sentence) in paragraph.split_sentence_bound_indices() {
-        let trimmed_start = sentence.len() - sentence.trim_start().len();
-        let trimmed = sentence.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let start = start + trimmed_start;
-        let end = start + trimmed.len();
-        match byte_ranges.last_mut() {
-            Some(previous) if ends_with_abbreviation(&paragraph[previous.clone()]) => {
-                previous.end = end;
-            }
-            _ => byte_ranges.push(start..end),
-        }
-    }
-    for byte_range in byte_ranges {
-        let Some(points) = byte_points.get(byte_range) else {
-            continue;
-        };
-        let mut rows: Vec<(i32, RangeInclusive<usize>)> = Vec::new();
-        for point in points {
-            match rows.last_mut() {
-                Some((line, columns)) if *line == point.line => {
-                    *columns = *columns.start()..=point.column.max(*columns.end());
-                }
-                _ => rows.push((point.line, point.column..=point.column)),
-            }
-        }
-        sentences.push(rows);
+            .min_by_key(|(start, _)| {
+                (
+                    (scrollback_row(content, start.line) - near_row).abs(),
+                    near_column.map_or(0, |column| start.column.abs_diff(column)),
+                )
+            })
     }
 }
-
-pub(crate) type TextBlockProvider = Rc<dyn Fn(&Terminal, Point, &App) -> Option<TextBlock>>;
-
-/// Why a picked text can't be extended, or none when it can.
-pub(crate) type TextBlockExtendBlocker =
-    Rc<dyn Fn(&Terminal, &TextBlock, TextBlockLevel, &App) -> Option<SharedString>>;
 
 /// A marker in the gutter over grid `lines`. `count` is the number of
 /// marked items it stands for, shown when there's more than one.
@@ -588,63 +189,72 @@ pub struct GutterMarker {
 pub(crate) type GutterMarkerClick =
     Rc<dyn Fn(RangeInclusive<i32>, GpuiPoint<Pixels>, &mut Window, &mut App)>;
 
-/// How much of a text block a pick takes: the whole block, which is a
-/// message, or a paragraph or a sentence of it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TextBlockLevel {
-    #[default]
-    Message,
-    Paragraph,
-    Sentence,
+/// Lines highlighted for the selection action. The highlight covers whole
+/// logical lines, where a line the terminal wrapped over several rows counts
+/// as one, and its start and end can be moved by words. Rows are counted from
+/// the start of the scrollback, so output scrolling the screen doesn't move
+/// them.
+#[derive(Clone)]
+struct LineHighlight {
+    /// A row in the logical line at the far end.
+    anchor: i64,
+    /// A row in the logical line at the active end, which the keyboard and
+    /// drags move.
+    head: i64,
+    /// Where the start was moved to by words, as a row and a column. Never
+    /// after the end.
+    start: Option<(i64, usize)>,
+    /// Where the end was moved to by words, as a row and a column.
+    end: Option<(i64, usize)>,
 }
 
-impl TextBlockLevel {
-    const ALL: [Self; 3] = [Self::Message, Self::Paragraph, Self::Sentence];
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Message => "message",
-            Self::Paragraph => "paragraph",
-            Self::Sentence => "sentence",
-        }
-    }
+/// The highlighted grid lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HighlightedLines {
+    pub lines: RangeInclusive<i32>,
+    /// The first highlighted column of the first line, when the start was
+    /// moved by words. Otherwise the first line is highlighted from its
+    /// start.
+    pub start_column: Option<usize>,
+    /// The last highlighted column of the last line, when the end was moved
+    /// by words. Otherwise the last line is highlighted to its end.
+    pub end_column: Option<usize>,
 }
 
-/// The text a pick points at.
-pub(crate) struct PickedTextBlock {
-    /// The picked text: the block, or a paragraph or a sentence of it.
-    pub(crate) block: TextBlock,
-    /// The block a picked paragraph or sentence is in.
-    pub(crate) parent: Option<TextBlock>,
-    /// The other texts picked to act on together.
-    pub(crate) collected: Vec<TextBlock>,
-    /// Where the pick points on the block, which the action's popover
-    /// opens next to.
-    pub(crate) anchor: Point,
-    /// The rows that extending added past the picked text's own end, which
-    /// are drawn fainter.
-    pub(crate) extension: Vec<(i32, RangeInclusive<usize>)>,
-    /// Whether the picked text's own boundary is shown briefly, after an
-    /// extension was cleared.
-    pub(crate) flashing: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineHighlightGrab {
+    /// A line, which moves the active end by lines.
+    Line,
+    /// The start handle, which moves the start by words.
+    StartHandle,
+    /// The end handle, which moves the end by words.
+    EndHandle,
 }
 
-/// Picking a text block for the selection action, which the host starts on
-/// request. Clicks and moves stay local while picking.
-struct TextBlockPick {
-    /// The picked point as a scrollback row and column, which output
-    /// scrolling the screen doesn't change until the scrollback is full.
-    position: Option<(i64, usize)>,
-    level: TextBlockLevel,
-    /// Where the other texts picked to act on together start, as scrollback
-    /// rows and columns.
-    collected: Vec<(i64, usize)>,
-    /// Where the user moved the picked text's end to, as a scrollback row
-    /// and column.
-    extend_to: Option<(i64, usize)>,
+/// A press that moves an end of the line highlight until its release.
+struct LineHighlightDrag {
+    pressed_line: i32,
+    moved: bool,
+    /// Whether a release without a move highlights the pressed line alone,
+    /// as when the press grabbed an edge of a highlight of several lines.
+    collapse_on_click: bool,
+    grab: LineHighlightGrab,
+    /// The highlight from before the press, which Esc restores.
+    before: LineHighlight,
 }
 
-const TEXT_BLOCK_BOUNDARY_FLASH: Duration = Duration::from_millis(400);
+/// How far from a handle, in cells, a press grabs it.
+const LINE_HIGHLIGHT_HANDLE_REACH: f32 = 0.5;
+
+/// How long after a resize to look for the highlighted text again, so the
+/// program has redrawn by then.
+const LINE_HIGHLIGHT_REFIND_DELAY: Duration = Duration::from_millis(500);
+
+/// The keys of the line highlight mode, which its label's tooltip lists.
+const LINE_HIGHLIGHT_KEYS: &str = "↑↓ to move · Shift+↑↓ to move the end · Alt+Shift+↑↓ to move the far end · Shift+←→ to move the end by a word · Alt+Shift+←→ to move the start by a word · Drag the handles at the start and end to adjust them · Enter to act on the lines · Esc to stop";
+
+const LINE_HIGHLIGHT_START_HANDLE_TOOLTIP: &str = "Drag to adjust start · Alt+Shift+←/→";
+const LINE_HIGHLIGHT_END_HANDLE_TOOLTIP: &str = "Drag to adjust end · Shift+←/→";
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -667,6 +277,31 @@ actions!(
     [
         /// Reruns the last executed task in the terminal.
         RerunTask,
+        /// Highlights the line above the line highlight's active end.
+        MoveLineHighlightUp,
+        /// Highlights the line below the line highlight's active end.
+        MoveLineHighlightDown,
+        /// Moves the line highlight's active end up a line.
+        MoveLineHighlightEndUp,
+        /// Moves the line highlight's active end down a line.
+        MoveLineHighlightEndDown,
+        /// Moves the far end of the line highlight up a line.
+        MoveLineHighlightFarEndUp,
+        /// Moves the far end of the line highlight down a line.
+        MoveLineHighlightFarEndDown,
+        /// Extends the end of the line highlight by a word.
+        ExtendLineHighlightByWord,
+        /// Trims a word off the end of the line highlight.
+        TrimLineHighlightByWord,
+        /// Moves the start of the line highlight left by a word.
+        MoveLineHighlightStartLeftByWord,
+        /// Moves the start of the line highlight right by a word.
+        MoveLineHighlightStartRightByWord,
+        /// Runs the terminal's selection action, such as commenting, on the
+        /// highlighted lines.
+        ConfirmLineHighlight,
+        /// Ends the line highlight mode.
+        ExitLineHighlight,
     ]
 );
 
@@ -729,22 +364,32 @@ pub struct TerminalView {
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
-    selection_action: Option<SelectionAction>,
+    pub(crate) selection_action: Option<SelectionAction>,
     gutter_markers: Option<GutterMarkers>,
     pub(crate) gutter_marker_click: Option<GutterMarkerClick>,
-    text_block_provider: Option<TextBlockProvider>,
-    text_block_suspended: bool,
-    text_block_extend_blocker: Option<TextBlockExtendBlocker>,
-    /// Set while a drag from the picked text's end extends it.
-    pub(crate) extending_text_block: bool,
-    text_block_boundary_flash: Option<Task<()>>,
+    /// The grid line of the gutter cell under the pointer.
+    pub(crate) gutter_hover_line: Option<i32>,
+    /// A press in the gutter on a marker, which opens the marker on release
+    /// unless a drag highlights lines instead.
+    gutter_press: Option<i32>,
+    line_highlight: Option<LineHighlight>,
+    line_highlight_suspended: bool,
+    line_highlight_drag: Option<LineHighlightDrag>,
+    /// The highlight's lines, looked up before every paint.
+    pub(crate) highlighted_lines: Option<HighlightedLines>,
+    /// The highlighted text and the row it starts on, as of the last paint,
+    /// to find the highlight again after a resize.
+    line_highlight_text: Option<(String, i64, Option<usize>)>,
+    line_highlight_refind: Option<Task<()>>,
+    /// The grid's columns and lines as of the last paint.
+    grid_size: (usize, usize),
     /// The viewport row and column under the pointer, while it's over the
     /// terminal.
     pointer_cell: Option<(usize, usize)>,
-    text_block_pick: Option<TextBlockPick>,
-    pub(crate) picked_text_block: Option<PickedTextBlock>,
-    /// Set when a click picks a block, so its release isn't reported to a
-    /// program that never saw the press.
+    /// The pointer's distance from the grid's left edge, in cells.
+    pointer_x: Option<f32>,
+    /// Set when a press is the line highlight's or the gutter's, so its
+    /// drag and release aren't reported to a program that never saw it.
     pub(crate) swallow_left_mouse_up: bool,
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
@@ -897,14 +542,17 @@ impl TerminalView {
             selection_action: None,
             gutter_markers: None,
             gutter_marker_click: None,
-            text_block_provider: None,
-            text_block_suspended: false,
-            text_block_extend_blocker: None,
-            extending_text_block: false,
-            text_block_boundary_flash: None,
+            gutter_hover_line: None,
+            gutter_press: None,
+            line_highlight: None,
+            line_highlight_suspended: false,
+            line_highlight_drag: None,
+            highlighted_lines: None,
+            line_highlight_text: None,
+            line_highlight_refind: None,
+            grid_size: (0, 0),
             pointer_cell: None,
-            text_block_pick: None,
-            picked_text_block: None,
+            pointer_x: None,
             swallow_left_mouse_up: false,
             scroll_top: Pixels::ZERO,
             scroll_handle,
@@ -973,7 +621,7 @@ impl TerminalView {
     }
 
     pub(crate) fn mouse_input_mode(&self) -> MouseInputMode {
-        if self.read_only || self.takes_mouse_for_text_block_pick() {
+        if self.read_only || self.takes_mouse_for_line_highlight() {
             MouseInputMode::LocalSelection
         } else {
             MouseInputMode::ReportToTerminal
@@ -991,31 +639,61 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Sets the action that a picked text block runs: `handler` gets the
-    /// block's range, its text, the pick's level, which is none for a
-    /// selection, and the window position to open at.
+    /// Sets the action that runs on a selection or on highlighted lines,
+    /// which turns on the line highlight mode: `handler` gets the range and
+    /// the window position to open at. `mode_label` names the mode in the
+    /// label it shows.
     pub fn on_selection_action(
         &mut self,
         label: impl Into<SharedString>,
-        handler: impl Fn(
-            Range,
-            String,
-            Option<PickedTextKind>,
-            GpuiPoint<Pixels>,
-            &mut Window,
-            &mut App,
-        ) + 'static,
+        mode_label: impl Into<SharedString>,
+        handler: impl Fn(Range, GpuiPoint<Pixels>, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) {
         self.selection_action = Some(SelectionAction {
             label: label.into(),
+            mode_label: mode_label.into(),
             handler: Rc::new(handler),
+            menu_action: None,
         });
         cx.notify();
     }
 
+    /// Makes the selection's context menu entry dispatch `action`, and show
+    /// only while `is_available` holds for the terminal's content.
+    pub fn set_selection_menu_action(
+        &mut self,
+        action: Box<dyn Action>,
+        is_available: impl Fn(&Content) -> bool + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(selection_action) = self.selection_action.as_mut() {
+            selection_action.menu_action = Some(SelectionMenuAction {
+                action: Rc::from(action),
+                is_available: Rc::new(is_available),
+            });
+            cx.notify();
+        }
+    }
+
+    /// Whether the selection action is available for the terminal's
+    /// current content, on a selection or on highlighted lines.
+    pub fn selection_menu_entry_available(&self, cx: &App) -> bool {
+        self.selection_action
+            .as_ref()
+            .is_some_and(|selection_action| {
+                selection_action
+                    .menu_action
+                    .as_ref()
+                    .is_none_or(|menu_action| {
+                        (menu_action.is_available)(self.terminal.read(cx).last_content())
+                    })
+            })
+    }
+
     pub fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
         self.selection_action = None;
+        self.exit_line_highlight(cx);
         cx.notify();
     }
 
@@ -1091,792 +769,899 @@ impl TerminalView {
             .find(|marker| marker.lines.contains(&line))
     }
 
-    /// Finds the text block at a grid point, which a pick highlights and
-    /// runs the selection action on.
-    pub fn set_text_block_provider(
-        &mut self,
-        provider: impl Fn(&Terminal, Point, &App) -> Option<TextBlock> + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        self.text_block_provider = Some(Rc::new(provider));
+    /// Whether the line highlight mode can start: the host set a selection
+    /// action, which is available for the terminal's content.
+    pub fn line_highlight_available(&self, cx: &App) -> bool {
+        self.selection_menu_entry_available(cx)
+    }
+
+    /// Hides the highlight and gives the mouse back to the program without
+    /// ending the mode, while the action started from it is in progress.
+    pub fn set_line_highlight_suspended(&mut self, suspended: bool, cx: &mut Context<Self>) {
+        self.line_highlight_suspended = suspended;
         cx.notify();
     }
 
-    /// Refuses extending a picked text when it returns a reason, which
-    /// shows as a tooltip on the picked text's end.
-    pub fn set_text_block_extend_blocker(
-        &mut self,
-        blocker: impl Fn(&Terminal, &TextBlock, TextBlockLevel, &App) -> Option<SharedString> + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        self.text_block_extend_blocker = Some(Rc::new(blocker));
-        cx.notify();
+    /// Whether the line highlight mode is on, suspended or not.
+    pub fn has_line_highlight(&self) -> bool {
+        self.line_highlight.is_some()
     }
 
-    pub fn clear_text_block_provider(&mut self, cx: &mut Context<Self>) {
-        self.text_block_provider = None;
-        self.text_block_extend_blocker = None;
-        self.cancel_text_block_pick(cx);
+    pub(crate) fn is_dragging_line_highlight(&self) -> bool {
+        self.line_highlight_drag.is_some()
     }
 
-    /// Hides the pick and gives the mouse back to the program without ending
-    /// the pick, for example while the action started from it is in
-    /// progress.
-    pub fn set_text_block_suspended(&mut self, suspended: bool, cx: &mut Context<Self>) {
-        self.text_block_suspended = suspended;
-        cx.notify();
+    pub(crate) fn takes_mouse_for_line_highlight(&self) -> bool {
+        self.line_highlight.is_some() && !self.line_highlight_suspended
     }
 
-    pub fn is_picking_text_block(&self) -> bool {
-        self.text_block_pick.is_some()
-    }
-
-    pub(crate) fn takes_mouse_for_text_block_pick(&self) -> bool {
-        self.text_block_pick.is_some() && !self.text_block_suspended
-    }
-
-    /// Starts picking a text block, at the vi cursor in vi mode, else under
-    /// the pointer, else the last block on screen. Typing, losing focus or
-    /// [`Self::cancel_text_block_pick`] ends the pick.
-    pub fn start_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        if self.text_block_provider.is_none() {
+    /// Starts the line highlight mode on grid `line`, else on the last
+    /// visible line with text. Esc, an unbound key, losing focus or
+    /// [`Self::exit_line_highlight`] ends it.
+    pub fn start_line_highlight(&mut self, line: Option<i32>, cx: &mut Context<Self>) {
+        if !self.line_highlight_available(cx) {
             return;
         }
-        let terminal = self.terminal.read(cx);
-        let point = if terminal.vi_mode_enabled() {
-            Some(terminal.last_content().cursor.point)
-        } else {
-            self.pointer_point(cx).or_else(|| {
-                // The last paragraph on screen, which is the most recent
-                // output.
-                let block_point = self.next_text_block_point(self.visible_lines(cx).rev(), cx)?;
-                let block = self.text_block_at(block_point, cx)?;
-                let last = self
-                    .block_units(&block, TextBlockLevel::Paragraph, cx)
-                    .pop()?;
-                Some(unit_start(&last))
-            })
+        let line = line.unwrap_or_else(|| self.last_text_line(cx));
+        self.line_highlight_suspended = false;
+        self.line_highlight_drag = None;
+        self.set_line_highlight(line, line, cx);
+    }
+
+    pub fn exit_line_highlight(&mut self, cx: &mut Context<Self>) {
+        self.line_highlight_drag = None;
+        self.line_highlight_refind = None;
+        self.line_highlight_text = None;
+        self.highlighted_lines = None;
+        if self.line_highlight.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn set_line_highlight(&mut self, anchor: i32, head: i32, cx: &mut Context<Self>) {
+        let (Some(anchor), Some(head)) = (
+            self.scrollback_line(anchor, cx),
+            self.scrollback_line(head, cx),
+        ) else {
+            return;
         };
-        let position = point.and_then(|point| self.scrollback_position(point, cx));
-        self.text_block_pick = Some(TextBlockPick {
-            position,
-            level: TextBlockLevel::Paragraph,
-            collected: Vec::new(),
-            extend_to: None,
+        self.line_highlight = Some(LineHighlight {
+            anchor,
+            head,
+            start: None,
+            end: None,
         });
         cx.notify();
     }
 
-    pub fn text_block_pick_level(&self) -> Option<TextBlockLevel> {
-        Some(self.text_block_pick.as_ref()?.level)
-    }
-
-    fn pick_point(&self, cx: &App) -> Option<Point> {
-        self.text_block_pick
-            .as_ref()?
-            .position
-            .and_then(|position| self.grid_point(position, cx))
-    }
-
-    /// Picks the whole block, or a paragraph or a sentence of it: the one
-    /// under the pointer, else the one the pick is in. Clears the texts
-    /// picked to act on together, which are of the old level.
-    pub fn set_text_block_pick_level(&mut self, level: TextBlockLevel, cx: &mut Context<Self>) {
-        let Some(pick) = &self.text_block_pick else {
-            return;
-        };
-        if pick.level == level {
-            return;
-        }
-        let from_message = pick.level == TextBlockLevel::Message;
-        let position = self
-            .pick_point(cx)
-            .and_then(|point| self.level_point(point, level, from_message, cx))
-            .and_then(|point| self.scrollback_position(point, cx))
-            .or(pick.position);
-        if let Some(pick) = &mut self.text_block_pick {
-            pick.level = level;
-            pick.position = position;
-            pick.collected.clear();
-            pick.extend_to = None;
-        }
-        cx.notify();
-    }
-
-    /// Where a pick at `point` rests at `level`: the start of the unit
-    /// under the pointer when it's in the same block, else of the unit at
-    /// `point`, or of the block's first when the pick is on the whole
-    /// block.
-    fn level_point(
-        &self,
-        point: Point,
-        level: TextBlockLevel,
-        from_message: bool,
-        cx: &App,
-    ) -> Option<Point> {
-        if level == TextBlockLevel::Message {
-            return Some(point);
-        }
-        let block = self.text_block_at(point, cx)?;
-        // The pointer only counts while it's on the picked text, since the
-        // keyboard may have moved the pick away from it.
-        let current_unit = self
-            .text_block_pick
-            .as_ref()
-            .and_then(|pick| self.unit_at(point, pick.level, cx))
-            .map(|(unit, _)| unit);
-        let unit_point = self
-            .pointer_point(cx)
-            .filter(|pointer| {
-                current_unit
-                    .as_ref()
-                    .is_some_and(|unit| unit_contains(unit, *pointer))
-            })
-            .or_else(|| from_message.then(|| unit_start(&block)))
-            .unwrap_or(point);
-        let (unit, _) = self.unit_at(unit_point, level, cx)?;
-        Some(unit_start(&unit))
-    }
-
-    /// The nearest level past the pick's, toward smaller texts when
-    /// `narrower` is set, that picks other text than the pick does now.
-    /// Levels that would pick the same text as their neighbor are skipped,
-    /// toward the message when widening.
-    fn next_distinct_level(&self, narrower: bool, cx: &App) -> Option<TextBlockLevel> {
-        let pick = self.text_block_pick.as_ref()?;
-        let point = self.pick_point(cx)?;
-        let current = self.unit_at(point, pick.level, cx)?.0.range();
-        let index = TextBlockLevel::ALL
-            .iter()
-            .position(|level| *level == pick.level)?;
-        let candidates: Vec<TextBlockLevel> = if narrower {
-            TextBlockLevel::ALL[index + 1..].to_vec()
-        } else {
-            TextBlockLevel::ALL[..index].iter().rev().copied().collect()
-        };
-        let from_message = pick.level == TextBlockLevel::Message;
-        let ranges = candidates
-            .iter()
-            .map(|level| {
-                self.level_point(point, *level, from_message, cx)
-                    .and_then(|point| self.unit_at(point, *level, cx))
-                    .and_then(|(unit, _)| unit.range())
-            })
-            .collect::<Vec<_>>();
-        let first = ranges
-            .iter()
-            .position(|range| range.is_some() && *range != current)?;
-        let mut chosen = first;
-        if !narrower {
-            while ranges
-                .get(chosen + 1)
-                .is_some_and(|range| *range == ranges[first])
-            {
-                chosen += 1;
-            }
-        }
-        candidates.get(chosen).copied()
-    }
-
-    /// Picks a paragraph of the picked message, or a sentence of the
-    /// picked paragraph.
-    pub fn narrow_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        if let Some(level) = self.next_distinct_level(true, cx) {
-            self.set_text_block_pick_level(level, cx);
-        }
-    }
-
-    /// Picks the paragraph or the message the pick is in.
-    pub fn widen_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        if let Some(level) = self.next_distinct_level(false, cx) {
-            self.set_text_block_pick_level(level, cx);
-        }
-    }
-
-    /// Clears the extension, else the texts picked to act on together,
-    /// else goes back to the paragraph or the message the pick is in, else
-    /// ends the pick.
-    pub fn back_out_of_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        self.extending_text_block = false;
-        if let Some(pick) = &mut self.text_block_pick
-            && pick.extend_to.take().is_some()
-        {
-            self.flash_text_block_boundary(cx);
-            cx.notify();
-            return;
-        }
-        if let Some(pick) = &mut self.text_block_pick
-            && !pick.collected.is_empty()
-        {
-            pick.collected.clear();
-            cx.notify();
-            return;
-        }
-        match self.next_distinct_level(false, cx) {
-            Some(level) => self.set_text_block_pick_level(level, cx),
-            None => self.cancel_text_block_pick(cx),
-        }
-    }
-
-    pub fn cancel_text_block_pick(&mut self, cx: &mut Context<Self>) {
-        self.extending_text_block = false;
-        self.text_block_boundary_flash = None;
-        if self.text_block_pick.take().is_some() {
-            self.picked_text_block = None;
-            cx.notify();
-        }
-    }
-
-    /// Moves the pick to the next or the previous text at the pick's level,
-    /// which carries on into the neighboring block.
-    pub fn move_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(pick) = &self.text_block_pick else {
-            return;
-        };
-        let point = self.adjacent_unit_point(self.pick_point(cx), pick.level, forward, cx);
-        let Some(position) = point.and_then(|point| self.scrollback_position(point, cx)) else {
-            return;
-        };
-        if let Some(pick) = &mut self.text_block_pick {
-            pick.position = Some(position);
-            pick.extend_to = None;
-        }
-        cx.notify();
-    }
-
-    /// Adds the picked text to the texts to act on together, or takes it
-    /// out when it's already one of them, and moves the pick on.
-    pub fn extend_text_block_pick(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(pick) = &self.text_block_pick else {
-            return;
-        };
-        let point = self.pick_point(cx);
-        let start = point
-            .and_then(|point| self.unit_at(point, pick.level, cx))
-            .and_then(|(unit, _)| self.scrollback_position(unit_start(&unit), cx));
-        // At the first or the last text there's nowhere to move, so the
-        // text is only added, or pressing again would take it back out.
-        let at_end = self
-            .adjacent_unit_point(point, pick.level, forward, cx)
-            .is_none();
-        if let Some(start) = start
-            && let Some(pick) = &mut self.text_block_pick
-        {
-            match pick.collected.iter().position(|other| *other == start) {
-                Some(_) if at_end => {}
-                Some(index) => {
-                    pick.collected.remove(index);
-                }
-                None => pick.collected.push(start),
-            }
-        }
-        self.move_text_block_pick(forward, cx);
-        cx.notify();
-    }
-
-    fn adjacent_unit_point(
-        &self,
-        current_point: Option<Point>,
-        level: TextBlockLevel,
-        forward: bool,
-        cx: &App,
-    ) -> Option<Point> {
-        if level == TextBlockLevel::Message {
-            return self.adjacent_block_point(current_point, forward, cx);
-        }
-        let Some((unit, block)) = current_point.and_then(|point| self.unit_at(point, level, cx))
-        else {
-            return self.adjacent_block_point(current_point, forward, cx);
-        };
-        let units = self.block_units(&block, level, cx);
-        let index = units.iter().position(|other| *other == unit)?;
-        let next_index = if forward {
-            index.checked_add(1)
-        } else {
-            index.checked_sub(1)
-        };
-        if let Some(next) = next_index.and_then(|index| units.get(index)) {
-            return Some(unit_start(next));
-        }
-        let block_point = self.adjacent_block_point(current_point, forward, cx)?;
-        let next_block = self.text_block_at(block_point, cx)?;
-        let next_units = self.block_units(&next_block, level, cx);
-        let next = if forward {
-            next_units.first()
-        } else {
-            next_units.last()
-        };
-        Some(next.map_or(block_point, unit_start))
-    }
-
-    fn adjacent_block_point(
-        &self,
-        current_point: Option<Point>,
-        forward: bool,
-        cx: &App,
-    ) -> Option<Point> {
+    /// The last visible line with text, else the last visible line.
+    fn last_text_line(&self, cx: &App) -> i32 {
         let visible_lines = self.visible_lines(cx);
-        let current_lines = current_point
-            .and_then(|point| self.text_block_at(point, cx))
-            .and_then(|block| block.lines());
-        if forward {
-            let first_line = current_lines
-                .map(|lines| lines.end() + 1)
-                .or(current_point.map(|point| point.line + 1))
-                .unwrap_or(*visible_lines.start());
-            self.next_text_block_point(first_line..=*visible_lines.end(), cx)
+        self.terminal
+            .read(cx)
+            .grid_rows(visible_lines.clone())
+            .iter()
+            .rev()
+            .find(|row| {
+                row.characters
+                    .iter()
+                    .any(|character| !character.is_whitespace())
+            })
+            .map_or(*visible_lines.end(), |row| row.line)
+    }
+
+    /// The grid lines from the top of the scrollback to the bottom of the
+    /// screen.
+    fn grid_lines(&self, cx: &App) -> RangeInclusive<i32> {
+        let content = self.terminal.read(cx).last_content();
+        let history_lines =
+            i32::try_from(content.total_lines.saturating_sub(content.screen_lines)).unwrap_or(0);
+        let screen_lines = i32::try_from(content.screen_lines).unwrap_or(0);
+        -history_lines..=screen_lines - 1
+    }
+
+    /// The rows of the logical line at `line`: the rows the terminal wrapped
+    /// it over.
+    fn logical_line(&self, line: i32, cx: &App) -> RangeInclusive<i32> {
+        let grid_lines = self.grid_lines(cx);
+        let line = line.clamp(*grid_lines.start(), *grid_lines.end());
+        let terminal = self.terminal.read(cx);
+        let wraps = |line: i32| {
+            terminal
+                .grid_rows(line..=line)
+                .first()
+                .is_some_and(|row| row.wraps)
+        };
+        let mut start = line;
+        while start > *grid_lines.start() && wraps(start - 1) {
+            start -= 1;
+        }
+        let mut end = line;
+        while end < *grid_lines.end() && wraps(end) {
+            end += 1;
+        }
+        start..=end
+    }
+
+    /// The first line of the logical line before or after the one at
+    /// `line`.
+    fn adjacent_logical_line(&self, line: i32, forward: bool, cx: &App) -> Option<i32> {
+        let logical_line = self.logical_line(line, cx);
+        let grid_lines = self.grid_lines(cx);
+        let next = if forward {
+            logical_line.end() + 1
         } else {
-            let first_line = current_lines
-                .map(|lines| lines.start() - 1)
-                .or(current_point.map(|point| point.line - 1))
-                .unwrap_or(*visible_lines.end());
-            self.next_text_block_point((*visible_lines.start()..=first_line).rev(), cx)
+            logical_line.start() - 1
+        };
+        grid_lines
+            .contains(&next)
+            .then(|| *self.logical_line(next, cx).start())
+    }
+
+    /// The highlight's grid lines, looked up from the terminal's content.
+    pub fn line_highlight_lines(&self, cx: &App) -> Option<HighlightedLines> {
+        let highlight = self.line_highlight.as_ref()?;
+        let anchor = self.grid_line(highlight.anchor, cx)?;
+        let head = self.grid_line(highlight.head, cx)?;
+        let start = highlight
+            .start
+            .and_then(|(row, column)| Some((self.grid_line(row, cx)?, column)));
+        let end = highlight
+            .end
+            .and_then(|(row, column)| Some((self.grid_line(row, cx)?, column)));
+        let first = match start {
+            Some((line, _)) => line,
+            None => *self.logical_line(anchor.min(head), cx).start(),
+        };
+        let last = match end {
+            Some((line, _)) => line,
+            None => *self.logical_line(anchor.max(head), cx).end(),
+        };
+        Some(HighlightedLines {
+            lines: first..=last.max(first),
+            start_column: start.map(|(_, column)| column),
+            end_column: end.map(|(_, column)| column),
+        })
+    }
+
+    /// The first and last highlighted cells.
+    fn line_highlight_points(&self, highlighted: &HighlightedLines, cx: &App) -> (Point, Point) {
+        let num_columns = self
+            .terminal
+            .read(cx)
+            .last_content()
+            .terminal_bounds
+            .num_columns();
+        (
+            Point::new(
+                *highlighted.lines.start(),
+                highlighted.start_column.unwrap_or(0),
+            ),
+            Point::new(
+                *highlighted.lines.end(),
+                highlighted
+                    .end_column
+                    .unwrap_or(num_columns.saturating_sub(1)),
+            ),
+        )
+    }
+
+    /// Moves an edge of the highlight to a word boundary at `point`. The
+    /// line of the start or the end also becomes the first or last line of
+    /// the anchor and the head, so later line moves start from it.
+    fn set_line_highlight_edge(
+        &mut self,
+        edge: LineHighlightGrab,
+        point: Point,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.scrollback_line(point.line, cx) else {
+            return;
+        };
+        let Some(highlight) = &mut self.line_highlight else {
+            return;
+        };
+        let head_is_first = highlight.head < highlight.anchor;
+        match edge {
+            LineHighlightGrab::StartHandle => {
+                if head_is_first {
+                    highlight.head = row;
+                } else {
+                    highlight.anchor = row;
+                }
+                highlight.start = Some((row, point.column));
+            }
+            LineHighlightGrab::EndHandle => {
+                if head_is_first {
+                    highlight.anchor = row;
+                } else {
+                    highlight.head = row;
+                }
+                highlight.end = Some((row, point.column));
+            }
+            LineHighlightGrab::Line => {}
+        }
+        cx.notify();
+    }
+
+    /// Moves the anchor and the head by lines. An edge left on its line
+    /// keeps its column, and an edge moved to another line snaps to the
+    /// nearest word boundary at or before its column there, else the line's
+    /// start or end.
+    fn move_line_highlight_lines(
+        &mut self,
+        update: impl FnOnce(&mut LineHighlight),
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.line_highlight_lines(cx);
+        let Some(highlight) = &mut self.line_highlight else {
+            return;
+        };
+        let head_was_first = highlight.head < highlight.anchor;
+        update(highlight);
+        // An edge whose anchor or head moved past the other one becomes the
+        // other kind of edge, whose column it doesn't have.
+        let flipped = head_was_first != (highlight.head < highlight.anchor)
+            && highlight.head != highlight.anchor;
+        highlight.start = None;
+        highlight.end = None;
+        cx.notify();
+        let (Some(mut before), Some(after)) = (before, self.line_highlight_lines(cx)) else {
+            return;
+        };
+        if flipped {
+            before.start_column = None;
+            before.end_column = None;
+        }
+        let same_logical_line = |before: i32, after: i32| {
+            self.logical_line(before, cx).start() == self.logical_line(after, cx).start()
+        };
+        let start = before.start_column.and_then(|column| {
+            let before_line = *before.lines.start();
+            let after_line = *after.lines.start();
+            if same_logical_line(before_line, after_line) {
+                Some(Point::new(before_line, column))
+            } else {
+                self.word_starts(after_line, cx)
+                    .into_iter()
+                    .rev()
+                    .find(|start| start.column <= column)
+            }
+        });
+        let end = before.end_column.and_then(|column| {
+            let before_line = *before.lines.end();
+            let after_line = *after.lines.end();
+            if same_logical_line(before_line, after_line) {
+                Some(Point::new(before_line, column))
+            } else {
+                self.word_ends(after_line, cx)
+                    .into_iter()
+                    .rev()
+                    .find(|end| end.column <= column)
+            }
+        });
+        // Snapping the end back on the start's line can put it before the
+        // start.
+        let end = match (start, end) {
+            (Some(start), Some(end)) if end < start => self
+                .word_ends(end.line, cx)
+                .into_iter()
+                .find(|word_end| *word_end >= start),
+            _ => end,
+        };
+        let start =
+            start.and_then(|point| Some((self.scrollback_line(point.line, cx)?, point.column)));
+        let end = end.and_then(|point| Some((self.scrollback_line(point.line, cx)?, point.column)));
+        if let Some(highlight) = &mut self.line_highlight {
+            highlight.start = start;
+            highlight.end = end;
         }
     }
 
-    /// The picked texts' range, their text, their level and the window
-    /// position the action opens at. Texts picked to act on together are
-    /// joined in the order they're on screen, with a line of `…` where
-    /// other text is between them. Ends the pick unless `keep_picking` is
-    /// set.
-    pub fn take_text_block_pick_target(
+    /// Highlights the line before or after the active end's, alone.
+    fn move_line_highlight(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(head) = self
+            .line_highlight
+            .as_ref()
+            .and_then(|highlight| self.grid_line(highlight.head, cx))
+        else {
+            return;
+        };
+        let Some(line) = self.adjacent_logical_line(head, forward, cx) else {
+            return;
+        };
+        self.set_line_highlight(line, line, cx);
+        self.scroll_to_line(line, cx);
+    }
+
+    /// Moves the active end, or the far end, a line up or down, which grows
+    /// or shrinks the highlight.
+    fn move_line_highlight_end(&mut self, far_end: bool, forward: bool, cx: &mut Context<Self>) {
+        let Some(highlight) = &self.line_highlight else {
+            return;
+        };
+        let row = if far_end {
+            highlight.anchor
+        } else {
+            highlight.head
+        };
+        let Some(line) = self
+            .grid_line(row, cx)
+            .and_then(|line| self.adjacent_logical_line(line, forward, cx))
+        else {
+            return;
+        };
+        let Some(row) = self.scrollback_line(line, cx) else {
+            return;
+        };
+        self.move_line_highlight_lines(
+            |highlight| {
+                if far_end {
+                    highlight.anchor = row;
+                } else {
+                    highlight.head = row;
+                }
+            },
+            cx,
+        );
+        self.scroll_to_line(line, cx);
+    }
+
+    /// Moves the highlight's end to the next word end, which can be past
+    /// the last highlighted line, or to the previous one, never before the
+    /// start's word.
+    fn move_line_highlight_end_by_word(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(highlighted) = self.line_highlight_lines(cx) else {
+            return;
+        };
+        let first = *highlighted.lines.start();
+        let last = *highlighted.lines.end();
+        let (start, _) = self.line_highlight_points(&highlighted, cx);
+        let current = match highlighted.end_column {
+            Some(column) => Point::new(last, column),
+            None => (first..=last)
+                .rev()
+                .find_map(|line| self.word_ends(line, cx).last().copied())
+                .unwrap_or(Point::new(last, 0)),
+        };
+        let next = if forward {
+            (current.line..=*self.grid_lines(cx).end()).find_map(|line| {
+                self.word_ends(line, cx)
+                    .into_iter()
+                    .find(|end| *end > current)
+            })
+        } else {
+            (first..=current.line)
+                .rev()
+                .find_map(|line| {
+                    self.word_ends(line, cx)
+                        .into_iter()
+                        .rev()
+                        .find(|end| *end < current)
+                })
+                .filter(|end| *end >= start)
+        };
+        let Some(next) = next else {
+            return;
+        };
+        self.set_line_highlight_edge(LineHighlightGrab::EndHandle, next, cx);
+        self.scroll_to_line(next.line, cx);
+    }
+
+    /// Moves the highlight's start to the previous word start, which can be
+    /// before the first highlighted line, or to the next one, never past the
+    /// end's word.
+    fn move_line_highlight_start_by_word(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(highlighted) = self.line_highlight_lines(cx) else {
+            return;
+        };
+        let first = *highlighted.lines.start();
+        let last = *highlighted.lines.end();
+        let (_, end) = self.line_highlight_points(&highlighted, cx);
+        let current = match highlighted.start_column {
+            Some(column) => Point::new(first, column),
+            None => (first..=last)
+                .find_map(|line| self.word_starts(line, cx).first().copied())
+                .unwrap_or(Point::new(first, 0)),
+        };
+        let next = if forward {
+            (current.line..=last)
+                .find_map(|line| {
+                    self.word_starts(line, cx)
+                        .into_iter()
+                        .find(|start| *start > current)
+                })
+                .filter(|start| *start <= end)
+        } else {
+            (*self.grid_lines(cx).start()..=current.line)
+                .rev()
+                .find_map(|line| {
+                    self.word_starts(line, cx)
+                        .into_iter()
+                        .rev()
+                        .find(|start| *start < current)
+                })
+        };
+        let Some(next) = next else {
+            return;
+        };
+        self.set_line_highlight_edge(LineHighlightGrab::StartHandle, next, cx);
+        self.scroll_to_line(next.line, cx);
+    }
+
+    /// Where words start on a row, in order. A word starts after a word
+    /// separator, or at the start of the row unless the terminal wrapped the
+    /// row before onto it.
+    fn word_starts(&self, line: i32, cx: &App) -> Vec<Point> {
+        let terminal = self.terminal.read(cx);
+        let rows = terminal.grid_rows(line..=line);
+        let Some(row) = rows.first() else {
+            return Vec::new();
+        };
+        let wrapped_onto = line > *self.grid_lines(cx).start()
+            && terminal
+                .grid_rows(line - 1..=line - 1)
+                .first()
+                .is_some_and(|row| row.wraps);
+        let is_word = |column: usize| {
+            row.characters
+                .get(column)
+                .is_some_and(|character| !terminal::is_word_separator(*character))
+        };
+        let mut starts = Vec::new();
+        for column in 0..row.characters.len() {
+            if row.wide_char_spacers.contains(&column) || !is_word(column) {
+                continue;
+            }
+            let mut previous = column.checked_sub(1);
+            while let Some(spacer) =
+                previous.filter(|column| row.wide_char_spacers.contains(column))
+            {
+                previous = spacer.checked_sub(1);
+            }
+            let continues = match previous {
+                Some(previous) => is_word(previous),
+                None => wrapped_onto,
+            };
+            if !continues {
+                starts.push(Point::new(line, column));
+            }
+        }
+        starts
+    }
+
+    /// The column right after the cell at `point`, past a wide character's
+    /// spacer.
+    fn column_after(&self, point: Point, cx: &App) -> usize {
+        let rows = self.terminal.read(cx).grid_rows(point.line..=point.line);
+        let mut next = point.column + 1;
+        if let Some(row) = rows.first() {
+            while row.wide_char_spacers.contains(&next) {
+                next += 1;
+            }
+        }
+        next
+    }
+
+    /// Where words end on a row, in order. A word runs to a word separator,
+    /// or to the end of the row unless the terminal wrapped it.
+    fn word_ends(&self, line: i32, cx: &App) -> Vec<Point> {
+        let rows = self.terminal.read(cx).grid_rows(line..=line);
+        let Some(row) = rows.first() else {
+            return Vec::new();
+        };
+        let is_word = |column: usize| {
+            row.characters
+                .get(column)
+                .is_some_and(|character| !terminal::is_word_separator(*character))
+        };
+        let mut ends = Vec::new();
+        for column in 0..row.characters.len() {
+            if row.wide_char_spacers.contains(&column) || !is_word(column) {
+                continue;
+            }
+            let mut next = column + 1;
+            while row.wide_char_spacers.contains(&next) {
+                next += 1;
+            }
+            let continues = if next < row.characters.len() {
+                is_word(next)
+            } else {
+                row.wraps
+            };
+            if !continues {
+                ends.push(Point::new(line, column));
+            }
+        }
+        ends
+    }
+
+    /// Scrolls the view so grid `line` is visible.
+    fn scroll_to_line(&mut self, line: i32, cx: &mut Context<Self>) {
+        let visible_lines = self.visible_lines(cx);
+        if line < *visible_lines.start() {
+            let lines = usize::try_from(visible_lines.start() - line).unwrap_or(0);
+            self.terminal
+                .update(cx, |terminal, _| terminal.scroll_up_by(lines));
+        } else if line > *visible_lines.end() {
+            let lines = usize::try_from(line - visible_lines.end()).unwrap_or(0);
+            self.terminal
+                .update(cx, |terminal, _| terminal.scroll_down_by(lines));
+        }
+    }
+
+    /// The highlighted range and the window position the action opens at,
+    /// below the highlight's last visible line.
+    pub fn take_line_highlight_target(
         &mut self,
-        keep_picking: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(Range, String, PickedTextKind, GpuiPoint<Pixels>)> {
-        if !self.takes_mouse_for_text_block_pick() {
+    ) -> Option<(Range, GpuiPoint<Pixels>)> {
+        if !self.takes_mouse_for_line_highlight() {
             return None;
         }
-        let level = self.text_block_pick.as_ref()?.level;
-        let picked = self.picked_text(cx)?;
+        let highlighted = self.line_highlight_lines(cx)?;
+        let (start, end) = self.line_highlight_points(&highlighted, cx);
         let content = self.terminal.read(cx).last_content();
-        let origin = terminal_element::text_block_action_origin(
-            picked.anchor,
+        let last = *highlighted.lines.end();
+        let range = Range::new(start, end);
+        let visible_lines = self.visible_lines(cx);
+        let anchor_line = last.clamp(*visible_lines.start(), *visible_lines.end());
+        let origin = terminal_element::line_highlight_action_origin(
+            anchor_line,
             content.display_offset,
             content.terminal_bounds,
             self.scroll_top,
             window,
             cx,
         )?;
-        let mut units = picked.collected;
-        units.push(picked.block);
-        units.sort_by_key(unit_start);
-        units.dedup_by_key(|unit| unit_start(unit));
-        let range = Range::new(
-            units.first()?.range()?.start(),
-            units.last()?.range()?.end(),
-        );
-        let mut text = String::new();
-        for (index, unit) in units.iter().enumerate() {
-            if let Some(previous) = index.checked_sub(1).and_then(|index| units.get(index)) {
-                let next_start =
-                    self.adjacent_unit_point(Some(unit_start(previous)), level, true, cx);
-                text.push_str(if next_start != Some(unit_start(unit)) {
-                    "\n…\n"
-                } else if level == TextBlockLevel::Sentence {
-                    " "
+        Some((range, origin))
+    }
+
+    /// Moves the highlight to the line after grid line `last`, where the
+    /// mode carries on once the action started from it is done.
+    pub fn advance_line_highlight(&mut self, last: i32, cx: &mut Context<Self>) {
+        if self.line_highlight.is_none() {
+            return;
+        }
+        let next_line = last + 1;
+        if self.grid_lines(cx).contains(&next_line) {
+            let next_line = *self.logical_line(next_line, cx).start();
+            self.set_line_highlight(next_line, next_line, cx);
+        }
+    }
+
+    fn confirm_line_highlight(
+        &mut self,
+        _: &ConfirmLineHighlight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection_action) = self.selection_action.clone() else {
+            return;
+        };
+        // Such as while a program shows a picker that Enter is meant for.
+        if !self.selection_menu_entry_available(cx) {
+            self.exit_line_highlight(cx);
+            return;
+        }
+        let Some((range, origin)) = self.take_line_highlight_target(window, cx) else {
+            return;
+        };
+        // The handler may update this view.
+        window.defer(cx, move |window, cx| {
+            (selection_action.handler)(range, origin, window, cx)
+        });
+    }
+
+    /// A press in the highlight mode at grid `line`: Shift extends the
+    /// highlight to the line, a press on its first or last line grabs that
+    /// edge, and any other press highlights the line. A drag moves the
+    /// pressed end until the release.
+    pub(crate) fn press_line_highlight(
+        &mut self,
+        line: i32,
+        x: f32,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.swallow_left_mouse_up = true;
+        let Some(before) = self.line_highlight.clone() else {
+            return;
+        };
+        if !shift && let Some(grab) = self.line_highlight_handle_at(line, x, cx) {
+            self.line_highlight_drag = Some(LineHighlightDrag {
+                pressed_line: line,
+                moved: false,
+                collapse_on_click: false,
+                grab,
+                before,
+            });
+            return;
+        }
+        let highlighted = self.line_highlight_lines(cx);
+        let mut collapse_on_click = false;
+        match highlighted {
+            Some(highlighted) if shift => {
+                // The end farther from the line stays put.
+                let far_end = if line < *highlighted.lines.start() {
+                    *highlighted.lines.end()
                 } else {
-                    "\n"
-                });
+                    *highlighted.lines.start()
+                };
+                self.set_line_highlight(far_end, line, cx);
             }
-            text.push_str(&unit.text);
-        }
-        if !keep_picking {
-            self.cancel_text_block_pick(cx);
-        } else if let Some(pick) = &mut self.text_block_pick {
-            pick.collected.clear();
-            pick.extend_to = None;
-        }
-        let kind = PickedTextKind {
-            level,
-            combined: units.len() > 1,
-        };
-        Some((range, text, kind, origin))
-    }
-
-    /// The text the pick points at, looked up from the terminal's content.
-    fn picked_text(&self, cx: &App) -> Option<PickedTextBlock> {
-        let pick = self.text_block_pick.as_ref()?;
-        let point = self.pick_point(cx)?;
-        let (mut unit, block) = self.unit_at(point, pick.level, cx)?;
-        let mut extension = Vec::new();
-        if let Some(end) = pick
-            .extend_to
-            .and_then(|position| self.grid_point(position, cx))
-            && let Some((extended, added)) = self.extended_unit(&unit, &block, end, cx)
-        {
-            unit = extended;
-            extension = added;
-        }
-        let anchor = if unit_contains(&unit, point) {
-            point
-        } else {
-            unit_start(&unit)
-        };
-        let collected = pick
-            .collected
-            .iter()
-            .filter_map(|position| {
-                let start = self.grid_point(*position, cx)?;
-                let (collected, _) = self.unit_at(start, pick.level, cx)?;
-                (unit_start(&collected) == start && collected != unit).then_some(collected)
-            })
-            .collect();
-        Some(PickedTextBlock {
-            block: unit,
-            parent: (pick.level != TextBlockLevel::Message).then_some(block),
-            collected,
-            anchor,
-            extension,
-            flashing: self.text_block_boundary_flash.is_some(),
-        })
-    }
-
-    /// The text at `level` at `point`, else the first one after it in its
-    /// block, else the block's last, with the block.
-    fn unit_at(
-        &self,
-        point: Point,
-        level: TextBlockLevel,
-        cx: &App,
-    ) -> Option<(TextBlock, TextBlock)> {
-        let block = self.text_block_at(point, cx)?;
-        let units = self.block_units(&block, level, cx);
-        let unit = units
-            .iter()
-            .find(|unit| unit_contains(unit, point))
-            .or_else(|| units.iter().find(|unit| unit_start(unit) >= point))
-            .or(units.last())?
-            .clone();
-        Some((unit, block))
-    }
-
-    /// The texts of a block at `level`: the block itself, its paragraphs or
-    /// their sentences.
-    fn block_units(&self, block: &TextBlock, level: TextBlockLevel, cx: &App) -> Vec<TextBlock> {
-        if level == TextBlockLevel::Message {
-            return vec![block.clone()];
-        }
-        let Some(lines) = block.lines() else {
-            return Vec::new();
-        };
-        let terminal = self.terminal.read(cx);
-        let grid_rows = terminal.grid_rows(lines);
-        let paragraphs = paragraph_rows(block, &grid_rows);
-        let unit_rows = match level {
-            TextBlockLevel::Sentence => paragraphs
-                .iter()
-                .flat_map(|paragraph| sentence_rows(paragraph, &grid_rows))
-                .collect(),
-            _ => paragraphs,
-        };
-        unit_rows
-            .into_iter()
-            .map(|rows| TextBlock {
-                text: joined_rows_text(terminal, &rows, &grid_rows),
-                rows,
-                label: None,
-                paragraphs: Vec::new(),
-            })
-            .collect()
-    }
-
-    /// The picked text from its start to `end`, which is kept inside its
-    /// block, with the rows past the text's own end.
-    fn extended_unit(
-        &self,
-        unit: &TextBlock,
-        block: &TextBlock,
-        end: Point,
-        cx: &App,
-    ) -> Option<(TextBlock, Vec<(i32, RangeInclusive<usize>)>)> {
-        let start = unit_start(unit);
-        let own_end = unit.range()?.end();
-        let end = end.min(block.range()?.end());
-        let rows = block
-            .rows
-            .iter()
-            .filter(|(line, _)| (start.line..=end.line).contains(line))
-            .filter_map(|(line, columns)| {
-                let first = if *line == start.line {
-                    start.column
+            Some(highlighted) if highlighted.lines.start() != highlighted.lines.end() => {
+                let first = self.logical_line(*highlighted.lines.start(), cx);
+                let last = self.logical_line(*highlighted.lines.end(), cx);
+                // Grabbing an edge keeps the columns, as its lines stay.
+                let grabbed = if first.contains(&line) {
+                    Some(*highlighted.lines.end())
+                } else if last.contains(&line) {
+                    Some(*highlighted.lines.start())
                 } else {
-                    *columns.start()
+                    None
                 };
-                let last = if *line == end.line {
-                    end.column.min(*columns.end())
-                } else {
-                    *columns.end()
-                };
-                (first <= last).then_some((*line, first..=last))
-            })
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            return None;
-        }
-        let added = rows
-            .iter()
-            .filter_map(|(line, columns)| {
-                let first = match line.cmp(&own_end.line) {
-                    std::cmp::Ordering::Less => return None,
-                    std::cmp::Ordering::Equal => (own_end.column + 1).max(*columns.start()),
-                    std::cmp::Ordering::Greater => *columns.start(),
-                };
-                (first <= *columns.end()).then_some((*line, first..=*columns.end()))
-            })
-            .collect();
-        let terminal = self.terminal.read(cx);
-        let grid_rows = terminal.grid_rows(rows.first()?.0..=rows.last()?.0);
-        let text = joined_rows_text(terminal, &rows, &grid_rows);
-        Some((
-            TextBlock {
-                rows,
-                text,
-                label: None,
-                paragraphs: Vec::new(),
-            },
-            added,
-        ))
-    }
-
-    /// Where words end in a block from `start` on, in order. A word runs to
-    /// a word separator, or to the end of a row unless the terminal wrapped
-    /// the row.
-    fn word_ends(&self, block: &TextBlock, start: Point, cx: &App) -> Vec<Point> {
-        let Some(lines) = block.lines() else {
-            return Vec::new();
-        };
-        let grid_rows = self.terminal.read(cx).grid_rows(lines);
-        let mut ends = Vec::new();
-        for (line, columns) in &block.rows {
-            let Some(row) = grid_rows.iter().find(|row| row.line == *line) else {
-                continue;
-            };
-            let is_word = |column: usize| {
-                row.characters
-                    .get(column)
-                    .is_some_and(|character| !terminal::is_word_separator(*character))
-            };
-            for column in *columns.start()..=*columns.end() {
-                if row.wide_char_spacers.contains(&column) || !is_word(column) {
-                    continue;
-                }
-                let mut next = column + 1;
-                while row.wide_char_spacers.contains(&next) {
-                    next += 1;
-                }
-                let continues = if next <= *columns.end() {
-                    is_word(next)
-                } else {
-                    row.wraps
-                };
-                let end = Point::new(*line, column);
-                if !continues && end >= start {
-                    ends.push(end);
+                match grabbed.zip(self.scrollback_line(line, cx)) {
+                    Some((far_end, head)) => {
+                        collapse_on_click = true;
+                        if let Some(anchor) = self.scrollback_line(far_end, cx)
+                            && let Some(highlight) = &mut self.line_highlight
+                        {
+                            highlight.anchor = anchor;
+                            highlight.head = head;
+                        }
+                    }
+                    None => self.set_line_highlight(line, line, cx),
                 }
             }
+            _ => self.set_line_highlight(line, line, cx),
         }
-        ends
+        self.line_highlight_drag = Some(LineHighlightDrag {
+            pressed_line: line,
+            moved: false,
+            collapse_on_click,
+            grab: LineHighlightGrab::Line,
+            before,
+        });
     }
 
-    /// The picked text at its own boundary, the block it's in and its end
-    /// now, which is where it was extended to, if it was.
-    fn extendable_unit(&self, cx: &App) -> Option<(TextBlock, TextBlock, Point)> {
-        let pick = self.text_block_pick.as_ref()?;
-        let (unit, block) = self.unit_at(self.pick_point(cx)?, pick.level, cx)?;
-        let end = match pick
-            .extend_to
-            .and_then(|position| self.grid_point(position, cx))
-        {
-            Some(end) => end,
-            None => unit.range()?.end(),
-        };
-        Some((unit, block, end))
-    }
-
-    /// Why the picked text can't be extended: it's combined with other
-    /// texts, which an extension could run into, or the host refuses it.
-    fn text_block_extend_blocked(&self, cx: &App) -> Option<SharedString> {
-        let pick = self.text_block_pick.as_ref()?;
-        if !pick.collected.is_empty() {
-            return Some("Combined highlights can't be extended".into());
-        }
-        let blocker = self.text_block_extend_blocker.as_ref()?;
-        let (unit, _) = self.unit_at(self.pick_point(cx)?, pick.level, cx)?;
-        blocker(self.terminal.read(cx), &unit, pick.level, cx)
-    }
-
-    fn set_text_block_extend_to(&mut self, end: Point, cx: &mut Context<Self>) {
-        let Some(position) = self.scrollback_position(end, cx) else {
+    fn set_line_highlight_head(&mut self, line: i32, cx: &mut Context<Self>) {
+        let Some(row) = self.scrollback_line(line, cx) else {
             return;
         };
-        if let Some(pick) = &mut self.text_block_pick
-            && pick.extend_to != Some(position)
-        {
-            pick.extend_to = Some(position);
-            self.text_block_boundary_flash = None;
-            cx.notify();
-        }
-    }
-
-    /// Moves the picked text's end to the end of the word at `point`, or of
-    /// the row's last word when `point` is past it. The end stays within the
-    /// block and after the text's first word.
-    fn drag_text_block_end(&mut self, point: Point, cx: &mut Context<Self>) {
-        let Some((unit, block, _)) = self.extendable_unit(cx) else {
-            return;
-        };
-        let ends = self.word_ends(&block, unit_start(&unit), cx);
-        let (Some(first), Some(last)) = (ends.first().copied(), ends.last().copied()) else {
-            return;
-        };
-        let end = if point <= first {
-            first
-        } else if point >= last {
-            last
-        } else {
-            ends.iter()
-                .find(|end| end.line == point.line && **end >= point)
-                .or_else(|| ends.iter().rev().find(|end| end.line == point.line))
-                .or_else(|| ends.iter().rev().find(|end| **end <= point))
-                .copied()
-                .unwrap_or(first)
-        };
-        self.set_text_block_extend_to(end, cx);
-    }
-
-    /// Moves the picked text's end by one word, never past its block or
-    /// before the end of its first word.
-    pub fn extend_text_block_pick_end(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !self.takes_mouse_for_text_block_pick() || self.text_block_extend_blocked(cx).is_some() {
-            return;
-        }
-        let Some((unit, block, end)) = self.extendable_unit(cx) else {
-            return;
-        };
-        let ends = self.word_ends(&block, unit_start(&unit), cx);
-        let next = if forward {
-            ends.iter().find(|other| **other > end)
-        } else {
-            ends.iter().rev().find(|other| **other < end)
-        };
-        if let Some(next) = next.copied() {
-            self.set_text_block_extend_to(next, cx);
-        }
-    }
-
-    /// The cells a drag extends the picked text from: its last cell and the
-    /// one after it, which is the next row's first when the last cell ends
-    /// its row.
-    fn text_block_grab_zone(&self, cx: &App) -> Option<[Point; 2]> {
-        let end = self.picked_text(cx)?.block.range()?.end();
-        let columns = self
-            .terminal
-            .read(cx)
-            .last_content()
-            .terminal_bounds
-            .num_columns();
-        let next = if end.column + 1 < columns {
-            Point::new(end.line, end.column + 1)
-        } else {
-            Point::new(end.line + 1, 0)
-        };
-        Some([end, next])
-    }
-
-    fn pointer_in_text_block_grab_zone(&self, cx: &App) -> bool {
-        self.pointer_point(cx).is_some_and(|pointer| {
-            self.text_block_grab_zone(cx)
-                .is_some_and(|zone| zone.contains(&pointer))
-        })
-    }
-
-    /// Whether the pointer shows that a drag extends the picked text.
-    pub fn shows_text_block_extend_cursor(&self, cx: &App) -> bool {
-        self.takes_mouse_for_text_block_pick()
-            && (self.extending_text_block
-                || (self.pointer_in_text_block_grab_zone(cx)
-                    && self.text_block_extend_blocked(cx).is_none()))
-    }
-
-    /// Why the picked text under the pointer can't be extended.
-    pub fn text_block_extend_tooltip(&self, cx: &App) -> Option<SharedString> {
-        if !self.takes_mouse_for_text_block_pick() || !self.pointer_in_text_block_grab_zone(cx) {
-            return None;
-        }
-        self.text_block_extend_blocked(cx)
-    }
-
-    /// A press while picking: in the picked text's grab zone it starts
-    /// extending the text, which the release ends. Elsewhere, outside an
-    /// extended text, it moves the pick to the pointer. Returns whether it
-    /// started extending.
-    pub(crate) fn press_text_block_pick(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.pointer_in_text_block_grab_zone(cx) && self.text_block_extend_blocked(cx).is_none()
-        {
-            self.extending_text_block = true;
-            cx.notify();
-            return true;
-        }
-        let extended = self
-            .text_block_pick
+        if self
+            .line_highlight
             .as_ref()
-            .is_some_and(|pick| pick.extend_to.is_some());
-        let Some(pointer) = self.pointer_point(cx) else {
+            .is_some_and(|highlight| highlight.head != row)
+        {
+            self.move_line_highlight_lines(|highlight| highlight.head = row, cx);
+        }
+    }
+
+    pub(crate) fn on_line_highlight_handle(&self, line: i32, x: f32, cx: &App) -> bool {
+        self.line_highlight_handle_at(line, x, cx).is_some()
+    }
+
+    /// The handle a press at grid `line` and `x` cells from the grid's left
+    /// edge grabs. The nearer handle wins when both are in reach.
+    fn line_highlight_handle_at(&self, line: i32, x: f32, cx: &App) -> Option<LineHighlightGrab> {
+        if !self.takes_mouse_for_line_highlight() {
+            return None;
+        }
+        let highlighted = self.line_highlight_lines(cx)?;
+        let (start, end) = self.line_highlight_points(&highlighted, cx);
+        let reach = |point: Point, edge_column: usize| {
+            let distance = (x - edge_column as f32).abs();
+            (point.line == line && distance <= LINE_HIGHLIGHT_HANDLE_REACH).then_some(distance)
+        };
+        let start_distance = reach(start, start.column);
+        let end_distance = reach(end, self.column_after(end, cx));
+        match (start_distance, end_distance) {
+            (Some(start_distance), Some(end_distance)) if end_distance < start_distance => {
+                Some(LineHighlightGrab::EndHandle)
+            }
+            (Some(_), _) => Some(LineHighlightGrab::StartHandle),
+            (None, Some(_)) => Some(LineHighlightGrab::EndHandle),
+            (None, None) => None,
+        }
+    }
+
+    /// Moves the dragged handle's edge to the word boundary nearest `x` on
+    /// grid `line`, stopping at the other edge's word.
+    fn drag_line_highlight_handle(
+        &mut self,
+        edge: LineHighlightGrab,
+        line: i32,
+        x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(highlighted) = self.line_highlight_lines(cx) else {
+            return;
+        };
+        let (start, end) = self.line_highlight_points(&highlighted, cx);
+        let distance = |column: usize| (x - column as f32).abs();
+        let target = match edge {
+            LineHighlightGrab::StartHandle => self
+                .word_starts(line, cx)
+                .into_iter()
+                .min_by(|a, b| distance(a.column).total_cmp(&distance(b.column)))
+                .and_then(|target| {
+                    if target <= end {
+                        return Some(target);
+                    }
+                    (*highlighted.lines.start()..=end.line)
+                        .rev()
+                        .find_map(|line| {
+                            self.word_starts(line, cx)
+                                .into_iter()
+                                .rev()
+                                .find(|word_start| *word_start <= end)
+                        })
+                }),
+            LineHighlightGrab::EndHandle => self
+                .word_ends(line, cx)
+                .into_iter()
+                .map(|word_end| (self.column_after(word_end, cx), word_end))
+                .min_by(|(a, _), (b, _)| distance(*a).total_cmp(&distance(*b)))
+                .map(|(_, word_end)| word_end)
+                .and_then(|target| {
+                    if target >= start {
+                        return Some(target);
+                    }
+                    (start.line..=*self.grid_lines(cx).end()).find_map(|line| {
+                        self.word_ends(line, cx)
+                            .into_iter()
+                            .find(|word_end| *word_end >= start)
+                    })
+                }),
+            LineHighlightGrab::Line => None,
+        };
+        let current = match edge {
+            LineHighlightGrab::StartHandle => highlighted.start_column.map(|_| start),
+            _ => highlighted.end_column.map(|_| end),
+        };
+        if let Some(target) = target
+            && current != Some(target)
+        {
+            self.set_line_highlight_edge(edge, target, cx);
+        }
+    }
+
+    /// Ends a drag with Esc, restoring the highlight from before it.
+    /// Returns whether a drag was going on.
+    fn cancel_line_highlight_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.line_highlight_drag.take() else {
             return false;
         };
-        let on_picked = self
-            .picked_text(cx)
-            .is_some_and(|picked| unit_contains(&picked.block, pointer));
-        if extended
-            && !on_picked
-            && let Some(position) = self.scrollback_position(pointer, cx)
-            && let Some(pick) = &mut self.text_block_pick
+        self.line_highlight = Some(drag.before);
+        cx.notify();
+        true
+    }
+
+    /// The tooltip of the handle under the pointer.
+    pub(crate) fn line_highlight_handle_tooltip(&self, cx: &App) -> Option<&'static str> {
+        if self.line_highlight_drag.is_some() {
+            return None;
+        }
+        let line = self.pointer_point(cx)?.line;
+        match self.line_highlight_handle_at(line, self.pointer_x?, cx)? {
+            LineHighlightGrab::StartHandle => Some(LINE_HIGHLIGHT_START_HANDLE_TOOLTIP),
+            LineHighlightGrab::EndHandle => Some(LINE_HIGHLIGHT_END_HANDLE_TOOLTIP),
+            LineHighlightGrab::Line => None,
+        }
+    }
+
+    /// Whether the pointer shows that a drag moves an edge of the highlight
+    /// sideways.
+    pub fn shows_line_column_resize_cursor(&self, cx: &App) -> bool {
+        if let Some(drag) = &self.line_highlight_drag {
+            return drag.grab != LineHighlightGrab::Line;
+        }
+        let (Some(point), Some(x)) = (self.pointer_point(cx), self.pointer_x) else {
+            return false;
+        };
+        self.line_highlight_handle_at(point.line, x, cx).is_some()
+    }
+
+    /// The grid line of a window position, and its distance from the grid's
+    /// left edge in cells.
+    pub(crate) fn grid_position_at(&self, position: GpuiPoint<Pixels>, cx: &App) -> (i32, f32) {
+        let terminal = self.terminal.read(cx);
+        let bounds = terminal.last_content().terminal_bounds;
+        let mut scrolled = position;
+        scrolled.y += self.scroll_top;
+        let line = terminal.grid_point_at(scrolled).line;
+        let x = if bounds.cell_width > px(0.) {
+            (position.x - bounds.bounds.origin.x) / bounds.cell_width
+        } else {
+            0.
+        };
+        (line, x)
+    }
+
+    /// A press in the gutter at grid `line`: on a marker it waits for the
+    /// release to open the marker, unless a drag highlights lines instead,
+    /// and elsewhere it starts the highlight mode on the line. Returns
+    /// whether the gutter takes the press.
+    pub(crate) fn press_gutter(&mut self, line: i32, cx: &mut Context<Self>) -> bool {
+        let on_marker =
+            self.gutter_marker_click.is_some() && self.gutter_marker_at(line, cx).is_some();
+        if !on_marker && !self.line_highlight_available(cx) {
+            return false;
+        }
+        self.swallow_left_mouse_up = true;
+        if on_marker {
+            self.gutter_press = Some(line);
+        } else {
+            self.start_line_highlight(Some(line), cx);
+            self.begin_gutter_line_drag(line);
+        }
+        true
+    }
+
+    /// Ends a press of the highlight or the gutter, and returns the line of
+    /// a gutter marker it clicked.
+    pub(crate) fn release_line_highlight(&mut self, cx: &mut Context<Self>) -> Option<i32> {
+        if let Some(drag) = self.line_highlight_drag.take()
+            && drag.collapse_on_click
+            && !drag.moved
         {
-            pick.position = Some(position);
-            pick.extend_to = None;
-            cx.notify();
+            self.set_line_highlight(drag.pressed_line, drag.pressed_line, cx);
         }
-        false
+        self.gutter_press.take()
     }
 
-    pub fn is_extending_text_block(&self) -> bool {
-        self.extending_text_block
-    }
-
-    pub(crate) fn release_text_block_extend(&mut self, cx: &mut Context<Self>) {
-        if self.extending_text_block {
-            self.extending_text_block = false;
-            cx.notify();
+    /// Whether the pointer shows that a drag moves an edge of the
+    /// highlight.
+    pub fn shows_line_resize_cursor(&self, cx: &App) -> bool {
+        if !self.takes_mouse_for_line_highlight() {
+            return false;
         }
-    }
-
-    fn flash_text_block_boundary(&mut self, cx: &mut Context<Self>) {
-        self.text_block_boundary_flash = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(TEXT_BLOCK_BOUNDARY_FLASH)
-                .await;
-            this.update(cx, |this, cx| {
-                this.text_block_boundary_flash = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// The first line's text block, as the point that a keyboard pick rests
-    /// on: the end of the block's first row.
-    fn next_text_block_point(
-        &self,
-        mut lines: impl Iterator<Item = i32>,
-        cx: &App,
-    ) -> Option<Point> {
-        lines.find_map(|line| {
-            let block = self.text_block_at(Point::new(line, 0), cx)?;
-            let (first_line, columns) = block.rows.first()?;
-            Some(Point::new(*first_line, *columns.end()))
+        if self
+            .line_highlight_drag
+            .as_ref()
+            .is_some_and(|drag| drag.moved)
+        {
+            return true;
+        }
+        let Some(line) = self.pointer_point(cx).map(|point| point.line) else {
+            return false;
+        };
+        self.highlighted_lines.as_ref().is_some_and(|highlighted| {
+            highlighted.lines.start() != highlighted.lines.end()
+                && (self
+                    .logical_line(*highlighted.lines.start(), cx)
+                    .contains(&line)
+                    || self
+                        .logical_line(*highlighted.lines.end(), cx)
+                        .contains(&line))
         })
+    }
+
+    /// The grid line of a window position in the gutter left of the text.
+    /// Only gutter lines that comment or open a marker are taken from the
+    /// program and the selection.
+    pub(crate) fn gutter_line_at(&self, position: GpuiPoint<Pixels>, cx: &App) -> Option<i32> {
+        let content = self.terminal.read(cx).last_content();
+        let bounds = content.terminal_bounds;
+        let gutter_left = bounds.bounds.origin.x - bounds.cell_width;
+        if position.x >= bounds.bounds.origin.x
+            || position.x < gutter_left
+            || bounds.line_height <= px(0.)
+        {
+            return None;
+        }
+        let row =
+            ((position.y - bounds.bounds.origin.y + self.scroll_top) / bounds.line_height).floor();
+        if row < 0. || row >= bounds.num_lines() as f32 {
+            return None;
+        }
+        let display_offset = i32::try_from(content.display_offset).ok()?;
+        let line = i32::try_from(row as i64).ok()? - display_offset;
+        let takes_line = self.line_highlight_available(cx)
+            || (self.gutter_marker_click.is_some() && self.gutter_marker_at(line, cx).is_some());
+        takes_line.then_some(line)
     }
 
     fn visible_lines(&self, cx: &App) -> RangeInclusive<i32> {
@@ -1893,143 +1678,247 @@ impl TerminalView {
         Some(Point::new(line, column))
     }
 
-    fn scrollback_position(&self, point: Point, cx: &App) -> Option<(i64, usize)> {
+    fn scrollback_line(&self, line: i32, cx: &App) -> Option<i64> {
         let content = self.terminal.read(cx).last_content();
         let history_lines =
             i64::try_from(content.total_lines).ok()? - i64::try_from(content.screen_lines).ok()?;
-        Some((history_lines + i64::from(point.line), point.column))
+        Some(history_lines + i64::from(line))
     }
 
-    fn grid_point(&self, (row, column): (i64, usize), cx: &App) -> Option<Point> {
+    fn grid_line(&self, row: i64, cx: &App) -> Option<i32> {
         let content = self.terminal.read(cx).last_content();
         let history_lines =
             i64::try_from(content.total_lines).ok()? - i64::try_from(content.screen_lines).ok()?;
-        Some(Point::new(i32::try_from(row - history_lines).ok()?, column))
+        i32::try_from(row - history_lines).ok()
     }
 
     pub(crate) fn set_pointer_cell(
         &mut self,
         pointer_cell: Option<(usize, usize)>,
+        pointer_x: Option<f32>,
         cx: &mut Context<Self>,
     ) {
-        if self.pointer_cell == pointer_cell {
+        if self.pointer_cell == pointer_cell && self.pointer_x == pointer_x {
             return;
         }
+        let cell_changed = self.pointer_cell != pointer_cell;
+        let hovered_handle = (
+            self.shows_line_column_resize_cursor(cx),
+            self.line_highlight_handle_tooltip(cx),
+        );
         self.pointer_cell = pointer_cell;
-        if !self.takes_mouse_for_text_block_pick() {
-            return;
-        }
-        if self.extending_text_block {
-            if let Some(point) = self.pointer_point(cx) {
-                self.drag_text_block_end(point, cx);
-            }
-            cx.notify();
-            return;
-        }
-        // An extended pick stays put until a press elsewhere, and so does a
-        // pick while the pointer is on the cells that extend it.
-        let extended = self
-            .text_block_pick
+        self.pointer_x = pointer_x;
+        let handle_drag = self
+            .line_highlight_drag
             .as_ref()
-            .is_some_and(|pick| pick.extend_to.is_some());
-        if extended || self.pointer_in_text_block_grab_zone(cx) {
-            cx.notify();
+            .is_some_and(|drag| drag.grab != LineHighlightGrab::Line);
+        if !cell_changed && !handle_drag {
+            // Handles are in reach of part of a cell.
+            if hovered_handle
+                != (
+                    self.shows_line_column_resize_cursor(cx),
+                    self.line_highlight_handle_tooltip(cx),
+                )
+            {
+                cx.notify();
+            }
             return;
         }
-        // A pointer leaving the terminal keeps the pick where it was, so
-        // the keyboard can carry on from there.
-        let Some(position) = self
-            .pointer_point(cx)
-            .and_then(|point| self.scrollback_position(point, cx))
-        else {
+        let Some(line) = self.pointer_point(cx).map(|point| point.line) else {
             return;
         };
-        if let Some(pick) = &mut self.text_block_pick {
-            pick.position = Some(position);
+        // A drag from a gutter marker highlights lines instead of opening the
+        // marker.
+        if let Some(pressed_line) = self.gutter_press
+            && pressed_line != line
+            && self.line_highlight_available(cx)
+        {
+            self.gutter_press = None;
+            self.start_line_highlight(Some(pressed_line), cx);
+            self.begin_gutter_line_drag(pressed_line);
+        }
+        let Some(drag) = &mut self.line_highlight_drag else {
+            return;
+        };
+        match drag.grab {
+            LineHighlightGrab::Line => {
+                if line != drag.pressed_line {
+                    drag.moved = true;
+                }
+                if drag.moved {
+                    self.set_line_highlight_head(line, cx);
+                }
+            }
+            edge => {
+                drag.moved = true;
+                if let Some(x) = self.pointer_x {
+                    self.drag_line_highlight_handle(edge, line, x, cx);
+                }
+            }
         }
         cx.notify();
     }
 
-    /// What clicking or Enter does to the picked block, and the other keys.
-    /// The block is looked up here rather than at paint, so the hint
-    /// matches the block that this frame highlights.
-    fn text_block_pick_hint(&self, cx: &App) -> Option<SharedString> {
-        if !self.takes_mouse_for_text_block_pick() {
-            return None;
+    /// A drag from the gutter, which moves the highlight it started by
+    /// lines.
+    fn begin_gutter_line_drag(&mut self, pressed_line: i32) {
+        if let Some(before) = self.line_highlight.clone() {
+            self.line_highlight_drag = Some(LineHighlightDrag {
+                pressed_line,
+                moved: false,
+                collapse_on_click: false,
+                grab: LineHighlightGrab::Line,
+                before,
+            });
         }
-        let pick = self.text_block_pick.as_ref()?;
-        let level = pick.level;
-        let picked = self.picked_text(cx);
-        let position = picked.as_ref().and_then(|picked| {
-            let parent = picked.parent.as_ref()?;
-            let units = self.block_units(parent, level, cx);
-            let index = units.iter().position(|unit| *unit == picked.block)?;
-            Some(format!(" {}/{}", index + 1, units.len()))
-        });
-        let collected = picked.as_ref().map_or(0, |picked| picked.collected.len());
-        let extended_lines = picked
-            .as_ref()
-            .filter(|_| pick.extend_to.is_some())
-            .map(|picked| picked.block.rows.len());
-        let label = picked.map(|picked| picked.block).map(|block| {
-            block.label.or_else(|| {
-                self.selection_action
-                    .as_ref()
-                    .map(|action| action.label.clone())
-            })
-        });
-        let escape = if pick.extend_to.is_some() {
-            "Esc to reset".to_string()
-        } else if collected > 0 {
-            "Esc to clear".to_string()
-        } else {
-            match self.next_distinct_level(false, cx) {
-                Some(wider) => format!("Esc for the {}", wider.name()),
-                None => "Esc to cancel".to_string(),
-            }
-        };
-        let mut level_name = level.name().to_string();
-        if let Some(first) = level_name.get_mut(..1) {
-            first.make_ascii_uppercase();
-        }
-        let picked_count = if collected > 0 {
-            format!(" · {} picked", collected + 1)
-        } else {
-            String::new()
-        };
-        let place = match extended_lines {
-            Some(1) => "Extending · 1 line".to_string(),
-            Some(lines) => format!("Extending · {lines} lines"),
-            None => format!("{level_name}{}{picked_count}", position.unwrap_or_default()),
-        };
-        Some(match label {
-            Some(Some(label)) => format!(
-                "{place} · {label}: click or Enter · Shift+↑↓ to add · ↑↓ to move · ←→ for message, paragraph or sentence · {escape}"
-            )
-            .into(),
-            _ => format!("Point at a message · ↑↓ to move · {escape}").into(),
-        })
     }
 
-    fn text_block_at(&self, point: Point, cx: &App) -> Option<TextBlock> {
-        let provider = self.text_block_provider.as_ref()?;
-        provider(self.terminal.read(cx), point, cx).filter(|block| !block.rows.is_empty())
-    }
-
-    /// Looks the picked block up again, since output may have changed it,
-    /// and ends a pick the terminal lost focus during. Runs before every
-    /// paint.
-    pub(crate) fn update_picked_text_block(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.takes_mouse_for_text_block_pick() && !self.focus_handle.is_focused(window) {
-            self.text_block_pick = None;
-            // This paint already has the pick's border and hint.
+    pub(crate) fn set_gutter_hover_line(&mut self, line: Option<i32>, cx: &mut Context<Self>) {
+        if self.gutter_hover_line != line {
+            self.gutter_hover_line = line;
             cx.notify();
         }
-        self.picked_text_block = None;
-        if !self.takes_mouse_for_text_block_pick() {
+    }
+
+    /// The highlighted text without whitespace and box borders.
+    fn line_highlight_text(&self, highlighted: &HighlightedLines, cx: &App) -> String {
+        let terminal = self.terminal.read(cx);
+        let num_columns = terminal.last_content().terminal_bounds.num_columns();
+        let last_column = num_columns.saturating_sub(1);
+        let rows = highlighted
+            .lines
+            .clone()
+            .map(|line| {
+                let start = match highlighted.start_column {
+                    Some(column) if line == *highlighted.lines.start() => column,
+                    _ => 0,
+                };
+                let end = match highlighted.end_column {
+                    Some(column) if line == *highlighted.lines.end() => column,
+                    _ => last_column,
+                };
+                (line, start..=end)
+            })
+            .collect::<Vec<_>>();
+        terminal
+            .rows_text(&rows)
+            .concat()
+            .chars()
+            .filter(|character| !is_ignored_by_anchor(*character))
+            .collect()
+    }
+
+    /// Finds the highlighted text again after a resize, once the program has
+    /// redrawn: where it shows closest to where it was, else the last line.
+    fn schedule_line_highlight_refind(
+        &mut self,
+        text: String,
+        near_row: i64,
+        near_column: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.line_highlight_refind = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(LINE_HIGHLIGHT_REFIND_DELAY)
+                .await;
+            this.update(cx, |this, cx| {
+                this.line_highlight_refind = None;
+                if this.line_highlight.is_none() {
+                    return;
+                }
+                let terminal = this.terminal.read(cx);
+                let found = ScreenText::new(&terminal.grid_cells()).find(
+                    &text,
+                    near_row,
+                    near_column,
+                    terminal.last_content(),
+                );
+                match found {
+                    Some((start, end)) => this.set_found_line_highlight(start, end, cx),
+                    None => {
+                        let line = this.last_text_line(cx);
+                        this.set_line_highlight(line, line, cx);
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Highlights text found again from its first and last cells. An edge
+    /// with only ignored characters beyond it on its logical line covers
+    /// the line's full start or end.
+    fn set_found_line_highlight(&mut self, start: Point, end: Point, cx: &mut Context<Self>) {
+        self.set_line_highlight(start.line, end.line, cx);
+        let only_ignored = |lines: RangeInclusive<i32>, keep: &dyn Fn(i32, usize) -> bool| {
+            self.terminal.read(cx).grid_rows(lines).iter().all(|row| {
+                row.characters
+                    .iter()
+                    .enumerate()
+                    .filter(|(column, _)| keep(row.line, *column))
+                    .all(|(_, character)| is_ignored_by_anchor(*character))
+            })
+        };
+        let start_is_line_start = only_ignored(
+            *self.logical_line(start.line, cx).start()..=start.line,
+            &|line, column| line < start.line || column < start.column,
+        );
+        let end_is_line_end = only_ignored(
+            end.line..=*self.logical_line(end.line, cx).end(),
+            &|line, column| line > end.line || column > end.column,
+        );
+        let start = (!start_is_line_start)
+            .then(|| Some((self.scrollback_line(start.line, cx)?, start.column)))
+            .flatten();
+        let end = (!end_is_line_end)
+            .then(|| Some((self.scrollback_line(end.line, cx)?, end.column)))
+            .flatten();
+        if let Some(highlight) = &mut self.line_highlight {
+            highlight.start = start;
+            highlight.end = end;
+        }
+    }
+
+    /// Looks the highlight up again, since output may have moved it, ends a
+    /// mode the terminal lost focus during, and finds the highlight again
+    /// after a resize. Runs before every paint.
+    pub(crate) fn update_line_highlight(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.takes_mouse_for_line_highlight()
+            && !self.focus_handle.is_focused(window)
+            && self.context_menu.is_none()
+        {
+            self.exit_line_highlight(cx);
+        }
+        let bounds = self.terminal.read(cx).last_content().terminal_bounds;
+        let grid_size = (bounds.num_columns(), bounds.num_lines());
+        let resized = self.grid_size != (0, 0) && self.grid_size != grid_size;
+        self.grid_size = grid_size;
+        if resized
+            && self.line_highlight.is_some()
+            && let Some((text, near_row, near_column)) = self.line_highlight_text.take()
+        {
+            self.schedule_line_highlight_refind(text, near_row, near_column, cx);
+        }
+        self.highlighted_lines = None;
+        if self.line_highlight.is_none() {
             return;
         }
-        self.picked_text_block = self.picked_text(cx);
+        // Kept up while suspended too, as the highlight moved on to the line
+        // after the commented ones.
+        let highlighted = self.line_highlight_lines(cx);
+        if self.line_highlight_refind.is_none()
+            && let Some(highlighted) = &highlighted
+            && let Some(near_row) = self.scrollback_line(*highlighted.lines.start(), cx)
+        {
+            self.line_highlight_text = Some((
+                self.line_highlight_text(highlighted, cx),
+                near_row,
+                highlighted.start_column,
+            ));
+        }
+        if self.takes_mouse_for_line_highlight() {
+            self.highlighted_lines = highlighted;
+        }
     }
 
     fn shows_workspace_actions(&self) -> bool {
@@ -2101,7 +1990,7 @@ impl TerminalView {
     /// Commits (sends) the given text to the PTY. Called by InputHandler::replace_text_in_range.
     pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !self.read_only && !text.is_empty() {
-            self.cancel_text_block_pick(cx);
+            self.exit_line_highlight(cx);
             self.terminal.update(cx, |term, _| {
                 term.input(text.to_string().into_bytes());
             });
@@ -2225,10 +2114,14 @@ impl TerminalView {
         cx.emit(Event::Wakeup);
     }
 
+    /// Shows the context menu. The selection action runs on a selection the
+    /// user made, else it starts the line highlight mode on `clicked_line`.
     pub fn deploy_context_menu(
         &mut self,
         position: GpuiPoint<Pixels>,
         has_selection: bool,
+        has_user_selection: bool,
+        clicked_line: Option<i32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2240,8 +2133,15 @@ impl TerminalView {
         let selection_action = self
             .selection_action
             .clone()
-            .filter(|_| has_selection)
+            .filter(|_| has_user_selection && self.selection_menu_entry_available(cx))
             .zip(self.selection_action_target(window, cx));
+        let line_highlight_entry = self
+            .selection_action
+            .as_ref()
+            .map(|selection_action| selection_action.label.clone())
+            .filter(|_| selection_action.is_none() && self.line_highlight_available(cx))
+            .zip(clicked_line);
+        let terminal_view = self.self_handle.clone();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -2255,12 +2155,36 @@ impl TerminalView {
                 .action("Copy", Box::new(Copy))
                 .when_some(
                     selection_action,
-                    |menu, (SelectionAction { label, handler }, (range, text, origin))| {
-                        menu.entry(label, None, move |window, cx| {
-                            handler(range, text.clone(), None, origin, window, cx)
-                        })
+                    |menu,
+                     (
+                        SelectionAction {
+                            label,
+                            handler,
+                            menu_action,
+                            ..
+                        },
+                        (range, _, origin),
+                    )| {
+                        match menu_action {
+                            Some(menu_action) => {
+                                menu.action(label, menu_action.action.boxed_clone())
+                            }
+                            None => menu.entry(label, None, move |window, cx| {
+                                handler(range, origin, window, cx)
+                            }),
+                        }
                     },
                 )
+                .when_some(line_highlight_entry, |menu, (label, line)| {
+                    menu.entry(label, None, move |window, cx| {
+                        terminal_view
+                            .update(cx, |terminal_view, cx| {
+                                terminal_view.start_line_highlight(Some(line), cx);
+                                window.focus(&terminal_view.focus_handle, cx);
+                            })
+                            .log_err();
+                    })
+                })
                 .when(
                     !self.read_only && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
@@ -2654,7 +2578,7 @@ impl TerminalView {
         let Some(clipboard) = cx.read_from_clipboard() else {
             return;
         };
-        self.cancel_text_block_pick(cx);
+        self.exit_line_highlight(cx);
 
         match clipboard.entries().first() {
             Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
@@ -2694,7 +2618,7 @@ impl TerminalView {
         };
 
         if let Some(text) = clipboard.text() {
-            self.cancel_text_block_pick(cx);
+            self.exit_line_highlight(cx);
             self.terminal
                 .update(cx, |terminal, _cx| terminal.paste(&text));
         }
@@ -2727,7 +2651,7 @@ impl TerminalView {
         if self.read_only {
             return;
         }
-        self.cancel_text_block_pick(cx);
+        self.exit_line_highlight(cx);
         self.clear_bell(cx);
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
         self.terminal.update(cx, |term, _| {
@@ -2739,7 +2663,7 @@ impl TerminalView {
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
             self.clear_bell(cx);
             self.blink_manager.update(cx, BlinkManager::pause_blinking);
-            self.cancel_text_block_pick(cx);
+            self.exit_line_highlight(cx);
             self.process_keystroke(&keystroke, cx);
         }
     }
@@ -2824,8 +2748,8 @@ impl TerminalView {
         if self.terminal.read(cx).last_content.selection.is_some() {
             dispatch_context.add("selection");
         }
-        if self.takes_mouse_for_text_block_pick() {
-            dispatch_context.add("text_block_pick");
+        if self.takes_mouse_for_line_highlight() {
+            dispatch_context.add("line_highlight");
         }
 
         dispatch_context
@@ -3061,9 +2985,9 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
-        // Keys that picking binds never get here, and any other key types
-        // into the program as usual.
-        self.cancel_text_block_pick(cx);
+        // Keys that the line highlight mode binds never get here, and any
+        // other key ends the mode and types into the program as usual.
+        self.exit_line_highlight(cx);
         self.pause_cursor_blinking(window, cx);
 
         if event.prefer_character_input
@@ -3101,9 +3025,10 @@ impl TerminalView {
     }
 
     fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.extending_text_block = false;
-        if let Some(pick) = &mut self.text_block_pick {
-            pick.extend_to = None;
+        // The mode carries on while its action has focus, or the context
+        // menu opened from it.
+        if !self.line_highlight_suspended && self.context_menu.is_none() {
+            self.exit_line_highlight(cx);
         }
         self.blink_manager.update(cx, BlinkManager::disable);
         self.terminal.update(cx, |terminal, _| {
@@ -3164,32 +3089,96 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
+            .when(self.takes_mouse_for_line_highlight(), |this| {
+                this.on_action(cx.listener(|this, _: &MoveLineHighlightUp, _, cx| {
+                    this.move_line_highlight(false, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLineHighlightDown, _, cx| {
+                    this.move_line_highlight(true, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLineHighlightEndUp, _, cx| {
+                    this.move_line_highlight_end(false, false, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLineHighlightEndDown, _, cx| {
+                    this.move_line_highlight_end(false, true, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLineHighlightFarEndUp, _, cx| {
+                    this.move_line_highlight_end(true, false, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLineHighlightFarEndDown, _, cx| {
+                    this.move_line_highlight_end(true, true, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ExtendLineHighlightByWord, _, cx| {
+                    this.move_line_highlight_end_by_word(true, cx)
+                }))
+                .on_action(cx.listener(|this, _: &TrimLineHighlightByWord, _, cx| {
+                    this.move_line_highlight_end_by_word(false, cx)
+                }))
+                .on_action(cx.listener(Self::confirm_line_highlight))
+                .on_action(
+                    cx.listener(|this, _: &MoveLineHighlightStartLeftByWord, _, cx| {
+                        this.move_line_highlight_start_by_word(false, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &MoveLineHighlightStartRightByWord, _, cx| {
+                        this.move_line_highlight_start_by_word(true, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &ExitLineHighlight, _, cx| {
+                    if !this.cancel_line_highlight_drag(cx) {
+                        this.exit_line_highlight(cx)
+                    }
+                }))
+            })
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    if !this
-                        .terminal
-                        .read(cx)
-                        .mouse_mode(event.modifiers.shift, this.mouse_input_mode())
+                    let gutter_line = this.gutter_line_at(event.position, cx);
+                    if gutter_line.is_none()
+                        && this
+                            .terminal
+                            .read(cx)
+                            .mouse_mode(event.modifiers.shift, this.mouse_input_mode())
                     {
-                        let had_selection = this.terminal.read(cx).last_content.selection.is_some();
-                        if !had_selection {
-                            this.terminal.update(cx, |terminal, _| {
-                                terminal.select_word_at_event_position(event);
-                            });
-                        }
-                        let has_selection = !had_selection
-                            || this
-                                .terminal
-                                .read(cx)
-                                .last_content
-                                .selection_text
-                                .as_ref()
-                                .is_some_and(|text| !text.is_empty());
-                        this.deploy_context_menu(event.position, has_selection, window, cx);
-                        cx.notify();
+                        return;
                     }
+                    let clicked_line = gutter_line.or_else(|| {
+                        let terminal = this.terminal.read(cx);
+                        let mut position = event.position;
+                        position.y += this.scroll_top;
+                        Some(terminal.grid_point_at(position).line)
+                    });
+                    let had_selection = this.terminal.read(cx).last_content.selection.is_some();
+                    // A right-click in the gutter or the highlight mode is
+                    // about lines, not the word under it.
+                    let selects_word = !had_selection
+                        && gutter_line.is_none()
+                        && !this.takes_mouse_for_line_highlight();
+                    if selects_word {
+                        this.terminal.update(cx, |terminal, _| {
+                            terminal.select_word_at_event_position(event);
+                        });
+                    }
+                    let has_selection = had_selection
+                        && this
+                            .terminal
+                            .read(cx)
+                            .last_content
+                            .selection_text
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty());
+                    // The gutter's entry always starts the mode on its line.
+                    this.deploy_context_menu(
+                        event.position,
+                        has_selection || selects_word,
+                        has_selection && gutter_line.is_none(),
+                        clicked_line,
+                        window,
+                        cx,
+                    );
+                    cx.notify();
                 }),
             )
             .child(
@@ -3239,31 +3228,32 @@ impl Render for TerminalView {
                         )
                     }),
             )
-            .when_some(self.text_block_pick_hint(cx), |this, hint| {
+            .when(self.takes_mouse_for_line_highlight(), |this| {
                 let colors = cx.theme().colors();
+                let mode_label = self
+                    .selection_action
+                    .as_ref()
+                    .map(|selection_action| selection_action.mode_label.clone())
+                    .unwrap_or_default();
                 this.child(
                     div()
                         .absolute()
                         .inset_0()
                         .border_1()
-                        .border_color(colors.border_focused),
+                        .border_color(colors.text_accent),
                 )
                 .child(
                     div()
+                        .id("line-highlight-mode-label")
                         .absolute()
-                        .bottom_1()
+                        .top_1()
                         .right_3()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.elevated_surface_background)
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
-                        .children(self.render_text_block_level_buttons(cx)),
+                        .child(
+                            Label::new(mode_label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .tooltip(Tooltip::text(LINE_HIGHLIGHT_KEYS)),
                 )
             })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
@@ -3275,46 +3265,6 @@ impl Render for TerminalView {
                 )
                 .with_priority(1)
             }))
-    }
-}
-
-impl TerminalView {
-    /// Switches between picking messages, paragraphs and sentences, for
-    /// pointer users who don't know the keys.
-    fn render_text_block_level_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let current_level = self.text_block_pick_level()?;
-        let button = |id: &'static str, label: &'static str, level: TextBlockLevel| {
-            Button::new(id, label)
-                .label_size(LabelSize::XSmall)
-                .toggle_state(current_level == level)
-                .tooltip(Tooltip::text(format!(
-                    "Pick a {} · ←→ to change",
-                    level.name()
-                )))
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.set_text_block_pick_level(level, cx)
-                }))
-        };
-        Some(
-            h_flex()
-                .gap_0p5()
-                .child(button(
-                    "text-block-level-message",
-                    "Message",
-                    TextBlockLevel::Message,
-                ))
-                .child(button(
-                    "text-block-level-paragraph",
-                    "Paragraph",
-                    TextBlockLevel::Paragraph,
-                ))
-                .child(button(
-                    "text-block-level-sentence",
-                    "Sentence",
-                    TextBlockLevel::Sentence,
-                ))
-                .into_any_element(),
-        )
     }
 }
 
@@ -4064,617 +4014,6 @@ mod tests {
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
-    /// `text` without its first line break and the indentation its lines
-    /// share.
-    fn dedent(text: &str) -> String {
-        let text = text.strip_prefix('\n').unwrap_or(text);
-        let text = text.trim_end_matches(' ');
-        let indent = text
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.len() - line.trim_start().len())
-            .min()
-            .unwrap_or(0);
-        text.lines()
-            .map(|line| format!("{}\n", line.get(indent..).unwrap_or("")))
-            .collect()
-    }
-
-    /// The grid rows of `text`, padded to `width` columns, and a block of
-    /// its lines with text. A line ending in `\` wraps.
-    fn text_grid(text: &str, width: usize) -> (Vec<GridRow>, TextBlock) {
-        let mut grid_rows = Vec::new();
-        let mut block_rows = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let (line, wraps) = match line.strip_suffix('\\') {
-                Some(line) => (line, true),
-                None => (line, false),
-            };
-            let mut characters = line.chars().collect::<Vec<_>>();
-            characters.resize(width.max(characters.len()), ' ');
-            let line_number = index as i32;
-            let first = characters
-                .iter()
-                .position(|character| !character.is_whitespace());
-            let last = characters
-                .iter()
-                .rposition(|character| !character.is_whitespace());
-            if let (Some(first), Some(last)) = (first, last) {
-                let last = if wraps { characters.len() - 1 } else { last };
-                block_rows.push((line_number, first..=last));
-            }
-            grid_rows.push(GridRow {
-                line: line_number,
-                characters,
-                wide_char_spacers: Vec::new(),
-                wraps,
-            });
-        }
-        let block = TextBlock {
-            rows: block_rows,
-            text: String::new(),
-            label: None,
-            paragraphs: Vec::new(),
-        };
-        (grid_rows, block)
-    }
-
-    fn rows_text(rows: &[(i32, RangeInclusive<usize>)], grid_rows: &[GridRow]) -> String {
-        let mut text = String::new();
-        for (line, columns) in rows {
-            let Some(row) = grid_rows.iter().find(|row| row.line == *line) else {
-                continue;
-            };
-            let row_text = columns
-                .clone()
-                .filter_map(|column| row.characters.get(column))
-                .collect::<String>();
-            if !text.is_empty() && !text.ends_with(' ') {
-                text.push(' ');
-            }
-            text.push_str(row_text.trim());
-        }
-        text
-    }
-
-    fn paragraph_texts(block: &TextBlock, grid_rows: &[GridRow]) -> Vec<String> {
-        paragraph_rows(block, grid_rows)
-            .iter()
-            .map(|rows| rows_text(rows, grid_rows))
-            .collect()
-    }
-
-    fn sentence_texts(block: &TextBlock, grid_rows: &[GridRow]) -> Vec<String> {
-        paragraph_rows(block, grid_rows)
-            .iter()
-            .flat_map(|paragraph| sentence_rows(paragraph, grid_rows))
-            .map(|rows| rows_text(&rows, grid_rows))
-            .collect()
-    }
-
-    fn paragraphs_of(text: &str) -> Vec<String> {
-        let (grid_rows, block) = text_grid(text, 40);
-        paragraph_texts(&block, &grid_rows)
-    }
-
-    #[test]
-    fn test_paragraphs_of_an_agent_message() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  The build failed because the linker
-                  couldn't find the library. I fixed
-                  Cargo.toml and reran the tests.
-
-                  All of them pass now.
-            "
-            )),
-            vec![
-                "The build failed because the linker couldn't find the library. I fixed Cargo.toml and reran the tests.",
-                "All of them pass now.",
-            ],
-            "rows the program wrapped join, a row starting with \"I\" or a \
-             name included, and a blank line ends a paragraph"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_full_rows_the_program_wrapped() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  The build failed because the linker said
-                   it could not find the library.
-
-                  All of them pass now.
-            "
-            )),
-            vec![
-                "The build failed because the linker said it could not find the library.",
-                "All of them pass now.",
-            ],
-            "a row the program filled to the edge carries the space between \
-             its words over to the start of the next row"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_rows_starting_with_a_hyphenated_word() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  I inferred that from how the old one
-                  ca-respawn cleans up stopped sessions.
-            "
-            )),
-            vec!["I inferred that from how the old one ca-respawn cleans up stopped sessions."],
-        );
-    }
-
-    fn paragraphs_at_width(text: &str, width: usize) -> Vec<String> {
-        let (grid_rows, block) = text_grid(text, width);
-        paragraph_texts(&block, &grid_rows)
-    }
-
-    #[test]
-    fn test_paragraphs_join_rows_starting_with_code_words() {
-        let expected = vec![
-            "The reviewer approved the change in round 2 with no open findings. Agent comments still work in the code editor, the agent panel and the terminal: every agent_comments item they use still has callers. Clippy is clean, all 33 agent_comments tests pass and all 36 markdown_preview tests pass, including all four close_and_return_to_editor_* tests.",
-            "- Spec line 17 is wrong. The agent panel and terminal don't use the markdown crate's on_selection_action or selection_action_in_range_highlights. Those two, plus set_range_highlights and cursor_offset, now have no callers outside the markdown crate. Spec line 26 puts the markdown crate out of scope, so I left them; removing them could be a follow-up change.",
-            "- Removed AgentCommentStore::offset_ranges and its test test_store_offset_ranges_follow_edits; the preview was the only real caller (should-fix).",
-            "- Removed an empty impl MarkdownPreviewView {} block (nit).",
-        ];
-        let wide = "
-  The reviewer approved the change in round 2 with no open findings. Agent comments still work in the code
-  editor, the agent panel and the terminal: every agent_comments item they use still has callers. Clippy is
-  clean, all 33 agent_comments tests pass and all 36 markdown_preview tests pass, including all four
-  close_and_return_to_editor_* tests.
-
-  - Spec line 17 is wrong. The agent panel and terminal don't use the markdown crate's on_selection_action or
-    selection_action_in_range_highlights. Those two, plus set_range_highlights and cursor_offset, now have no
-    callers outside the markdown crate. Spec line 26 puts the markdown crate out of scope, so I left them;
-    removing them could be a follow-up change.
-
-  - Removed AgentCommentStore::offset_ranges and its test test_store_offset_ranges_follow_edits; the preview was
-    the only real caller (should-fix).
-  - Removed an empty impl MarkdownPreviewView {} block (nit).
-";
-        let narrow = "
-  The reviewer approved the change in round 2 with no open findings. Agent comments
-  still work in the code editor, the agent panel and the terminal: every
-  agent_comments item they use still has callers. Clippy is clean, all 33
-  agent_comments tests pass and all 36 markdown_preview tests pass, including all
-  four close_and_return_to_editor_* tests.
-
-  - Spec line 17 is wrong. The agent panel and terminal don't use the markdown
-    crate's on_selection_action or selection_action_in_range_highlights. Those two,
-    plus set_range_highlights and cursor_offset, now have no callers outside the
-    markdown crate. Spec line 26 puts the markdown crate out of scope, so I left
-    them; removing them could be a follow-up change.
-
-  - Removed AgentCommentStore::offset_ranges and its test
-    test_store_offset_ranges_follow_edits; the preview was the only real caller
-    (should-fix).
-  - Removed an empty impl MarkdownPreviewView {} block (nit).
-";
-        assert_eq!(paragraphs_at_width(wide, 114), expected);
-        assert_eq!(paragraphs_at_width(narrow, 88), expected);
-    }
-
-    #[test]
-    fn test_paragraphs_join_rows_starting_with_a_path_or_method() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  I changed the lookup in the file
-                  src/foo.rs and then the call to
-                  Store::offset_ranges as well.
-            "
-            )),
-            vec!["I changed the lookup in the file src/foo.rs and then the call to Store::offset_ranges as well."],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_code_lines_ending_in_semicolons_apart() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  let first_value = compute_value(a);
-                  let second_value = compute_other(b);
-            "
-            )),
-            vec![
-                "let first_value = compute_value(a);",
-                "let second_value = compute_other(b);",
-            ],
-        );
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  let long_binding_name = build(one, two);
-                  let another_long_name_here = make(three);
-            "
-            )),
-            vec![
-                "let long_binding_name = build(one, two);",
-                "let another_long_name_here = make(three);",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_short_rows_before_long_identifiers_apart() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  ok done
-                      some_very_long_identifier_name_here
-            "
-            )),
-            vec!["ok done", "some_very_long_identifier_name_here"],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_short_rows_before_long_tokens_apart() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  Compiling foo
-                  target/debug/build/foo-1a2b/out/gen.rs
-            "
-            )),
-            vec!["Compiling foo", "target/debug/build/foo-1a2b/out/gen.rs"],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_apart_a_call_row_after_a_joined_row() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  Then I set the value in the old
-                  place for it, a = compute(one);
-                  some_other_function_name(two);
-            "
-            )),
-            vec![
-                "Then I set the value in the old place for it, a = compute(one);",
-                "some_other_function_name(two);",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_end_where_the_next_word_would_have_fit() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                Checked the parser and the lexer files
-                and both pass the full test suite.
-                All good.
-            "
-            )),
-            vec![
-                "Checked the parser and the lexer files and both pass the full test suite.",
-                "All good.",
-            ],
-            "a program filling rows up to its widest one would have put \"All\" \
-             on the row above"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_ignore_wider_rows_of_other_paragraphs() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                cargo test --package terminal_view --lib -- paragraphs
-
-                The old session may still show as a
-                running one for a moment after start.
-            "
-            )),
-            vec![
-                "cargo test --package terminal_view --lib -- paragraphs",
-                "The old session may still show as a running one for a moment after start.",
-            ],
-            "a command wider than the paragraph says nothing of its wrap width"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_rows_ending_in_a_number() {
-        assert_eq!(
-            paragraphs_of("Each retry waits for a while, about 3\nseconds before it gives up.\n"),
-            vec!["Each retry waits for a while, about 3 seconds before it gives up."],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_apart_rows_one_column_deeper_short_of_the_width() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                  Here is what the compiler said about it
-                   error in the parser module
-            "
-            )),
-            vec![
-                "Here is what the compiler said about it",
-                "error in the parser module",
-            ],
-            "only a row that fills the width carries a space to the next row"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_apart_log_lines_ending_in_a_number() {
-        assert_eq!(
-            paragraphs_of("Retrying the request to the server, try 2\nWaiting for the server\n"),
-            vec!["Retrying the request to the server, try 2", "Waiting for the server"],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_full_rows_of_a_program_wrapping_narrower() {
-        let (grid_rows, block) = text_grid(
-            "The parser keeps the old API as it is\n wrapped, and the new one sits beside\nit for now.\n",
-            50,
-        );
-        assert_eq!(
-            paragraph_texts(&block, &grid_rows),
-            vec!["The parser keeps the old API as it is wrapped, and the new one sits beside it for now."],
-            "a row as wide as another row of the paragraph is full, though short of the edge"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_full_rows_shown_by_later_rows() {
-        let (grid_rows, block) = text_grid(
-            "The parser keeps the old API as it is\n wrapped, and the new one is in\nanother module that sits beside it in\none file.\n",
-            40,
-        );
-        assert_eq!(
-            paragraph_texts(&block, &grid_rows),
-            vec!["The parser keeps the old API as it is wrapped, and the new one is in another module that sits beside it in one file."],
-            "a later row as wide as the first shows the first is full"
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_measure_wide_characters_in_cells() {
-        let (mut grid_rows, block) = text_grid(
-            "The word for the world in Chinese is\n世 界  is how the words are written there.\n",
-            40,
-        );
-        grid_rows[1].wide_char_spacers = vec![1, 3];
-        assert_eq!(paragraph_rows(&block, &grid_rows).len(), 1);
-    }
-
-    #[test]
-    fn test_paragraphs_keep_apart_log_lines_ending_in_a_bracketed_number() {
-        assert_eq!(
-            paragraphs_of("Retrying a request to the host (try 2)\nWaiting for the server\n"),
-            vec!["Retrying a request to the host (try 2)", "Waiting for the server"],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_join_rows_the_terminal_wrapped() {
-        assert_eq!(
-            paragraphs_of("A row the terminal wrapped at its edg\\\ne goes on.\nNext line\n"),
-            vec![
-                "A row the terminal wrapped at its edg e goes on.",
-                "Next line"
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_of_bullets_with_wrapped_rows() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                - First step that takes long enough
-                  to wrap onto a second row.
-                - Second step.
-                  • A nested bullet that is long
-                    enough to wrap as well.
-                * Third step.
-            "
-            )),
-            vec![
-                "- First step that takes long enough to wrap onto a second row.",
-                "- Second step.",
-                "• A nested bullet that is long enough to wrap as well.",
-                "* Third step.",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_of_numbered_and_lettered_lists() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                1. Move the parser into its own crate
-                   so it can be tested alone.
-                2. Add tests.
-                a) Keep the old API as it is for the
-                   time being.
-                b) Remove it.
-            "
-            )),
-            vec![
-                "1. Move the parser into its own crate so it can be tested alone.",
-                "2. Add tests.",
-                "a) Keep the old API as it is for the time being.",
-                "b) Remove it.",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_keep_code_diffs_listings_and_logs_apart() {
-        for text in [
-            &dedent(
-                "
-                fn long_name(arg: Type) -> Result {
-                    let value = compute(arg);
-                    value
-            ",
-            ),
-            &dedent(
-                "
-                @@ -1,3 +1,4 @@ fn main() in a file
-                +    let added = line();
-                     unchanged context line
-            ",
-            ),
-            &dedent(
-                "
-                drwxr-xr-x  5 user staff 160 crates
-                drwxr-xr-x  5 user staff 160 assets
-            ",
-            ),
-            &dedent(
-                "
-                2026-11-10T10:00:01 INFO started ok
-                2026-11-10T10:00:02 INFO listening
-            ",
-            ),
-            &dedent(
-                "
-                error[E0308]: mismatched types here, found
-                warning: unused variable `value` in main
-            ",
-            ),
-            &dedent(
-                "
-                ## A heading on its own line
-                Text under the heading that is long
-            ",
-            ),
-        ] {
-            let paragraphs = paragraphs_of(text);
-            assert_eq!(paragraphs.len(), text.lines().count(), "{paragraphs:?}");
-        }
-    }
-
-    #[test]
-    fn test_paragraphs_of_quotes_and_tool_results() {
-        assert_eq!(
-            paragraphs_of(&dedent(
-                "
-                > A quoted reply that runs long enough
-                  to wrap onto the next row.
-                Read 42 lines from the file you named
-                and found nothing.
-            "
-            )),
-            vec![
-                "> A quoted reply that runs long enough to wrap onto the next row.",
-                "Read 42 lines from the file you named and found nothing.",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraph_runs_keep_their_lines_together() {
-        let (grid_rows, mut block) = text_grid(
-            &dedent(
-                "
-                1. Which auth method should we use?
-                   a) OAuth
-                   b) API key
-                2. Should tokens expire?
-            ",
-            ),
-            40,
-        );
-        block.paragraphs = vec![0..=2];
-        assert_eq!(
-            paragraph_texts(&block, &grid_rows),
-            vec![
-                "1. Which auth method should we use? a) OAuth b) API key",
-                "2. Should tokens expire?",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_paragraphs_of_wide_characters() {
-        let (mut grid_rows, block) = text_grid(
-            "界 is a wide character in a long row\nand this row carries it on.\n",
-            40,
-        );
-        grid_rows[0].characters.insert(1, ' ');
-        grid_rows[0].characters.pop();
-        grid_rows[0].wide_char_spacers = vec![1];
-        let block = TextBlock {
-            rows: vec![(0, 0..=36), (1, 0..=26)],
-            ..block
-        };
-        assert_eq!(paragraph_rows(&block, &grid_rows).len(), 1);
-    }
-
-    #[test]
-    fn test_sentences_of_paragraphs() {
-        let (grid_rows, block) = text_grid(
-            &dedent(
-                "
-                One. Two runs on over a row that the
-                program wrapped. Three
-                No stop
-            ",
-            ),
-            40,
-        );
-        assert_eq!(
-            sentence_texts(&block, &grid_rows),
-            vec![
-                "One.",
-                "Two runs on over a row that the program wrapped.",
-                "Three",
-                "No stop"
-            ],
-        );
-    }
-
-    #[test]
-    fn test_sentences_go_on_after_abbreviations() {
-        let (grid_rows, block) = text_grid(
-            "Use a parser, e.g. Pest. Ask Dr. Who. It ends etc. Then more.\n",
-            70,
-        );
-        assert_eq!(
-            sentence_texts(&block, &grid_rows),
-            vec![
-                "Use a parser, e.g. Pest.",
-                "Ask Dr. Who.",
-                "It ends etc.",
-                "Then more."
-            ],
-        );
-    }
-
-    #[test]
-    fn test_sentence_rows_skip_wide_char_spacers() {
-        // The spacer at column 1 holds a space in the grid.
-        let grid_rows = [GridRow {
-            line: 0,
-            characters: "界  x. Next.".chars().collect(),
-            wide_char_spacers: vec![1],
-            wraps: false,
-        }];
-        assert_eq!(
-            sentence_rows(&[(0, 0..=10)], &grid_rows),
-            vec![vec![(0, 0..=4)], vec![(0, 6..=10)]],
-        );
-    }
-
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
         for path in paths {
@@ -4949,42 +4288,32 @@ mod tests {
         );
     }
 
-    type SelectionActions = Rc<RefCell<Vec<(Range, String)>>>;
+    type SelectionActions = Rc<RefCell<Vec<Range>>>;
 
     fn record_selection_actions(
         terminal_view: &Entity<TerminalView>,
         cx: &mut VisualTestContext,
     ) -> SelectionActions {
         let actions = SelectionActions::default();
+        let weak_view = terminal_view.downgrade();
         terminal_view.update(cx, |terminal_view, cx| {
             let actions = actions.clone();
             terminal_view.on_selection_action(
-                "Act on Selection",
-                move |range, text, _, _, _, _| actions.borrow_mut().push((range, text)),
+                "Act on Lines",
+                "Acting",
+                move |range, _, _, cx| {
+                    actions.borrow_mut().push(range);
+                    // As a host does once its action opens.
+                    weak_view
+                        .update(cx, |terminal_view, cx| {
+                            terminal_view.advance_line_highlight(range.end().line, cx)
+                        })
+                        .log_err();
+                },
                 cx,
             );
         });
         actions
-    }
-
-    /// Writes `text` on the first line and returns the window position of
-    /// the middle of the cell at `column`.
-    fn write_first_line(
-        terminal: &Entity<Terminal>,
-        text: &str,
-        cx: &mut VisualTestContext,
-    ) -> impl Fn(f32) -> GpuiPoint<Pixels> + use<> {
-        cx.update(|window, cx| {
-            terminal.update(cx, |terminal, cx| {
-                terminal.write_output(text.as_bytes(), cx);
-                terminal.sync(window, cx);
-            });
-        });
-        cx.run_until_parked();
-        let bounds = terminal.read_with(cx, |terminal, _| terminal.last_content.terminal_bounds);
-        move |column| {
-            bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * 0.5)
-        }
     }
 
     fn drag(from: GpuiPoint<Pixels>, to: GpuiPoint<Pixels>, cx: &mut VisualTestContext) {
@@ -5060,262 +4389,810 @@ mod tests {
         );
     }
 
-    /// Offers a block on each of `lines`, spanning the line's first five
-    /// columns.
-    fn provide_line_blocks(
-        terminal_view: &Entity<TerminalView>,
-        lines: RangeInclusive<i32>,
-        cx: &mut VisualTestContext,
-    ) {
-        terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.set_text_block_provider(
-                move |_, point, _| {
-                    lines.contains(&point.line).then(|| TextBlock {
-                        rows: vec![(point.line, 0..=4)],
-                        text: "hello".into(),
-                        label: None,
-                        paragraphs: Vec::new(),
-                    })
-                },
-                cx,
-            );
-        });
-    }
+    const ENABLE_MOUSE_REPORTING: &str = "\x1b[?1002h\x1b[?1006h";
 
-    fn start_pick(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) {
-        terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.start_text_block_pick(cx)
+    const FIVE_LINES: &str = "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n";
+
+    fn write_output(terminal: &Entity<Terminal>, text: &str, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(text.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
         });
         cx.run_until_parked();
     }
 
-    fn move_pick(terminal_view: &Entity<TerminalView>, forward: bool, cx: &mut VisualTestContext) {
-        terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.move_text_block_pick(forward, cx)
-        });
-        cx.run_until_parked();
+    /// The window position of the middle of the cell at a column and a grid
+    /// line, where column -0.5 is the gutter.
+    fn cell_position(
+        terminal: &Entity<Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> impl Fn(f32, i32) -> GpuiPoint<Pixels> + use<> {
+        let bounds = terminal.read_with(cx, |terminal, _| terminal.last_content.terminal_bounds);
+        move |column, line| {
+            bounds.bounds.origin
+                + gpui::point(
+                    bounds.cell_width * column,
+                    bounds.line_height * (line as f32 + 0.5),
+                )
+        }
     }
 
-    fn picked_line(
+    fn highlighted(
         terminal_view: &Entity<TerminalView>,
         cx: &mut VisualTestContext,
-    ) -> Option<i32> {
-        terminal_view.read_with(cx, |terminal_view, _| {
-            let picked = terminal_view.picked_text_block.as_ref()?;
-            Some(picked.block.rows.first()?.0)
+    ) -> Option<(RangeInclusive<i32>, Option<usize>)> {
+        terminal_view.read_with(cx, |terminal_view, cx| {
+            terminal_view
+                .line_highlight_lines(cx)
+                .map(|highlighted| (highlighted.lines, highlighted.end_column))
         })
     }
 
-    fn is_picking(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> bool {
-        terminal_view.read_with(cx, |terminal_view, _| terminal_view.is_picking_text_block())
+    fn highlighted_lines(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<RangeInclusive<i32>> {
+        highlighted(terminal_view, cx).map(|(lines, _)| lines)
+    }
+
+    fn start_line_highlight(
+        terminal_view: &Entity<TerminalView>,
+        line: Option<i32>,
+        cx: &mut VisualTestContext,
+    ) {
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.start_line_highlight(line, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    fn has_line_highlight(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        terminal_view.read_with(cx, |terminal_view, _| terminal_view.has_line_highlight())
+    }
+
+    fn keys(keystrokes: &str, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes(keystrokes);
+        cx.run_until_parked();
     }
 
     #[gpui::test]
-    async fn hovering_highlights_nothing_until_a_pick_starts(cx: &mut TestAppContext) {
+    async fn keyboard_grows_and_shrinks_the_line_highlight(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, FIVE_LINES, &mut cx);
+
+        start_line_highlight(&terminal_view, None, &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(4..=4),
+            "the mode should start on the last line with text"
+        );
+        keys("up k", &mut cx);
+        assert_eq!(highlighted_lines(&terminal_view, &mut cx), Some(2..=2));
+        keys("shift-down shift-j", &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(2..=4),
+            "grow down"
+        );
+        keys("shift-up", &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(2..=3),
+            "shrink from the bottom"
+        );
+        keys("alt-shift-down", &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(3..=3),
+            "shrink from the top"
+        );
+        keys("shift-up shift-k", &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=3),
+            "grow up"
+        );
+        keys("down", &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(2..=2),
+            "down should move the active end's line alone"
+        );
+
+        keys("enter", &mut cx);
+        let last_column = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.num_columns() - 1
+        });
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[Range::new(Point::new(2, 0), Point::new(2, last_column))]
+        );
+        assert!(has_line_highlight(&terminal_view, &mut cx));
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(3..=3),
+            "the highlight should move to the line after the one acted on"
+        );
+    }
+
+    #[gpui::test]
+    async fn mouse_grows_and_shrinks_the_line_highlight(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
         let _actions = record_selection_actions(&terminal_view, &mut cx);
-        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
-        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
-
-        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert_eq!(picked_line(&terminal_view, &mut cx), None);
-
-        start_pick(&terminal_view, &mut cx);
-        assert_eq!(
-            picked_line(&terminal_view, &mut cx),
-            Some(0),
-            "the pick should start under the pointer, without waiting"
+        write_output(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}{FIVE_LINES}"),
+            &mut cx,
         );
-        let hint = terminal_view.read_with(&cx, |terminal_view, cx| {
-            terminal_view.text_block_pick_hint(cx)
+        let cell = cell_position(&terminal, &mut cx);
+        start_line_highlight(&terminal_view, None, &mut cx);
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+
+        click(cell(1.5, 1), &mut cx);
+        assert_eq!(highlighted_lines(&terminal_view, &mut cx), Some(1..=1));
+        drag(cell(1.5, 1), cell(1.5, 3), &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=3),
+            "grow down"
+        );
+        drag(cell(1.5, 3), cell(1.5, 2), &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=2),
+            "dragging the bottom edge up should shrink from the bottom"
+        );
+        drag(cell(1.5, 1), cell(1.5, 0), &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(0..=2),
+            "dragging the top edge up should grow up"
+        );
+        drag(cell(1.5, 0), cell(1.5, 1), &mut cx);
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=2),
+            "dragging the top edge down should shrink from the top"
+        );
+        cx.simulate_mouse_move(cell(1.5, 4), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=2),
+            "hovering shouldn't move the highlight"
+        );
+        cx.simulate_mouse_down(cell(1.5, 4), MouseButton::Left, gpui::Modifiers::shift());
+        cx.simulate_mouse_up(cell(1.5, 4), MouseButton::Left, gpui::Modifiers::shift());
+        cx.run_until_parked();
+        assert_eq!(
+            highlighted_lines(&terminal_view, &mut cx),
+            Some(1..=4),
+            "shift-click should extend to the clicked line"
+        );
+
+        assert!(
+            terminal.read_with(&cx, |terminal, _| terminal.last_content.selection.is_none()),
+            "highlight drags shouldn't select"
+        );
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "the program shouldn't see highlight presses, drags or releases",
+        );
+    }
+
+    #[gpui::test]
+    async fn shift_arrows_move_the_line_highlight_end_by_words(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, "alpha beta\r\ngamma delta\r\n", &mut cx);
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+
+        keys("shift-left", &mut cx);
+        assert_eq!(highlighted(&terminal_view, &mut cx), Some((0..=0, Some(4))));
+        keys("shift-left", &mut cx);
+        assert_eq!(
+            highlighted(&terminal_view, &mut cx),
+            Some((0..=0, Some(4))),
+            "the first word should stay highlighted"
+        );
+        keys("shift-right shift-right", &mut cx);
+        assert_eq!(
+            highlighted(&terminal_view, &mut cx),
+            Some((0..=1, Some(4))),
+            "extending past the last line should go on into the next"
+        );
+        keys("shift-left", &mut cx);
+        assert_eq!(highlighted(&terminal_view, &mut cx), Some((0..=0, Some(9))));
+        keys("shift-right enter", &mut cx);
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[Range::new(Point::new(0, 0), Point::new(1, 4))]
+        );
+    }
+
+    /// The highlight's lines and its start and end columns.
+    fn highlighted_columns(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(RangeInclusive<i32>, Option<usize>, Option<usize>)> {
+        terminal_view.read_with(cx, |terminal_view, cx| {
+            terminal_view.line_highlight_lines(cx).map(|highlighted| {
+                (
+                    highlighted.lines,
+                    highlighted.start_column,
+                    highlighted.end_column,
+                )
+            })
+        })
+    }
+
+    fn num_columns(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) -> usize {
+        terminal.read_with(cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.num_columns()
+        })
+    }
+
+    #[gpui::test]
+    async fn alt_shift_arrows_move_the_line_highlight_start_by_words(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(
+            &terminal,
+            "alpha beta gamma\r\ndelta epsilon\r\nzeta eta theta\r\n",
+            &mut cx,
+        );
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+
+        keys("alt-shift-right", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(6), None))
+        );
+        keys("alt-shift-right alt-shift-right", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(11), None)),
+            "the start should stop at the last word"
+        );
+        keys("shift-left", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(11), None)),
+            "the end shouldn't move before the start"
+        );
+        keys("alt-shift-left alt-shift-left alt-shift-left", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(0), None)),
+        );
+        keys("alt-shift-right alt-shift-right", &mut cx);
+        keys("shift-right", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=1, Some(11), Some(4))),
+            "the end should move on into the next line"
+        );
+        keys("shift-down", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=2, Some(11), Some(3))),
+            "the end should snap to the word end before its column"
+        );
+        keys("shift-up", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=1, Some(11), None)),
+            "without a word end before its column, the end should be the line end"
+        );
+        keys("alt-shift-down", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, Some(6), None)),
+            "the start should snap to the word start before its column"
+        );
+        keys("alt-shift-left alt-shift-left", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=1, Some(11), None)),
+            "the start should move on into the previous line"
+        );
+        keys("enter", &mut cx);
+        assert_eq!(
+            actions.borrow().last(),
+            Some(&Range::new(
+                Point::new(0, 11),
+                Point::new(1, num_columns(&terminal, &mut cx) - 1)
+            ))
+        );
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+        keys("alt-shift-right shift-left down", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, None, None)),
+            "a plain arrow should clear both columns"
+        );
+    }
+
+    #[gpui::test]
+    async fn moving_an_end_past_the_other_clears_the_columns(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, "zeta eta theta\r\nalpha beta gamma\r\n", &mut cx);
+        start_line_highlight(&terminal_view, Some(1), &mut cx);
+        keys("alt-shift-right shift-left", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, Some(6), Some(9)))
+        );
+        keys("shift-up", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=1, None, None)),
+            "neither edge's column belongs to its new kind of edge"
+        );
+    }
+
+    #[gpui::test]
+    async fn dragging_the_handles_moves_the_line_highlight_edges_by_words(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}alpha beta gamma\r\ndelta epsilon\r\n"),
+            &mut cx,
+        );
+        let cell = cell_position(&terminal, &mut cx);
+        let line_end = num_columns(&terminal, &mut cx) as f32;
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+
+        // The start handle at column 0 reaches into the gutter.
+        drag(cell(-0.4, 0), cell(6.3, 0), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(6), None))
+        );
+        drag(cell(6.0, 0), cell(40.0, 0), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(11), None)),
+            "a drag past the line end should clamp to its last word"
+        );
+        drag(cell(line_end, 0), cell(3.0, 0), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(11), Some(15))),
+            "the end should stop at the start's word"
+        );
+        drag(cell(11.0, 0), cell(-3.0, 0), &mut cx);
+        drag(cell(16.0, 0), cell(10.4, 0), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(0), Some(9))),
+            "a drag past the line start should clamp to its first word"
+        );
+        drag(cell(10.0, 0), cell(7.0, 1), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=1, Some(0), Some(4))),
+            "a diagonal drag should move the end to the word nearest the pointer on its line"
+        );
+
+        let before = highlighted_columns(&terminal_view, &mut cx);
+        cx.simulate_mouse_move(cell(0.0, 0), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(cell(0.0, 0), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            cell(6.0, 1),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, Some(0), Some(4))),
+            "the start should follow the drag and stop at the end's word"
+        );
+        keys("escape", &mut cx);
+        cx.simulate_mouse_up(cell(6.0, 1), MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            before,
+            "Esc should restore the highlight from before the drag"
+        );
+        assert!(has_line_highlight(&terminal_view, &mut cx));
+
+        assert!(terminal.read_with(&cx, |terminal, _| terminal.last_content.selection.is_none()));
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "the program shouldn't see handle presses, drags or releases",
+        );
+    }
+
+    #[gpui::test]
+    async fn the_nearer_line_highlight_handle_wins(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, "a b c\r\n", &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+        drag(cell(0.0, 0), cell(2.0, 0), &mut cx);
+        let line_end = num_columns(&terminal, &mut cx) as f32;
+        drag(cell(line_end, 0), cell(3.0, 0), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((0..=0, Some(2), Some(2)))
+        );
+        let handle_at = |x: f32, cx: &mut VisualTestContext| {
+            terminal_view.read_with(cx, |terminal_view, cx| {
+                terminal_view.line_highlight_handle_at(0, x, cx)
+            })
+        };
+        assert_eq!(
+            handle_at(2.4, &mut cx),
+            Some(LineHighlightGrab::StartHandle)
+        );
+        assert_eq!(handle_at(2.6, &mut cx), Some(LineHighlightGrab::EndHandle));
+        assert_eq!(handle_at(1.4, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn handles_and_keys_land_on_the_same_words(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        let num_columns = num_columns(&terminal, &mut cx);
+        // A word wrapped from the end of the second row onto the third.
+        let wrapped = format!("a{}bcde", " ".repeat(num_columns - 3));
+        write_output(&terminal, &format!("ab 日本 cd\r\n{wrapped}\r\n"), &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
+
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+        keys("alt-shift-right shift-left", &mut cx);
+        let by_keys = highlighted_columns(&terminal_view, &mut cx);
+        assert_eq!(by_keys, Some((0..=0, Some(3), Some(5))));
+        start_line_highlight(&terminal_view, Some(0), &mut cx);
+        drag(cell(0.0, 0), cell(3.2, 0), &mut cx);
+        drag(cell(num_columns as f32, 0), cell(7.1, 0), &mut cx);
+        assert_eq!(highlighted_columns(&terminal_view, &mut cx), by_keys);
+
+        start_line_highlight(&terminal_view, Some(1), &mut cx);
+        keys("alt-shift-right", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=2, Some(num_columns - 2), None))
+        );
+        drag(cell(num_columns as f32 - 2., 1), cell(0.0, 2), &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=2, Some(num_columns - 2), None)),
+            "a wrapped word's continuation isn't a word start"
+        );
+        keys("alt-shift-right", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=2, Some(num_columns - 2), None)),
+            "nor for the keys"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_partial_line_highlight_is_found_again_after_a_resize(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(
+            &terminal,
+            "before\r\nalpha beta gamma\r\nafter\r\n",
+            &mut cx,
+        );
+        start_line_highlight(&terminal_view, Some(1), &mut cx);
+        keys("alt-shift-right shift-left", &mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, Some(6), Some(9)))
+        );
+
+        narrow_window(&mut cx);
+        assert_eq!(
+            highlighted_columns(&terminal_view, &mut cx),
+            Some((1..=1, Some(6), Some(9)))
+        );
+    }
+
+    #[gpui::test]
+    async fn a_gutter_drag_highlights_lines_without_reporting_them(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(
+            &terminal,
+            &format!("{ENABLE_MOUSE_REPORTING}{FIVE_LINES}"),
+            &mut cx,
+        );
+        let cell = cell_position(&terminal, &mut cx);
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+
+        click(cell(-0.5, 2), &mut cx);
+        assert!(has_line_highlight(&terminal_view, &mut cx));
+        assert_eq!(highlighted_lines(&terminal_view, &mut cx), Some(2..=2));
+
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.exit_line_highlight(cx)
         });
+        drag(cell(-0.5, 1), cell(-0.5, 3), &mut cx);
+        assert_eq!(highlighted_lines(&terminal_view, &mut cx), Some(1..=3));
+        assert!(terminal.read_with(&cx, |terminal, _| terminal.last_content.selection.is_none()));
         assert!(
-            hint.is_some_and(
-                |hint| hint.starts_with("Paragraph 1/1 · Act on Selection: click or Enter")
-            ),
-            "the hint should name the action on the picked block"
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
+                .is_empty(),
+            "the program shouldn't see gutter presses, drags or releases",
         );
-
-        cx.simulate_keystrokes("a");
-        cx.run_until_parked();
-        assert!(
-            !is_picking(&terminal_view, &mut cx),
-            "typing should end the pick"
-        );
-        assert_eq!(picked_line(&terminal_view, &mut cx), None);
     }
 
     #[gpui::test]
-    async fn keyboard_pick_moves_between_blocks_on_screen(cx: &mut TestAppContext) {
-        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
-        let (_pane, terminal, terminal_view) =
-            add_display_only_terminal(&project, window_handle, true, false, cx);
-        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        provide_line_blocks(&terminal_view, 1..=3, &mut cx);
-        let _cell = write_first_line(&terminal, "a\r\nb\r\nc\r\nd\r\n", &mut cx);
-
-        start_pick(&terminal_view, &mut cx);
-        assert_eq!(
-            picked_line(&terminal_view, &mut cx),
-            Some(3),
-            "without the pointer the pick should start at the last block on screen"
-        );
-        move_pick(&terminal_view, false, &mut cx);
-        assert_eq!(picked_line(&terminal_view, &mut cx), Some(2));
-        move_pick(&terminal_view, false, &mut cx);
-        move_pick(&terminal_view, false, &mut cx);
-        assert_eq!(
-            picked_line(&terminal_view, &mut cx),
-            Some(1),
-            "the pick should stop at the first block"
-        );
-        move_pick(&terminal_view, true, &mut cx);
-        assert_eq!(picked_line(&terminal_view, &mut cx), Some(2));
-    }
-
-    #[gpui::test]
-    async fn pick_starts_at_the_vi_cursor(cx: &mut TestAppContext) {
-        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
-        let (_pane, terminal, terminal_view) =
-            add_display_only_terminal(&project, window_handle, true, false, cx);
-        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        provide_line_blocks(&terminal_view, 0..=3, &mut cx);
-        let cell = write_first_line(&terminal, "a\r\nb\r\nc\r\nd\r\n", &mut cx);
-        cx.simulate_mouse_move(cell(0.5), None, gpui::Modifiers::default());
-        terminal.update(&mut cx, |terminal, _| terminal.toggle_vi_mode());
-        cx.simulate_keystrokes("k k");
-        cx.run_until_parked();
-        let cursor_line =
-            terminal.read_with(&cx, |terminal, _| terminal.last_content().cursor.point.line);
-
-        start_pick(&terminal_view, &mut cx);
-        assert_eq!(picked_line(&terminal_view, &mut cx), Some(cursor_line));
-        assert_ne!(cursor_line, 0, "the vi cursor should win over the pointer");
-    }
-
-    #[gpui::test]
-    async fn clicking_a_picked_block_runs_the_action_without_reporting_the_click(
+    async fn the_context_menu_entry_starts_the_line_highlight_on_the_clicked_line(
         cx: &mut TestAppContext,
     ) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        let actions = record_selection_actions(&terminal_view, &mut cx);
-        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
-        let cell = write_first_line(
-            &terminal,
-            &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
-            &mut cx,
-        );
-        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, FIVE_LINES, &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
 
-        start_pick(&terminal_view, &mut cx);
-        click(cell(1.5), &mut cx);
-        assert_eq!(
-            actions.borrow().as_slice(),
-            &[(
-                Range::new(Point::new(0, 0), Point::new(0, 4)),
-                "hello".into()
-            )]
-        );
-        assert!(
-            !is_picking(&terminal_view, &mut cx),
-            "a click should end the pick"
-        );
-        assert!(
-            terminal
-                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
-                .is_empty(),
-            "the program shouldn't see the click, or its release",
-        );
-
-        drag(cell(0.1), cell(4.9), &mut cx);
-        assert!(
-            !terminal
-                .update(&mut cx, |terminal, _| terminal.take_pty_write_log())
-                .is_empty(),
-            "after the pick the program should get the mouse again",
-        );
+        for (position, line) in [(cell(1., 3), 3), (cell(-0.5, 1), 1)] {
+            cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+            cx.run_until_parked();
+            assert!(terminal_view.read_with(&cx, |view, _| view.context_menu.is_some()));
+            // Past the workspace actions and Copy.
+            let entry_index =
+                if terminal_view.read_with(&cx, |view, _| view.shows_workspace_actions()) {
+                    3
+                } else {
+                    1
+                };
+            cx.dispatch_action(menu::SelectFirst);
+            for _ in 0..entry_index {
+                cx.dispatch_action(menu::SelectNext);
+            }
+            cx.dispatch_action(menu::Confirm);
+            cx.run_until_parked();
+            assert_eq!(
+                highlighted_lines(&terminal_view, &mut cx),
+                Some(line..=line)
+            );
+            terminal_view.update(&mut cx, |terminal_view, cx| {
+                terminal_view.exit_line_highlight(cx)
+            });
+        }
     }
 
     #[gpui::test]
-    async fn shift_click_keeps_picking(cx: &mut TestAppContext) {
+    async fn the_gutter_is_left_alone_without_a_selection_action(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        let actions = record_selection_actions(&terminal_view, &mut cx);
-        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
-        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
+        write_output(&terminal, FIVE_LINES, &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
 
-        start_pick(&terminal_view, &mut cx);
-        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
-        cx.simulate_mouse_down(cell(1.5), MouseButton::Left, gpui::Modifiers::shift());
-        cx.simulate_mouse_up(cell(1.5), MouseButton::Left, gpui::Modifiers::shift());
-        cx.run_until_parked();
-
-        assert_eq!(actions.borrow().len(), 1);
-        assert!(is_picking(&terminal_view, &mut cx));
+        drag(cell(-0.5, 1), cell(3., 2), &mut cx);
+        assert!(!has_line_highlight(&terminal_view, &mut cx));
+        assert!(
+            terminal.read_with(&cx, |terminal, _| terminal.last_content.selection.is_some()),
+            "a drag from the gutter should select text"
+        );
+        drag(cell(1., 1), cell(-0.5, 2), &mut cx);
+        assert!(
+            !terminal.read_with(&cx, |terminal, _| terminal.selection_started()),
+            "a drag released over the gutter should end"
+        );
     }
 
     #[gpui::test]
-    async fn a_pick_click_released_off_the_terminal_keeps_later_releases(cx: &mut TestAppContext) {
+    async fn a_gutter_click_on_a_marker_opens_it(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
         let _actions = record_selection_actions(&terminal_view, &mut cx);
-        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
-        let cell = write_first_line(&terminal, "hello world\n", &mut cx);
-        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
-        let outside = bounds.bounds.bottom_right() + gpui::point(px(50.), px(50.));
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.set_gutter_markers(
+                |_, _| {
+                    vec![GutterMarker {
+                        lines: 1..=1,
+                        color: gpui::red(),
+                        count: 1,
+                    }]
+                },
+                cx,
+            );
+            let opened = opened.clone();
+            terminal_view
+                .on_gutter_marker_click(move |lines, _, _, _| opened.borrow_mut().push(lines));
+        });
+        write_output(&terminal, FIVE_LINES, &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
 
-        start_pick(&terminal_view, &mut cx);
-        cx.simulate_mouse_move(cell(1.5), None, gpui::Modifiers::default());
-        cx.simulate_mouse_down(cell(1.5), MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_move(outside, Some(MouseButton::Left), gpui::Modifiers::default());
-        cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
+        click(cell(-0.5, 1), &mut cx);
+        assert_eq!(opened.borrow().as_slice(), &[1..=1]);
+        assert!(!has_line_highlight(&terminal_view, &mut cx));
 
-        assert!(
-            !terminal_view.read_with(&cx, |terminal_view, _| terminal_view.swallow_left_mouse_up),
-            "a release anywhere should end the swallowing"
-        );
-        drag(cell(0.1), cell(4.9), &mut cx);
+        drag(cell(-0.5, 1), cell(-0.5, 2), &mut cx);
         assert_eq!(
-            terminal.read_with(&cx, |terminal, _| terminal
-                .last_content
-                .selection_text
-                .clone()),
-            Some("hello".into()),
-            "a later drag should select again"
+            opened.borrow().len(),
+            1,
+            "a drag from a marker shouldn't open it"
         );
+        assert_eq!(highlighted_lines(&terminal_view, &mut cx), Some(1..=2));
     }
 
-    const ENABLE_MOUSE_REPORTING: &str = "\x1b[?1002h\x1b[?1006h";
+    #[gpui::test]
+    async fn escape_an_unbound_key_and_focus_loss_end_the_line_highlight(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, FIVE_LINES, &mut cx);
+
+        start_line_highlight(&terminal_view, None, &mut cx);
+        keys("escape", &mut cx);
+        assert!(!has_line_highlight(&terminal_view, &mut cx));
+
+        start_line_highlight(&terminal_view, None, &mut cx);
+        terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        keys("x", &mut cx);
+        assert!(!has_line_highlight(&terminal_view, &mut cx));
+        assert_eq!(
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"x".to_vec()],
+            "an unbound key should go to the program"
+        );
+
+        start_line_highlight(&terminal_view, None, &mut cx);
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        assert!(!has_line_highlight(&terminal_view, &mut cx));
+    }
+
+    /// The text of grid `lines`, without whitespace.
+    fn lines_text(
+        terminal: &Entity<Terminal>,
+        lines: RangeInclusive<i32>,
+        cx: &mut VisualTestContext,
+    ) -> String {
+        terminal.read_with(cx, |terminal, _| {
+            terminal
+                .grid_rows(lines)
+                .iter()
+                .flat_map(|row| row.characters.iter())
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        })
+    }
+
+    fn narrow_window(cx: &mut VisualTestContext) {
+        let bounds = cx.update(|window, _| window.bounds());
+        cx.simulate_resize(gpui::size(bounds.size.width / 3., bounds.size.height));
+        cx.run_until_parked();
+        cx.executor().advance_clock(LINE_HIGHLIGHT_REFIND_DELAY);
+        cx.run_until_parked();
+    }
 
     #[gpui::test]
-    async fn picking_keeps_scroll_reports(cx: &mut TestAppContext) {
+    async fn the_line_highlight_is_found_again_after_a_resize(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, true, false, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        provide_line_blocks(&terminal_view, 0..=0, &mut cx);
-        let cell = write_first_line(
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        let long_line = "word ".repeat(30);
+        write_output(
+            &terminal,
+            &format!("before\r\n{long_line}\r\nafter\r\n"),
+            &mut cx,
+        );
+        start_line_highlight(&terminal_view, Some(1), &mut cx);
+
+        narrow_window(&mut cx);
+        assert!(has_line_highlight(&terminal_view, &mut cx));
+        let lines = highlighted_lines(&terminal_view, &mut cx).expect("the highlight should stay");
+        assert!(lines.end() > lines.start(), "the long line should wrap");
+        assert_eq!(
+            lines_text(&terminal, lines, &mut cx),
+            long_line.replace(' ', ""),
+        );
+    }
+
+    #[gpui::test]
+    async fn the_line_highlight_falls_back_to_the_last_line_when_its_text_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(&terminal, FIVE_LINES, &mut cx);
+        start_line_highlight(&terminal_view, Some(1), &mut cx);
+
+        write_output(&terminal, "\x1b[H\x1b[2J\x1b[3Jlast\r\n", &mut cx);
+        narrow_window(&mut cx);
+        assert!(has_line_highlight(&terminal_view, &mut cx));
+        let lines = highlighted_lines(&terminal_view, &mut cx).expect("the highlight should stay");
+        assert_eq!(lines_text(&terminal, lines, &mut cx), "last");
+    }
+
+    #[gpui::test]
+    async fn line_highlight_keeps_scroll_reports(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let _actions = record_selection_actions(&terminal_view, &mut cx);
+        write_output(
             &terminal,
             &format!("{ENABLE_MOUSE_REPORTING}hello world\n"),
             &mut cx,
         );
-        start_pick(&terminal_view, &mut cx);
+        let cell = cell_position(&terminal, &mut cx);
+        start_line_highlight(&terminal_view, None, &mut cx);
         terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
 
         cx.simulate_event(ScrollEvent {
-            position: cell(2.0),
+            position: cell(2.0, 0),
             delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 1.0)),
             ..Default::default()
         });

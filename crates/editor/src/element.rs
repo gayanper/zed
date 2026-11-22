@@ -2132,80 +2132,6 @@ impl EditorElement {
         Some(button)
     }
 
-    fn layout_selection_comment_button(
-        &self,
-        display_row: DisplayRow,
-        line_layout: &LineWithInvisibles,
-        crease_trailer: Option<&CreaseTrailerLayout>,
-        em_width: Pixels,
-        content_origin: gpui::Point<Pixels>,
-        scroll_position: gpui::Point<ScrollOffset>,
-        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
-        line_height: Pixels,
-        snapshot: &EditorSnapshot,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<AnyElement> {
-        let editor = self.editor.read(cx);
-        if !editor.focus_handle.is_focused(window) || editor.selections.pending_anchor().is_some() {
-            return None;
-        }
-        let newest_selection = editor.selections.newest_anchor();
-        let is_cursor = newest_selection
-            .start
-            .cmp(&newest_selection.end, snapshot.buffer_snapshot())
-            .is_eq();
-        // The cursor icon is not debounced, so it must not wait on the
-        // selection flag.
-        let visible = if is_cursor {
-            editor.show_cursor_comment_button
-        } else {
-            editor.show_selection_comment_button
-        };
-        if !visible {
-            return None;
-        }
-
-        let icon_size = IconSize::Small;
-        let focus_handle = editor.focus_handle.clone();
-        let mut button = IconButton::new("selection_comment_button", IconName::Chat)
-            .icon_size(icon_size)
-            .shape(ui::IconButtonShape::Square)
-            .style(ButtonStyle::Filled)
-            .tooltip(move |_window, cx| {
-                Tooltip::for_action_in(
-                    "Comment for Agent",
-                    &zed_actions::agent_comments::ToggleComment,
-                    &focus_handle,
-                    cx,
-                )
-            })
-            .on_click(|_, window, cx| {
-                window
-                    .dispatch_action(zed_actions::agent_comments::ToggleComment.boxed_clone(), cx);
-            })
-            .into_any_element();
-
-        let line_end = if let Some(crease_trailer) = crease_trailer {
-            crease_trailer.bounds.right()
-        } else {
-            Pixels::from(
-                ScrollPixelOffset::from(content_origin.x + line_layout.width)
-                    - scroll_pixel_position.x,
-            )
-        };
-        let start_x = line_end + em_width;
-        let start_y = content_origin.y
-            + (((display_row.as_f64() - scroll_position.y) as f32) * line_height)
-            + (line_height / 2.0)
-            - (icon_size.square(window, cx) / 2.);
-
-        let absolute_offset = point(start_x, start_y);
-        button.layout_as_root(AvailableSpace::min_size(), window, cx);
-        button.prepaint_as_root(absolute_offset, AvailableSpace::min_size(), window, cx);
-        Some(button)
-    }
-
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -6036,7 +5962,7 @@ impl EditorElement {
                 self.paint_inline_diagnostics(layout, window, cx);
                 self.paint_inline_blame(layout, window, cx);
                 self.paint_inline_code_actions(layout, window, cx);
-                self.paint_selection_comment_button(layout, window, cx);
+                self.paint_agent_comment_tooltips(layout, window, cx);
                 self.paint_diff_hunk_controls(layout, window, cx);
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
@@ -6799,17 +6725,148 @@ impl EditorElement {
         }
     }
 
-    fn paint_selection_comment_button(
+    /// Hover areas over the visible parts of agent comments, which show how
+    /// to edit them. Their hitboxes don't block the mouse, so clicks and
+    /// selections still reach the text.
+    fn layout_agent_comment_tooltips(
+        &self,
+        position_map: &PositionMap,
+        sticky_scroll_header_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let editor = self.editor.read(cx);
+        let Some((_, ranges)) = editor.background_highlights.get(&HighlightKey::AgentComment)
+        else {
+            return Vec::new();
+        };
+        let ranges = ranges.clone();
+        let focus_handle = editor.focus_handle.clone();
+        let snapshot = &position_map.snapshot.display_snapshot;
+        let visible_rows = position_map.visible_row_range.clone();
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let visible_start = snapshot
+            .display_point_to_anchor(DisplayPoint::new(visible_rows.start, 0), Bias::Left);
+        let visible_end =
+            snapshot.display_point_to_anchor(DisplayPoint::new(visible_rows.end, 0), Bias::Right);
+        let text_bounds = position_map.text_hitbox.bounds;
+        let below_sticky_headers = Bounds::from_corners(
+            point(
+                text_bounds.left(),
+                (text_bounds.top() + sticky_scroll_header_height).min(text_bounds.bottom()),
+            ),
+            text_bounds.bottom_right(),
+        );
+        let mut elements = Vec::new();
+        // The ranges are sorted by start, as highlights are.
+        for (range_index, range) in ranges.iter().enumerate() {
+            if range.start.cmp(&visible_end, buffer_snapshot).is_gt() {
+                break;
+            }
+            if range.end.cmp(&visible_start, buffer_snapshot).is_lt() {
+                continue;
+            }
+            let start = range.start.to_display_point(snapshot);
+            let end = range.end.to_display_point(snapshot);
+            // Blank-line comments have no width to hover.
+            if start == end {
+                continue;
+            }
+            let first_row = cmp::max(start.row(), visible_rows.start);
+            let end_row = cmp::min(end.row().next_row(), visible_rows.end);
+            for row in (first_row..end_row).iter_rows() {
+                let Some(line_layout) = position_map
+                    .line_layouts
+                    .get(row.minus(visible_rows.start) as usize)
+                else {
+                    continue;
+                };
+                let alignment_offset =
+                    line_layout.alignment_offset(self.style.text.text_align, position_map.content_width);
+                let x_for_column = |column: u32| {
+                    position_map.content_origin.x
+                        + Pixels::from(
+                            ScrollPixelOffset::from(
+                                line_layout.x_for_index(column as usize) + alignment_offset,
+                            ) - position_map.scroll_pixel_position.x,
+                        )
+                };
+                let start_x = if row == start.row() {
+                    x_for_column(start.column())
+                } else {
+                    x_for_column(0)
+                };
+                let end_x = if row == end.row() {
+                    x_for_column(end.column())
+                } else {
+                    x_for_column(line_layout.len as u32)
+                };
+                if end_x <= start_x {
+                    continue;
+                }
+                let origin = point(
+                    start_x,
+                    position_map.content_origin.y
+                        + Pixels::from(
+                            (row.as_f64() - position_map.scroll_position.y)
+                                * ScrollOffset::from(position_map.line_height),
+                        ),
+                );
+                let size = size(end_x - start_x, position_map.line_height);
+                let focus_handle = focus_handle.clone();
+                let mut element = div()
+                    .id(ElementId::NamedInteger(
+                        "agent-comment-tooltip".into(),
+                        ((row.0 as u64) << 32) | range_index as u64,
+                    ))
+                    .size_full()
+                    .tooltip(Tooltip::element(move |_, cx| {
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new("Agent comment ·"))
+                            .child(ui::KeyBinding::for_action_in(
+                                &zed_actions::agent_comments::ToggleComment,
+                                &focus_handle,
+                                cx,
+                            ))
+                            .child(Label::new("to edit"))
+                            .into_any_element()
+                    }))
+                    .into_any_element();
+                let available_space = size.map(AvailableSpace::Definite);
+                // Clipped so that rows scrolled under the gutter or the sticky
+                // headers don't take their hover.
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: below_sticky_headers,
+                    }),
+                    |window| {
+                        element.layout_as_root(available_space, window, cx);
+                        element.prepaint_as_root(origin, available_space, window, cx);
+                    },
+                );
+                elements.push(element);
+            }
+        }
+        elements
+    }
+
+    fn paint_agent_comment_tooltips(
         &mut self,
         layout: &mut EditorLayout,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(mut selection_comment_button) = layout.selection_comment_button.take() {
-            window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
-                selection_comment_button.paint(window, cx);
-            })
-        }
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: layout.position_map.text_hitbox.bounds,
+            }),
+            |window| {
+                for element in &mut layout.agent_comment_tooltips {
+                    element.paint(window, cx);
+                }
+            },
+        );
     }
 
     fn paint_diff_hunk_controls(
@@ -9618,7 +9675,6 @@ impl Element for EditorElement {
 
                     let mut inline_blame_layout = None;
                     let mut inline_code_actions = None;
-                    let mut selection_comment_button = None;
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
                         if (start_row..end_row).contains(&display_row)
@@ -9642,19 +9698,6 @@ impl Element for EditorElement {
                                 crease_trailers.get(line_ix),
                             ) {
                                 let crease_trailer_layout = crease_trailer.as_ref();
-                                selection_comment_button = self.layout_selection_comment_button(
-                                    display_row,
-                                    line_layout,
-                                    crease_trailer_layout,
-                                    em_width,
-                                    content_origin,
-                                    scroll_position,
-                                    scroll_pixel_position,
-                                    line_height,
-                                    &snapshot,
-                                    window,
-                                    cx,
-                                );
                                 if let Some(layout) = self.layout_inline_blame(
                                     display_row,
                                     row_info,
@@ -10157,6 +10200,14 @@ impl Element for EditorElement {
                         diff_hunk_control_bounds,
                     });
 
+                    let agent_comment_tooltips =
+                        self.layout_agent_comment_tooltips(
+                            &position_map,
+                            sticky_scroll_header_height,
+                            window,
+                            cx,
+                        );
+
                     let visible_horizontal_scrollbar =
                         scrollbars_layout.as_ref().is_some_and(|scrollbars_layout| {
                             scrollbars_layout.visible && scrollbars_layout.horizontal.is_some()
@@ -10193,7 +10244,7 @@ impl Element for EditorElement {
                         point_diagnostic_underline_offset,
                         inline_blame_layout,
                         inline_code_actions,
-                        selection_comment_button,
+                        agent_comment_tooltips,
                         blocks,
                         spacer_blocks,
                         cursors,
@@ -10411,7 +10462,7 @@ pub struct EditorLayout {
     point_diagnostic_underline_offset: Pixels,
     inline_blame_layout: Option<InlineBlameLayout>,
     inline_code_actions: Option<AnyElement>,
-    selection_comment_button: Option<AnyElement>,
+    agent_comment_tooltips: Vec<AnyElement>,
     blocks: Vec<BlockLayout>,
     spacer_blocks: Vec<BlockLayout>,
     highlighted_ranges: Vec<(Range<DisplayPoint>, Hsla)>,
@@ -12798,9 +12849,9 @@ mod tests {
             );
         });
 
-        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        // Drawn as a view, since the comments' hover areas need one.
         cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
+            div().size_full().child(editor.clone())
         });
         cx.run_until_parked();
 

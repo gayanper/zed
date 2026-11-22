@@ -50745,14 +50745,12 @@ async fn test_soft_wrap_indent_updated_on_file_move_between_directories(
 }
 
 #[gpui::test]
-async fn test_selection_comment_button_click_keeps_selection(cx: &mut TestAppContext) {
+async fn test_no_comment_button_after_line_end(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorTestContext::new(cx).await;
-    cx.set_state("one «twoˇ» three");
     let toggles = Rc::new(Cell::new(0));
     cx.update_editor(|editor, window, cx| {
         window.focus(&editor.focus_handle(cx), cx);
-        editor.set_show_selection_comment_button(true, cx);
         let toggles = toggles.clone();
         editor
             .register_action(
@@ -50762,60 +50760,23 @@ async fn test_selection_comment_button_click_keeps_selection(cx: &mut TestAppCon
             )
             .detach();
     });
-    cx.run_until_parked();
 
-    let line_end = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 13));
-    let em_width =
-        cx.update_editor(|editor, _, _| editor.last_position_map.as_ref().unwrap().em_layout_width);
-    cx.simulate_click(
-        gpui::Point {
-            x: line_end.x + em_width + px(6.),
-            y: line_end.y,
-        },
-        Modifiers::none(),
-    );
-    cx.run_until_parked();
+    for state in ["one «twoˇ» three", "one twoˇ three"] {
+        cx.set_state(state);
+        cx.run_until_parked();
+        let line_end = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 13));
+        let em_width = cx.update_editor(|editor, _, _| {
+            editor.last_position_map.as_ref().unwrap().em_layout_width
+        });
+        cx.simulate_click(
+            gpui::Point {
+                x: line_end.x + em_width + px(6.),
+                y: line_end.y,
+            },
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+    }
 
-    assert_eq!(toggles.get(), 1, "the click should hit the comment button");
-    cx.assert_editor_state("one «twoˇ» three");
-}
-
-#[gpui::test]
-async fn test_cursor_comment_button_ignores_selection_flag(cx: &mut TestAppContext) {
-    init_test(cx, |_| {});
-    let mut cx = EditorTestContext::new(cx).await;
-    cx.set_state("one twoˇ three");
-    let toggles = Rc::new(Cell::new(0));
-    cx.update_editor(|editor, window, cx| {
-        window.focus(&editor.focus_handle(cx), cx);
-        editor.set_show_selection_comment_button(false, cx);
-        editor.set_show_cursor_comment_button(true, cx);
-        let toggles = toggles.clone();
-        editor
-            .register_action(
-                move |_: &zed_actions::agent_comments::ToggleComment, _, _| {
-                    toggles.set(toggles.get() + 1);
-                },
-            )
-            .detach();
-    });
-    cx.run_until_parked();
-
-    let line_end = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 13));
-    let em_width =
-        cx.update_editor(|editor, _, _| editor.last_position_map.as_ref().unwrap().em_layout_width);
-    cx.simulate_click(
-        gpui::Point {
-            x: line_end.x + em_width + px(6.),
-            y: line_end.y,
-        },
-        Modifiers::none(),
-    );
-    cx.run_until_parked();
-
-    assert_eq!(
-        toggles.get(),
-        1,
-        "the cursor icon should show without the selection delay"
-    );
+    assert_eq!(toggles.get(), 0, "no comment button should be laid out");
 }

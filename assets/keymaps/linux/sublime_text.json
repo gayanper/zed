@@ -1,5 +1,12 @@
 [
   {
+    // Keeps shift-alt-m for the Markdown preview over the agent comment binding.
+    "context": "Editor && mode == full",
+    "bindings": {
+      "alt-shift-m": null,
+    },
+  },
+  {
     "bindings": {
       "ctrl-{": "pane::ActivatePreviousItem",
       "ctrl-}": "pane::ActivateNextItem",

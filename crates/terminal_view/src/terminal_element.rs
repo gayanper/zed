@@ -21,14 +21,14 @@ use terminal::{
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
-use ui::{IconSize, ParentElement, Tooltip};
+use ui::{Color as UiColor, Icon, IconName, IconSize, ParentElement, Tooltip};
 use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
-use crate::{BlockContext, BlockProperties, ContentMode, GutterMarker, TerminalMode, TerminalView};
+use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -46,6 +46,10 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     /// Visible rows, color and count of each gutter marker.
     gutter_markers: Vec<(RangeInclusive<usize>, Hsla, usize)>,
+    /// Visible rows of the line highlight, which gets a gutter bar of its own.
+    line_highlight_rows: Option<RangeInclusive<usize>>,
+    /// The glyph shown over the hovered gutter cell.
+    gutter_glyph: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
 }
@@ -964,22 +968,25 @@ impl TerminalElement {
                     terminal_view.swallow_left_mouse_up = false;
                 });
 
-                if open_gutter_marker(&terminal_view, e.position, window, cx) {
-                    terminal_view.update(cx, |terminal_view, _| {
-                        terminal_view.swallow_left_mouse_up = true;
-                    });
+                let (line, x) = terminal_view.read(cx).grid_position_at(e.position, cx);
+                // The start handle at column 0 reaches into the gutter.
+                let on_handle = terminal_view.read(cx).on_line_highlight_handle(line, x, cx);
+
+                // The gutter is never reported to the program, so its
+                // gestures work while a program takes the mouse.
+                let gutter_line = terminal_view.read(cx).gutter_line_at(e.position, cx);
+                if !on_handle
+                    && let Some(line) = gutter_line
+                    && terminal_view
+                        .update(cx, |terminal_view, cx| terminal_view.press_gutter(line, cx))
+                {
                     return;
                 }
 
-                if terminal_view.read(cx).takes_mouse_for_text_block_pick() {
-                    let extending = terminal_view.update(cx, |terminal_view, cx| {
-                        terminal_view.swallow_left_mouse_up = true;
-                        terminal_view.press_text_block_pick(cx)
+                if terminal_view.read(cx).takes_mouse_for_line_highlight() {
+                    terminal_view.update(cx, |terminal_view, cx| {
+                        terminal_view.press_line_highlight(line, x, e.modifiers.shift, cx)
                     });
-                    if extending {
-                        return;
-                    }
-                    pick_text_block(&terminal_view.downgrade(), e.modifiers.shift, window, cx);
                     return;
                 }
 
@@ -1031,7 +1038,22 @@ impl TerminalElement {
                     })
                 }
 
-                let pointer_cell = if hitbox.is_hovered(window) {
+                let gutter_line = if hitbox.is_hovered(window) {
+                    terminal_view.read(cx).gutter_line_at(e.position, cx)
+                } else {
+                    None
+                };
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.set_gutter_hover_line(gutter_line, cx)
+                });
+
+                // A drag keeps moving the highlight off the terminal, where
+                // it clamps to the nearest line and column.
+                let tracks_pointer = hitbox.is_hovered(window)
+                    || terminal_view.read(cx).is_dragging_line_highlight();
+                let pointer_x = tracks_pointer
+                    .then(|| terminal_view.read(cx).grid_position_at(e.position, cx).1);
+                let pointer_cell = if tracks_pointer {
                     let terminal = terminal.read(cx);
                     let mut position = e.position;
                     position.y += terminal_view.read(cx).scroll_top;
@@ -1045,10 +1067,13 @@ impl TerminalElement {
                     None
                 };
                 terminal_view.update(cx, |terminal_view, cx| {
-                    terminal_view.set_pointer_cell(pointer_cell, cx)
+                    terminal_view.set_pointer_cell(pointer_cell, pointer_x, cx)
                 });
 
-                if hitbox.is_hovered(window) {
+                if hitbox.is_hovered(window)
+                    && gutter_line.is_none()
+                    && !terminal_view.read(cx).swallow_left_mouse_up
+                {
                     terminal.update(cx, |terminal, cx| {
                         terminal.mouse_move(e, mouse_input_mode, cx);
                     })
@@ -1070,7 +1095,7 @@ impl TerminalElement {
                 {
                     terminal_view.update(cx, |terminal_view, cx| {
                         terminal_view.swallow_left_mouse_up = false;
-                        terminal_view.release_text_block_extend(cx);
+                        terminal_view.release_line_highlight(cx);
                     });
                 }
             }
@@ -1083,10 +1108,23 @@ impl TerminalElement {
                 let focus = focus.clone();
                 move |event, window, cx| {
                     if button == MouseButton::Left && terminal_view.read(cx).swallow_left_mouse_up {
-                        terminal_view.update(cx, |terminal_view, cx| {
+                        let marker_line = terminal_view.update(cx, |terminal_view, cx| {
                             terminal_view.swallow_left_mouse_up = false;
-                            terminal_view.release_text_block_extend(cx);
+                            terminal_view.release_line_highlight(cx)
                         });
+                        if let Some(line) = marker_line {
+                            open_gutter_marker(&terminal_view, line, event.position, window, cx);
+                        }
+                        return;
+                    }
+                    // A press in the gutter isn't reported, so neither is
+                    // its release; a left drag released there still ends.
+                    if button != MouseButton::Left
+                        && terminal_view
+                            .read(cx)
+                            .gutter_line_at(event.position, cx)
+                            .is_some()
+                    {
                         return;
                     }
                     if !focus.is_focused(window) {
@@ -1113,7 +1151,15 @@ impl TerminalElement {
             self.interactivity.on_mouse_down(button, {
                 let terminal = terminal.clone();
                 let focus = focus.clone();
+                let terminal_view = terminal_view.clone();
                 move |event, window, cx| {
+                    if terminal_view
+                        .read(cx)
+                        .gutter_line_at(event.position, cx)
+                        .is_some()
+                    {
+                        return;
+                    }
                     if mouse_input_mode == MouseInputMode::LocalSelection
                         || (button == MouseButton::Right
                             && !terminal
@@ -1429,23 +1475,15 @@ impl Element for TerminalElement {
                 });
 
                 self.terminal_view.update(cx, |terminal_view, cx| {
-                    terminal_view.update_picked_text_block(window, cx)
+                    terminal_view.update_line_highlight(window, cx)
                 });
-                let text_block =
+                let highlighted_lines = self.terminal_view.read(cx).highlighted_lines.clone();
+                let hover_tooltip = hover_tooltip.or_else(|| {
                     self.terminal_view
                         .read(cx)
-                        .picked_text_block
-                        .as_ref()
-                        .map(|picked| {
-                            (
-                                picked.block.clone(),
-                                picked.extension.clone(),
-                                picked.collected.clone(),
-                                picked.flashing,
-                            )
-                        });
-                let extend_tooltip = self.terminal_view.read(cx).text_block_extend_tooltip(cx);
-                let hover_tooltip = hover_tooltip.or(extend_tooltip.map(String::from));
+                        .line_highlight_handle_tooltip(cx)
+                        .map(String::from)
+                });
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
@@ -1478,53 +1516,20 @@ impl Element for TerminalElement {
                     relative_highlighted_ranges
                         .push((selection.point_range(), player_color.selection));
                 }
-                let text_block_marker_color = theme.colors().text_accent;
-                if let Some((block, extension, collected, flashing)) = &text_block {
-                    // Only the picked texts are highlighted, not the block
-                    // around them.
-                    let tint = theme.colors().ghost_element_selected;
-                    let rows = collected
-                        .iter()
-                        .flat_map(|collected| &collected.rows)
-                        .chain(&block.rows);
-                    for (line, columns) in rows {
-                        // An extension is a row's end, drawn on its own.
-                        let last = extension
-                            .iter()
-                            .find(|(extended_line, _)| extended_line == line)
-                            .map_or(Some(*columns.end()), |(_, extended)| {
-                                extended.start().checked_sub(1)
-                            });
-                        if let Some(last) = last.filter(|last| *last >= *columns.start()) {
-                            relative_highlighted_ranges.push((
-                                Range::new(
-                                    Point::new(*line, *columns.start()),
-                                    Point::new(*line, last),
-                                ),
-                                tint,
-                            ));
-                        }
-                    }
-                    for (line, columns) in extension {
-                        relative_highlighted_ranges.push((
-                            Range::new(
-                                Point::new(*line, *columns.start()),
-                                Point::new(*line, *columns.end()),
-                            ),
-                            tint.opacity(0.5),
-                        ));
-                    }
-                    if *flashing {
-                        for (line, columns) in &block.rows {
-                            relative_highlighted_ranges.push((
-                                Range::new(
-                                    Point::new(*line, *columns.start()),
-                                    Point::new(*line, *columns.end()),
-                                ),
-                                theme.colors().text_accent.opacity(0.3),
-                            ));
-                        }
-                    }
+                if let Some(highlighted) = &highlighted_lines {
+                    let last_column = dimensions.num_columns().saturating_sub(1);
+                    let range = Range::new(
+                        Point::new(
+                            *highlighted.lines.start(),
+                            highlighted.start_column.unwrap_or(0),
+                        ),
+                        Point::new(
+                            *highlighted.lines.end(),
+                            highlighted.end_column.unwrap_or(last_column),
+                        ),
+                    );
+                    relative_highlighted_ranges
+                        .push((range, theme.colors().ghost_element_selected));
                 }
 
                 // then have that representation be converted to the appropriate highlight data structure
@@ -1695,16 +1700,8 @@ impl Element for TerminalElement {
                     Some(markers) => markers(self.terminal.read(cx).last_content(), cx),
                     None => Vec::new(),
                 };
-                let text_block_marker = text_block.as_ref().and_then(|(block, _, _, _)| {
-                    Some(GutterMarker {
-                        lines: block.lines()?,
-                        color: text_block_marker_color,
-                        count: 1,
-                    })
-                });
                 let gutter_markers = gutter_markers
                     .iter()
-                    .chain(text_block_marker.as_ref())
                     .filter_map(|marker| {
                         let rows = gutter_marker_rows(
                             &marker.lines,
@@ -1714,6 +1711,18 @@ impl Element for TerminalElement {
                         Some((rows, marker.color, marker.count))
                     })
                     .collect();
+                let line_highlight_rows = highlighted_lines.as_ref().and_then(|highlighted| {
+                    gutter_marker_rows(&highlighted.lines, display_offset, dimensions.num_lines())
+                });
+                let gutter_glyph = layout_gutter_glyph(
+                    &self.terminal_view,
+                    &self.focus,
+                    &dimensions,
+                    bounds.origin.x,
+                    display_offset,
+                    window,
+                    cx,
+                );
 
                 LayoutState {
                     hitbox,
@@ -1729,6 +1738,8 @@ impl Element for TerminalElement {
                     hyperlink_tooltip,
                     block_below_cursor_element,
                     gutter_markers,
+                    line_highlight_rows,
+                    gutter_glyph,
                     base_text_style: text_style,
                     content_mode,
                 }
@@ -1784,13 +1795,13 @@ impl Element for TerminalElement {
             } else if self
                 .terminal_view
                 .read(cx)
-                .shows_text_block_extend_cursor(cx)
+                .shows_line_column_resize_cursor(cx)
             {
-                window.set_cursor_style(gpui::CursorStyle::ResizeLeftRight, &layout.hitbox);
-            } else if self
-                .terminal_view
-                .read(cx)
-                .takes_mouse_for_text_block_pick()
+                window.set_cursor_style(gpui::CursorStyle::ResizeColumn, &layout.hitbox);
+            } else if self.terminal_view.read(cx).shows_line_resize_cursor(cx) {
+                window.set_cursor_style(gpui::CursorStyle::ResizeRow, &layout.hitbox);
+            } else if self.terminal_view.read(cx).takes_mouse_for_line_highlight()
+                || self.terminal_view.read(cx).gutter_hover_line.is_some()
             {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
             } else {
@@ -1799,6 +1810,7 @@ impl Element for TerminalElement {
 
             let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
+            let gutter_glyph = layout.gutter_glyph.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
             self.interactivity.paint(
                 global_id,
@@ -1897,6 +1909,21 @@ impl Element for TerminalElement {
                         }
                     }
 
+                    // The highlight's bar is wider than the markers' bars, so
+                    // it stands apart from them.
+                    if let Some(rows) = &layout.line_highlight_rows {
+                        let line_height = layout.dimensions.line_height;
+                        let cell_width = layout.dimensions.cell_width;
+                        let bar_width = cell_width * 0.5;
+                        let bar_left = origin.x - cell_width + (cell_width - bar_width) / 2.;
+                        let top = origin.y + *rows.start() as f32 * line_height;
+                        let height = (rows.end() - rows.start() + 1) as f32 * line_height;
+                        window.paint_quad(fill(
+                            Bounds::new(point(bar_left, top), size(bar_width, height)),
+                            cx.theme().colors().text_accent.opacity(0.5),
+                        ));
+                    }
+
                     // Paint batched text runs instead of individual cells
                     let text_paint_start = Instant::now();
                     for batch in &layout.batched_text_runs {
@@ -1963,6 +1990,10 @@ impl Element for TerminalElement {
                     }
 
                     if let Some(mut element) = hyperlink_tooltip {
+                        element.paint(window, cx);
+                    }
+
+                    if let Some(mut element) = gutter_glyph {
                         element.paint(window, cx);
                     }
 
@@ -2250,84 +2281,98 @@ fn action_anchor_size(window: &mut Window, cx: &mut App) -> Pixels {
     IconSize::Small.square(window, cx) + px(6.)
 }
 
-/// Runs the gutter marker click handler for a click in the gutter on a
-/// marker, and returns whether it ran.
+/// The glyph over the hovered gutter cell, whose tooltip names the
+/// selection action and its key. A cell with a marker shows the marker
+/// instead.
+fn layout_gutter_glyph(
+    terminal_view: &Entity<TerminalView>,
+    focus: &FocusHandle,
+    dimensions: &TerminalBounds,
+    gutter_left: Pixels,
+    display_offset: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let view = terminal_view.read(cx);
+    let line = view.gutter_hover_line?;
+    if !view.line_highlight_available(cx) || view.gutter_marker_at(line, cx).is_some() {
+        return None;
+    }
+    let selection_action = view.selection_action.clone()?;
+    let row = usize::try_from(line.checked_add(i32::try_from(display_offset).ok()?)?).ok()?;
+    let origin = point(
+        gutter_left,
+        dimensions.bounds.origin.y + row as f32 * dimensions.line_height - view.scroll_top,
+    );
+    let focus = focus.clone();
+    let mut element = div()
+        .id("terminal-gutter-glyph")
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(IconName::Plus)
+                .size(IconSize::XSmall)
+                .color(UiColor::Muted),
+        )
+        .tooltip(move |_window, cx| match &selection_action.menu_action {
+            Some(menu_action) => Tooltip::for_action_in(
+                selection_action.label.clone(),
+                menu_action.action.as_ref(),
+                &focus,
+                cx,
+            ),
+            None => Tooltip::simple(selection_action.label.clone(), cx),
+        })
+        .into_any_element();
+    element.prepaint_as_root(
+        origin,
+        size(dimensions.cell_width, dimensions.line_height).into(),
+        window,
+        cx,
+    );
+    Some(element)
+}
+
+/// Runs the gutter marker click handler for a click on the marker over grid
+/// `line`.
 fn open_gutter_marker(
     terminal_view: &Entity<TerminalView>,
+    line: i32,
     position: GpuiPoint<Pixels>,
     window: &mut Window,
     cx: &mut App,
-) -> bool {
+) {
     let view = terminal_view.read(cx);
     let Some(handler) = view.gutter_marker_click.clone() else {
-        return false;
-    };
-    let content = view.terminal().read(cx).last_content();
-    let bounds = content.terminal_bounds;
-    if position.x >= bounds.bounds.origin.x || bounds.line_height <= px(0.) {
-        return false;
-    }
-    let row =
-        ((position.y - bounds.bounds.origin.y + view.scroll_top) / bounds.line_height).floor();
-    if row < 0. {
-        return false;
-    }
-    let Some(line) = i32::try_from(row as i64)
-        .ok()
-        .zip(i32::try_from(content.display_offset).ok())
-        .map(|(row, display_offset)| row - display_offset)
-    else {
-        return false;
-    };
-    let Some(marker) = view.gutter_marker_at(line, cx) else {
-        return false;
-    };
-    handler(marker.lines, position, window, cx);
-    true
-}
-
-/// Runs the selection action on the picked text block, and keeps picking
-/// when `keep_picking` is set.
-fn pick_text_block(
-    terminal_view: &WeakEntity<TerminalView>,
-    keep_picking: bool,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Ok(Some((target, action))) = terminal_view.update(cx, |terminal_view, cx| {
-        let action = terminal_view.selection_action.clone()?;
-        let target = terminal_view.take_text_block_pick_target(keep_picking, window, cx)?;
-        Some((target, action))
-    }) else {
         return;
     };
-    let (range, text, kind, origin) = target;
-    (action.handler)(range, text, Some(kind), origin, window, cx);
+    let Some(marker) = view.gutter_marker_at(line, cx) else {
+        return;
+    };
+    handler(marker.lines, position, window, cx);
 }
 
-/// Where the selection action's popover opens for a text block: just below the cell the
-/// pick points at, like a tooltip, so it's next to where the
-/// user is looking. On the last row it goes above the cell instead.
-pub(crate) fn text_block_action_origin(
-    anchor: Point,
+/// Where the selection action's popover opens for highlighted lines: just
+/// below grid `line`, like a tooltip, so it's next to where the user is
+/// looking. On the last row it goes above the line instead.
+pub(crate) fn line_highlight_action_origin(
+    line: i32,
     display_offset: usize,
     dimensions: TerminalBounds,
     scroll_top: Pixels,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<GpuiPoint<Pixels>> {
-    let row = anchor
-        .line
-        .checked_add(i32::try_from(display_offset).ok()?)?;
+    let row = line.checked_add(i32::try_from(display_offset).ok()?)?;
     let row = usize::try_from(row).ok()?;
     if row >= dimensions.num_lines() {
         return None;
     }
     let anchor_size = action_anchor_size(window, cx);
     let bounds = dimensions.bounds;
-    let x = (bounds.origin.x + (anchor.column as f32 + 0.5) * dimensions.cell_width)
-        .min(bounds.right() - anchor_size)
-        .max(bounds.origin.x);
+    let x = bounds.origin.x + dimensions.cell_width * 0.5;
     let row_top = bounds.origin.y + row as f32 * dimensions.line_height - scroll_top;
     let y = if row + 1 < dimensions.num_lines() {
         row_top + dimensions.line_height

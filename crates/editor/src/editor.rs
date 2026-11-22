@@ -1035,8 +1035,6 @@ pub struct Editor {
     show_bookmarks: Option<bool>,
     show_breakpoints: Option<bool>,
     show_diff_review_button: bool,
-    show_selection_comment_button: bool,
-    show_cursor_comment_button: bool,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
     buffers_with_disabled_indent_guides: HashSet<BufferId>,
@@ -2423,8 +2421,6 @@ impl Editor {
             show_bookmarks: None,
             show_breakpoints: None,
             show_diff_review_button: false,
-            show_selection_comment_button: false,
-            show_cursor_comment_button: false,
             show_wrap_guides: None,
             show_indent_guides,
             buffers_with_disabled_indent_guides: HashSet::default(),
@@ -2773,6 +2769,36 @@ impl Editor {
             window,
             cx,
         ));
+    }
+
+    /// Shows `context_menu` below the newest cursor, following it as the
+    /// editor scrolls.
+    pub fn deploy_context_menu_at_cursor(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = self.selections.newest_anchor().head();
+        let line_height = self.style(cx).text.line_height_in_pixels(window.rem_size());
+        self.mouse_context_menu = Some(MouseContextMenu::new(
+            self,
+            crate::mouse_context_menu::MenuPosition::PinnedToEditor {
+                source,
+                offset: gpui::point(Pixels::ZERO, line_height),
+            },
+            context_menu,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mouse_context_menu_entity(&self) -> Option<Entity<ContextMenu>> {
+        self.mouse_context_menu
+            .as_ref()
+            .map(|menu| menu.context_menu.clone())
     }
 
     pub fn mouse_menu_is_focused(&self, window: &Window, cx: &App) -> bool {

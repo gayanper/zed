@@ -891,6 +891,16 @@ impl ContextMenu {
         self.selected_index
     }
 
+    pub fn entry_labels(&self) -> Vec<SharedString> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ContextMenuItem::Entry(entry) => Some(entry.label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selected_index else {
             return cx.emit(DismissEvent);

@@ -398,8 +398,10 @@ pub mod agent_comments {
     actions!(
         agent_comments,
         [
-            /// Comments for the agent on the selection, or opens or closes the
-            /// agent comment under the cursor.
+            /// Comments for the agent on the selection in an editor or an agent
+            /// terminal thread. A selection or cursor touching one comment
+            /// edits it, and touching several lists them to choose from. Closes
+            /// the open comment input when nothing is written in it.
             ToggleComment,
         ]
     );

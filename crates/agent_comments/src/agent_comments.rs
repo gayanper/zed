@@ -12,7 +12,7 @@ use agent_settings::AgentSettings;
 use buffer_diff::{BufferDiffSnapshot, DiffHunk};
 use collections::{HashMap, HashSet};
 use editor::{
-    CODE_ACTIONS_DEBOUNCE_TIMEOUT, Editor, EditorEvent, ToPoint as _,
+    Editor, EditorEvent, ToPoint as _,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
     },
@@ -20,7 +20,7 @@ use editor::{
 };
 use gpui::{
     Anchor, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    Global, Hsla, Pixels, Point, Subscription, Task, WeakEntity, Window, actions, anchored,
+    Global, Hsla, Pixels, Point, Subscription, WeakEntity, Window, actions, anchored,
     deferred, px,
 };
 use language::{
@@ -29,7 +29,7 @@ use language::{
 use multi_buffer::{MultiBuffer, MultiBufferRow, MultiBufferSnapshot};
 use settings::{Settings as _, SettingsStore};
 use theme::Theme;
-use ui::{KeyBinding, prelude::*};
+use ui::{ContextMenu, KeyBinding, prelude::*};
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
 use zed_actions::agent_comments::ToggleComment;
@@ -51,41 +51,6 @@ actions!(
         InsertPendingComments,
         /// Removes the workspace's pending agent comments without inserting them.
         ClearPendingComments,
-        /// Comments for the agent on the text selected in a terminal thread, or
-        /// else starts picking a list item, question or line to comment on, or
-        /// comments on the picked one while picking.
-        CommentTerminalSelection,
-        /// Moves the terminal comment pick to the previous block on screen.
-        SelectPreviousTerminalCommentTarget,
-        /// Moves the terminal comment pick to the next block on screen.
-        SelectNextTerminalCommentTarget,
-        /// Comments on the picked terminal block and ends the pick.
-        ConfirmTerminalCommentTarget,
-        /// Comments on the picked terminal block and keeps picking once the
-        /// comment is closed.
-        ConfirmTerminalCommentTargetAndContinue,
-        /// Ends the terminal comment pick.
-        CancelTerminalCommentPick,
-        /// Picks a smaller part of the picked terminal text: a paragraph of
-        /// a message, or a sentence of a paragraph.
-        NarrowTerminalCommentPick,
-        /// Picks the paragraph or the message that the picked terminal text
-        /// is in.
-        WidenTerminalCommentPick,
-        /// Adds the picked terminal text to the texts to comment on together,
-        /// or takes it out, and moves the pick to the previous one.
-        ExtendTerminalCommentPickUp,
-        /// Adds the picked terminal text to the texts to comment on together,
-        /// or takes it out, and moves the pick to the next one.
-        ExtendTerminalCommentPickDown,
-        /// Clears the extension of the picked terminal text, else the texts
-        /// picked to comment on together, else goes back to the paragraph or
-        /// the message the pick is in, else ends the pick.
-        BackOutOfTerminalCommentPick,
-        /// Extends the end of the picked terminal text by one word.
-        ExtendTerminalCommentPickEnd,
-        /// Moves the end of the picked terminal text back by one word.
-        ShrinkTerminalCommentPickEnd,
     ]
 );
 
@@ -113,12 +78,74 @@ pub enum CommentSource {
 
 impl CommentSource {
     fn title(&self) -> SharedString {
+        format!("Comment on {}", self.target_label()).into()
+    }
+
+    fn edit_title(&self) -> SharedString {
+        format!("Edit comment on {}", self.target_label()).into()
+    }
+
+    fn target_label(&self) -> String {
         match self {
-            Self::Code { path, rows } => format!("Comment on {}", code_location(path, rows)).into(),
-            Self::Quote { label, .. } => format!("Comment on selection from {label}").into(),
-            Self::Terminal { .. } => "Comment on terminal selection".into(),
+            Self::Code { path, rows } => code_location(path, rows),
+            Self::Quote { label, .. } => format!("selection from {label}"),
+            Self::Terminal { .. } => "terminal selection".to_string(),
         }
     }
+}
+
+/// What a comment target leads to under the overlap rule: comments can't
+/// overlap, so a target touching one comment edits it, and a target touching
+/// several lets the user choose which to edit.
+#[derive(Debug, PartialEq)]
+pub enum CommentOverlap<T> {
+    None,
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> CommentOverlap<T> {
+    /// `touching` holds the comments the target really intersects; ranges
+    /// only sharing a boundary with the target must be left out.
+    pub fn new(mut touching: Vec<T>) -> Self {
+        match touching.len() {
+            0 => Self::None,
+            1 => touching.pop().map_or(Self::None, Self::One),
+            _ => Self::Many(touching),
+        }
+    }
+}
+
+/// The characters of a comment's first line that a row of the comment list
+/// shows.
+const MAX_COMMENT_LIST_LABEL: usize = 60;
+
+fn comment_list_label(body: &str) -> String {
+    let first_line = body.lines().next().unwrap_or_default().trim();
+    match first_line.char_indices().nth(MAX_COMMENT_LIST_LABEL) {
+        Some((end, _)) => format!("{}…", &first_line[..end]),
+        None => first_line.to_string(),
+    }
+}
+
+/// A menu listing comments by their first line, for choosing the one to
+/// edit. Escape closes it.
+pub fn comment_list_menu<T: Clone + 'static>(
+    comments: Vec<(String, T)>,
+    on_choose: impl Fn(&T, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let on_choose = Rc::new(on_choose);
+    ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+        for (body, comment) in comments {
+            let on_choose = on_choose.clone();
+            menu = menu.entry(comment_list_label(&body), None, move |window, cx| {
+                on_choose(&comment, window, cx)
+            });
+        }
+        menu
+    })
 }
 
 /// A comment as it is written into the agent's prompt.
@@ -170,29 +197,62 @@ pub struct TerminalComment {
     /// When the text shows in more than one place, the place closest to this
     /// row is taken.
     pub first_row: i64,
-    /// The column the commented text starts at on `first_row`, for a
-    /// comment on part of a line. Such a comment is only found where it was
-    /// made, so it never moves to the same text elsewhere.
-    pub start_column: Option<usize>,
-    pub kind: TerminalCommentKind,
-    /// The commented text, kept as it was when the comment was made. Text
-    /// picked in separate places is joined with lines of `…` between.
+    /// The commented text, kept as it was when the comment was made.
     pub quoted_text: String,
+    /// The first commented column, when the comment leaves out text before
+    /// it on its line. Only used to choose between places a short text shows
+    /// on the same row.
+    pub start_column: Option<usize>,
+    /// Whether the comment leaves out text after its end on its line.
+    pub end_trimmed: bool,
     pub body: String,
 }
 
-/// What a terminal comment was made on. A pick only edits a comment of its
-/// own kind, since comments on a paragraph, on one of its sentences and on
-/// its whole lines sit side by side.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalCommentKind {
-    /// Whole lines: a selection or a message.
-    Lines,
-    Paragraph,
-    Sentence,
+/// Text quoted from a terminal for a comment. See [`TerminalComment`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalQuote {
+    pub first_row: i64,
+    pub text: String,
+    pub start_column: Option<usize>,
+    pub end_trimmed: bool,
 }
 
+/// The characters of a terminal quote a row of the comment list shows.
+const MAX_COMMENT_LIST_QUOTE: usize = 24;
+
 impl TerminalComment {
+    /// The quote with "…" where it leaves out text of its first or last
+    /// line, on one line.
+    pub fn display_quote(&self) -> String {
+        let text = self
+            .quoted_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "{}{text}{}",
+            if self.start_column.is_some() {
+                "…"
+            } else {
+                ""
+            },
+            if self.end_trimmed { "…" } else { "" },
+        )
+    }
+
+    /// A row of the comment list: the quote, then the body's first line.
+    pub fn list_label(&self) -> String {
+        let quote = self.display_quote();
+        let quote = match quote.char_indices().nth(MAX_COMMENT_LIST_QUOTE) {
+            Some((end, _)) if !quote[end..].chars().all(|character| character == '…') => {
+                format!("{}…", &quote[..end])
+            }
+            _ => quote,
+        };
+        let body = self.body.lines().next().unwrap_or_default().trim();
+        format!("“{quote}” — {body}")
+    }
+
     fn payload(&self) -> CommentPayload {
         CommentPayload {
             source: CommentSource::Terminal {
@@ -275,10 +335,7 @@ impl AgentCommentStore {
     pub fn add_terminal(
         &mut self,
         terminal_id: EntityId,
-        first_row: i64,
-        start_column: Option<usize>,
-        kind: TerminalCommentKind,
-        quoted_text: String,
+        quote: TerminalQuote,
         body: String,
         cx: &mut Context<Self>,
     ) -> AgentCommentId {
@@ -286,10 +343,10 @@ impl AgentCommentStore {
         self.terminal_comments.push(TerminalComment {
             id,
             terminal_id,
-            first_row,
-            start_column,
-            kind,
-            quoted_text,
+            first_row: quote.first_row,
+            quoted_text: quote.text,
+            start_column: quote.start_column,
+            end_trimmed: quote.end_trimmed,
             body,
         });
         cx.emit(AgentCommentStoreEvent::Changed);
@@ -854,19 +911,6 @@ pub fn agent_comment_background(theme: &Theme) -> Hsla {
         .unwrap_or(theme.status().info_background)
 }
 
-/// While comments are turned off, the icons are hidden.
-fn refresh_editor_comment_buttons(
-    editor: &mut Editor,
-    show_selection_button: bool,
-    cx: &mut Context<Editor>,
-) {
-    let has_active_store = comment_store(editor.workspace().as_ref(), cx).is_some()
-        && !selection_in_historic_file(editor, cx);
-    editor.set_show_selection_comment_button(show_selection_button && has_active_store, cx);
-    let in_comment = has_active_store && comment_at_cursor(editor, cx).is_some();
-    editor.set_show_cursor_comment_button(in_comment, cx);
-}
-
 /// Whether the newest selection is in a past revision of a file, such as in a
 /// commit view, which isn't offered for comments.
 fn selection_in_historic_file(editor: &Editor, cx: &App) -> bool {
@@ -878,11 +922,11 @@ fn selection_in_historic_file(editor: &Editor, cx: &App) -> bool {
         .is_some_and(|file| matches!(file.disk_state(), DiskState::Historic { .. }))
 }
 
-/// The first comment, in document order, overlapping the newest selection.
-fn comment_at_cursor(
+/// The comments, in document order, overlapping the newest selection.
+fn comments_at_cursor(
     editor: &Editor,
     cx: &mut App,
-) -> Option<(Entity<AgentCommentStore>, BufferSnapshot, AgentComment)> {
+) -> Option<(Entity<AgentCommentStore>, BufferSnapshot, Vec<AgentComment>)> {
     let store = comment_store(editor.workspace().as_ref(), cx)?;
     let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
     let selection = editor.selections.newest_anchor().range();
@@ -895,12 +939,8 @@ fn comment_at_cursor(
             range.start.to_offset(snapshot)..range.end.to_offset(snapshot),
         ),
     };
-    let comment = store
-        .read(cx)
-        .comments_at(&snapshot, range, cx)
-        .into_iter()
-        .next()?;
-    Some((store, snapshot, comment))
+    let comments = store.read(cx).comments_at(&snapshot, range, cx);
+    Some((store, snapshot, comments))
 }
 
 /// Lines a diff shows as deleted: text of `main`'s diff base `base`.
@@ -1017,36 +1057,17 @@ pub fn init(cx: &mut App) {
             return;
         }
         let open_input = OpenInputSlot::default();
-        refresh_editor_comment_buttons(editor, true, cx);
         refresh_editor_comment_highlights(editor, cx);
         let comment_stores = AgentCommentStores::global(cx);
         cx.observe(&comment_stores, {
             let open_input = open_input.clone();
             move |editor, _, cx| {
                 close_input_if_comment_gone(&open_input, editor.workspace().as_ref(), cx);
-                refresh_editor_comment_buttons(editor, true, cx);
                 refresh_editor_comment_highlights(editor, cx)
             }
         })
         .detach();
-        let pending_selection_button: Rc<RefCell<Option<Task<()>>>> = Rc::default();
         cx.subscribe_self(move |editor, event: &EditorEvent, cx| match event {
-            EditorEvent::SelectionsChanged { local: true } => {
-                // Wait for the selection to settle, so brief accidental
-                // selections don't flash the icon.
-                refresh_editor_comment_buttons(editor, false, cx);
-                let task = cx.spawn(async move |editor, cx| {
-                    cx.background_executor()
-                        .timer(CODE_ACTIONS_DEBOUNCE_TIMEOUT)
-                        .await;
-                    editor
-                        .update(cx, |editor, cx| {
-                            refresh_editor_comment_buttons(editor, true, cx)
-                        })
-                        .log_err();
-                });
-                pending_selection_button.replace(Some(task));
-            }
             EditorEvent::BufferRangesUpdated { .. } => {
                 refresh_editor_comment_highlights(editor, cx);
             }
@@ -1055,12 +1076,31 @@ pub fn init(cx: &mut App) {
         .detach();
         let editor_handle = cx.entity().downgrade();
         editor
-            .register_action(move |_: &ToggleComment, window, cx| {
-                editor_handle
-                    .update(cx, |editor, cx| {
-                        toggle_editor_comment(editor, &open_input, window, cx)
-                    })
-                    .log_err();
+            .register_action_renderer(move |editor, window, cx| {
+                let has_open_input = open_input.borrow().is_some();
+                // Hidden from the command palette where it can't comment,
+                // but kept while an input is open so the action can close it.
+                if !has_open_input
+                    && (comment_store(editor.workspace().as_ref(), cx).is_none()
+                        || selection_in_historic_file(editor, cx))
+                {
+                    return;
+                }
+                let editor_handle = editor_handle.clone();
+                let open_input = open_input.clone();
+                window.on_action(
+                    std::any::TypeId::of::<ToggleComment>(),
+                    move |_, phase, window, cx| {
+                        if phase != gpui::DispatchPhase::Bubble {
+                            return;
+                        }
+                        editor_handle
+                            .update(cx, |editor, cx| {
+                                toggle_editor_comment(editor, &open_input, window, cx)
+                            })
+                            .log_err();
+                    },
+                );
             })
             .detach();
     })
@@ -1108,18 +1148,21 @@ fn close_input_if_comment_gone(
     input.update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
 }
 
-/// Closes the open comment input, or else comments on the selection, or
-/// else opens the comment under the cursor.
+/// Closes the open comment input when nothing is written in it, or else
+/// applies the overlap rule to the newest selection: edits the one comment
+/// it touches, lists the comments when it touches several, or else comments
+/// on the selection, or on the cursor's line when the selection is empty.
 fn toggle_editor_comment(
     editor: &mut Editor,
     open_input: &OpenInputSlot,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let open = open_input.borrow_mut().take();
-    if let Some(open) = open {
-        open.input
-            .update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
+    let open = open_input.borrow().as_ref().map(|open| open.input.clone());
+    if let Some(input) = open {
+        if input.read(cx).is_empty(cx) {
+            input.update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
+        }
         return;
     }
     if comment_store(editor.workspace().as_ref(), cx).is_none()
@@ -1129,10 +1172,19 @@ fn toggle_editor_comment(
     }
     let display_snapshot = editor.display_snapshot(cx);
     let selection = editor.selections.newest::<BufferPoint>(&display_snapshot);
-    // Comments can't overlap, so a selection touching one edits it instead.
-    if selection.is_empty() || comment_at_cursor(editor, cx).is_some() {
-        edit_comment_at_cursor(editor, open_input, window, cx);
+    let Some((store, snapshot, comments)) = comments_at_cursor(editor, cx) else {
         return;
+    };
+    match CommentOverlap::new(comments) {
+        CommentOverlap::One(comment) => {
+            edit_comment(editor, store, &snapshot, comment, open_input, window, cx);
+            return;
+        }
+        CommentOverlap::Many(comments) => {
+            show_editor_comment_list(editor, store, snapshot, comments, open_input, window, cx);
+            return;
+        }
+        CommentOverlap::None => {}
     }
     let multi_buffer_snapshot = display_snapshot.buffer_snapshot();
     let selection_range = editor.selections.newest_anchor().range();
@@ -1141,16 +1193,24 @@ fn toggle_editor_comment(
     else {
         return;
     };
-    if let Some(removed_lines) =
+    if let Some(mut removed_lines) =
         removed_lines_in_range(editor, &selection_range, buffer_snapshot, &range, cx)
     {
+        if selection.is_empty() {
+            let base_snapshot = removed_lines.base.read(cx).snapshot();
+            removed_lines.range = line_range(&base_snapshot, removed_lines.range.start);
+        }
         comment_on_removed_lines(editor, removed_lines, open_input, window, cx);
         return;
     }
     let Some(buffer) = editor.buffer().read(cx).buffer(buffer_snapshot.remote_id()) else {
         return;
     };
-    let offset_range = range.start.to_offset(buffer_snapshot)..range.end.to_offset(buffer_snapshot);
+    let offset_range = if selection.is_empty() {
+        line_range(buffer_snapshot, range.start.to_offset(buffer_snapshot))
+    } else {
+        range.start.to_offset(buffer_snapshot)..range.end.to_offset(buffer_snapshot)
+    };
     let range = comment_anchor_range(buffer_snapshot, offset_range.clone());
     let Some(source) = code_source_for_buffer_range(buffer_snapshot, offset_range, cx) else {
         log::warn!("agent comment: selection is not in a file");
@@ -1186,6 +1246,13 @@ fn toggle_editor_comment(
             }
         },
     );
+}
+
+/// The line containing `offset`, without its newline.
+fn line_range(snapshot: &BufferSnapshot, offset: usize) -> Range<usize> {
+    let row = snapshot.offset_to_point(offset).row;
+    let start = snapshot.point_to_offset(BufferPoint::new(row, 0));
+    start..start + snapshot.line_len(row) as usize
 }
 
 /// The end of the line containing `anchor`, so an input block appears below
@@ -1295,20 +1362,61 @@ fn comment_on_removed_lines(
     );
 }
 
-fn edit_comment_at_cursor(
+/// Lists the comments the cursor touches at the cursor, to choose the one
+/// to edit.
+fn show_editor_comment_list(
     editor: &mut Editor,
+    store: Entity<AgentCommentStore>,
+    snapshot: BufferSnapshot,
+    comments: Vec<AgentComment>,
     open_input: &OpenInputSlot,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let Some((store, snapshot, comment)) = comment_at_cursor(editor, cx) else {
-        return;
-    };
+    let editor_handle = cx.entity().downgrade();
+    let open_input = open_input.clone();
+    let rows = comments
+        .into_iter()
+        .map(|comment| (comment.body.clone(), comment))
+        .collect();
+    let menu = comment_list_menu(
+        rows,
+        move |comment, window, cx| {
+            let comment = comment.clone();
+            let store = store.clone();
+            let snapshot = snapshot.clone();
+            let open_input = open_input.clone();
+            let editor_handle = editor_handle.clone();
+            // After the menu's dismissal returns focus to the editor, so the
+            // input keeps the focus it takes.
+            window.defer(cx, move |window, cx| {
+                editor_handle
+                    .update(cx, |editor, cx| {
+                        edit_comment(editor, store, &snapshot, comment, &open_input, window, cx)
+                    })
+                    .log_err();
+            });
+        },
+        window,
+        cx,
+    );
+    editor.deploy_context_menu_at_cursor(menu, window, cx);
+}
+
+fn edit_comment(
+    editor: &mut Editor,
+    store: Entity<AgentCommentStore>,
+    snapshot: &BufferSnapshot,
+    comment: AgentComment,
+    open_input: &OpenInputSlot,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
     let source = match &comment.diff_base_of {
         Some(main) => {
-            removed_lines_title_source(main, &snapshot, comment.offset_range(&snapshot), cx)
+            removed_lines_title_source(main, snapshot, comment.offset_range(snapshot), cx)
         }
-        None => code_source_for_buffer_range(&snapshot, comment.offset_range(&snapshot), cx),
+        None => code_source_for_buffer_range(snapshot, comment.offset_range(snapshot), cx),
     };
     let Some(source) = source else {
         return;
@@ -1322,7 +1430,7 @@ fn edit_comment_at_cursor(
     };
     let store = store.downgrade();
     let comment_id = comment.id;
-    let input = cx.new(|cx| CommentInput::editing(source.title(), &comment.body, window, cx));
+    let input = cx.new(|cx| CommentInput::editing(source.edit_title(), &comment.body, window, cx));
     show_input_block(
         editor,
         block_anchor,
@@ -1484,6 +1592,14 @@ impl CommentInput {
         this
     }
 
+    pub fn title(&self) -> &SharedString {
+        &self.title
+    }
+
+    pub fn is_empty(&self, cx: &App) -> bool {
+        self.editor.read(cx).text(cx).trim().is_empty()
+    }
+
     fn set_translucent_when_unfocused(&mut self, translucent: bool, cx: &mut Context<Self>) {
         self.translucent_when_unfocused = translucent;
         cx.notify();
@@ -1521,7 +1637,7 @@ impl CommentInput {
     /// Vim users press escape out of habit, so in vim normal mode escape
     /// mustn't throw away a written comment.
     fn cancel_if_empty(&mut self, _: &CancelIfEmpty, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.read(cx).text(cx).trim().is_empty() {
+        if self.is_empty(cx) {
             cx.emit(CommentInputEvent::Cancelled);
         }
     }
@@ -1677,14 +1793,10 @@ impl CommentPopover {
         Self::with_input(input, None, position, subscription, window, cx)
     }
 
-    /// Starts a new comment on text selected in a terminal. `first_row` is
-    /// described on [`TerminalComment`].
+    /// Starts a new comment on text selected in a terminal.
     pub fn new_terminal<V: 'static>(
         terminal_id: EntityId,
-        first_row: i64,
-        start_column: Option<usize>,
-        kind: TerminalCommentKind,
-        quoted_text: String,
+        quote: TerminalQuote,
         position: Point<Pixels>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -1692,7 +1804,7 @@ impl CommentPopover {
         on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
     ) -> Self {
         let source = CommentSource::Terminal {
-            text: quoted_text.clone(),
+            text: quote.text.clone(),
         };
         let input = cx.new(|cx| CommentInput::new(source.title(), window, cx));
         let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
@@ -1701,15 +1813,7 @@ impl CommentPopover {
                 && let Some(store) = comment_store(Some(&workspace), cx)
             {
                 store.update(cx, |store, cx| {
-                    store.add_terminal(
-                        terminal_id,
-                        first_row,
-                        start_column,
-                        kind,
-                        quoted_text.clone(),
-                        body.clone(),
-                        cx,
-                    )
+                    store.add_terminal(terminal_id, quote.clone(), body.clone(), cx)
                 });
                 show_comment_added_toast(&workspace, cx);
             }
@@ -1729,7 +1833,7 @@ impl CommentPopover {
     ) -> Option<Self> {
         let store = comment_store(workspace, cx)?.downgrade();
         let comment_id = comment.id;
-        let title = comment.payload().source.title();
+        let title = comment.payload().source.edit_title();
         let input = cx.new(|cx| CommentInput::editing(title, &comment.body, window, cx));
         let subscription = cx.subscribe_in(&input, window, move |view, _, event, window, cx| {
             apply_edit_event(event, &store, comment_id, cx);
@@ -1774,6 +1878,19 @@ impl CommentPopover {
         is_input_stale(self.comment_id, workspace, cx)
     }
 
+    pub fn input(&self) -> &Entity<CommentInput> {
+        &self.input
+    }
+
+    /// Closes the popover when nothing is written in it; keeps it otherwise,
+    /// so written text isn't lost.
+    pub fn cancel_if_empty(&self, cx: &mut App) {
+        if self.input.read(cx).is_empty(cx) {
+            self.input
+                .update(cx, |_, cx| cx.emit(CommentInputEvent::Cancelled));
+        }
+    }
+
     pub fn render(&self) -> impl IntoElement {
         deferred(
             anchored()
@@ -1809,6 +1926,16 @@ mod tests {
             },
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn test_edit_title() {
+        let source = CommentSource::Code {
+            path: "src/main.rs".into(),
+            rows: 2..=2,
+        };
+        assert_eq!(source.title(), "Comment on `src/main.rs:3`");
+        assert_eq!(source.edit_title(), "Edit comment on `src/main.rs:3`");
     }
 
     #[test]
@@ -2101,6 +2228,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_terminal_comment_list_label_marks_trimmed_edges() {
+        let comment =
+            |text: &str, start_column: Option<usize>, end_trimmed: bool| TerminalComment {
+                id: AgentCommentId(0),
+                terminal_id: EntityId::from(1u64),
+                first_row: 0,
+                quoted_text: text.to_string(),
+                start_column,
+                end_trimmed,
+                body: "Why?\nMore.".to_string(),
+            };
+        assert_eq!(comment("a b", None, false).list_label(), "“a b” — Why?");
+        assert_eq!(
+            comment("mismatched\ntypes", Some(7), true).list_label(),
+            "“…mismatched types…” — Why?"
+        );
+        assert_eq!(comment("tail", Some(3), false).display_quote(), "…tail");
+        assert_eq!(comment("head", None, true).display_quote(), "head…");
+        assert_eq!(
+            comment(&"x".repeat(30), None, false).list_label(),
+            format!("“{}…” — Why?", "x".repeat(MAX_COMMENT_LIST_QUOTE))
+        );
+    }
+
     fn add_terminal(
         store: &Entity<AgentCommentStore>,
         terminal_id: EntityId,
@@ -2111,10 +2263,12 @@ mod tests {
         store.update(cx, |store, cx| {
             store.add_terminal(
                 terminal_id,
-                first_row,
-                None,
-                TerminalCommentKind::Lines,
-                format!("quoted {body}"),
+                TerminalQuote {
+                    first_row,
+                    text: format!("quoted {body}"),
+                    start_column: None,
+                    end_trimmed: false,
+                },
                 body.to_string(),
                 cx,
             )
@@ -2344,15 +2498,6 @@ mod tests {
             });
         }
 
-        fn buttons(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> (bool, bool) {
-            editor.read_with(cx, |editor, _| {
-                (
-                    editor.show_selection_comment_button(),
-                    editor.show_cursor_comment_button(),
-                )
-            })
-        }
-
         fn editor_focused(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool {
             editor.update_in(cx, |editor, window, cx| {
                 editor.focus_handle(cx).is_focused(window)
@@ -2386,50 +2531,6 @@ mod tests {
                     )
                     .len()
             })
-        }
-
-        #[gpui::test]
-        async fn test_buttons_follow_selection_and_setting(cx: &mut TestAppContext) {
-            let (editor, cx) = open_editor("one two three\n", cx).await;
-
-            select(&editor, 4..7, cx);
-            cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
-            cx.run_until_parked();
-            assert_eq!(buttons(&editor, cx), (false, false), "comments are off");
-
-            let store = enable_comments(&editor, cx);
-            assert_eq!(buttons(&editor, cx), (true, false));
-
-            select(&editor, 0..3, cx);
-            assert_eq!(
-                buttons(&editor, cx),
-                (false, false),
-                "hidden while settling"
-            );
-            cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
-            cx.run_until_parked();
-            assert_eq!(buttons(&editor, cx), (true, false));
-
-            editor.update(cx, |editor, cx| {
-                let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
-                let snapshot = buffer.read(cx).snapshot();
-                let range = comment_anchor_range(&snapshot, 4..7);
-                store.update(cx, |store, cx| {
-                    store.add(buffer, range, "Two.".to_string(), cx)
-                });
-            });
-            select(&editor, 5..5, cx);
-            cx.run_until_parked();
-            assert!(buttons(&editor, cx).1, "cursor inside a comment");
-            select(&editor, 9..9, cx);
-            cx.run_until_parked();
-            assert!(!buttons(&editor, cx).1, "cursor outside a comment");
-
-            set_comments_enabled(false, cx);
-            select(&editor, 5..5, cx);
-            cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
-            cx.run_until_parked();
-            assert_eq!(buttons(&editor, cx), (false, false));
         }
 
         #[gpui::test]
@@ -2468,14 +2569,24 @@ mod tests {
             });
             assert_eq!(comment, "two");
 
-            // An open input closes on toggle.
+            // An input with text stays open on toggle; an empty one closes.
             select(&editor, 5..5, cx);
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
             assert!(!editor_focused(&editor, cx), "the cursor's comment opens");
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
+            assert!(!editor_focused(&editor, cx), "written text isn't lost");
+            cx.dispatch_action(Discard);
+            cx.run_until_parked();
             assert!(editor_focused(&editor, cx));
+            select(&editor, 9..12, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            assert!(!editor_focused(&editor, cx));
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            assert!(editor_focused(&editor, cx), "an empty input closes");
 
             // A selection overlapping a comment edits it.
             select(&editor, 6..16, cx);
@@ -2498,15 +2609,282 @@ mod tests {
             assert_eq!(bodies(&store, cx).len(), 2);
             assert_eq!(highlight_count(&editor, cx), 2);
 
-            // A cursor outside any comment does nothing.
+            // A cursor outside any comment comments on its line.
             select(&editor, 16..16, cx);
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
-            assert!(editor_focused(&editor, cx));
+            assert!(!editor_focused(&editor, cx));
+            cx.simulate_input("Four.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx).len(), 3);
+            assert_eq!(comment_text(&store, 2, cx), "four");
 
             store.update(cx, |store, cx| store.clear(cx));
             cx.run_until_parked();
             assert_eq!(highlight_count(&editor, cx), 0);
+        }
+
+        fn comment_text(
+            store: &Entity<AgentCommentStore>,
+            index: usize,
+            cx: &mut VisualTestContext,
+        ) -> String {
+            store.read_with(cx, |store, cx| {
+                let comment = &store.comments()[index];
+                let snapshot = comment.buffer.read(cx).snapshot();
+                snapshot
+                    .text_for_range(comment.offset_range(&snapshot))
+                    .collect::<String>()
+            })
+        }
+
+        #[gpui::test]
+        async fn test_cursor_on_blank_line_comments_on_it(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one\n\ntwo\n", cx).await;
+            let store = enable_comments(&editor, cx);
+
+            select(&editor, 4..4, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input("Blank.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx), ["Blank."]);
+            assert_eq!(comment_text(&store, 0, cx), "");
+            let payloads = cx.update(|_, cx| {
+                store
+                    .read(cx)
+                    .pending_comments(None, |_, _| Some("main.rs".into()), cx)
+            });
+            assert_eq!(payloads.len(), 1);
+
+            select(&editor, 4..4, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input(" Again.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(
+                bodies(&store, cx),
+                ["Blank. Again."],
+                "the cursor on the blank line edits its comment"
+            );
+        }
+
+        /// Opens the editor's right-click menu at the cursor.
+        fn open_context_menu(
+            editor: &Entity<Editor>,
+            cx: &mut VisualTestContext,
+        ) -> (Entity<ui::ContextMenu>, Vec<SharedString>) {
+            let focus_handle = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+            cx.update(|window, cx| {
+                focus_handle.dispatch_action(&editor::actions::OpenContextMenu, window, cx)
+            });
+            cx.run_until_parked();
+            let menu = editor
+                .read_with(cx, |editor, _| editor.mouse_context_menu_entity())
+                .expect("the context menu should open");
+            let labels = menu.read_with(cx, |menu, _| menu.entry_labels());
+            (menu, labels)
+        }
+
+        fn close_context_menu(menu: &Entity<ui::ContextMenu>, cx: &mut VisualTestContext) {
+            menu.update_in(cx, |menu, window, cx| menu.cancel(&menu::Cancel, window, cx));
+            cx.run_until_parked();
+        }
+
+        const COMMENT_ENTRY: &str = "Comment for Agent";
+
+        fn has_comment_entry(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool {
+            let (menu, labels) = open_context_menu(editor, cx);
+            close_context_menu(&menu, cx);
+            labels.iter().any(|label| label.as_ref() == COMMENT_ENTRY)
+        }
+
+        /// Runs the "Comment for Agent" entry of the right-click menu.
+        fn run_comment_entry(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+            let (menu, labels) = open_context_menu(editor, cx);
+            let index = labels
+                .iter()
+                .position(|label| label.as_ref() == COMMENT_ENTRY)
+                .expect("the menu should have the comment entry");
+            menu.update_in(cx, |menu, window, cx| {
+                menu.select_first(&menu::SelectFirst, window, cx);
+                for _ in 0..index {
+                    menu.select_next(&menu::SelectNext, window, cx);
+                }
+                menu.confirm(&menu::Confirm, window, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        async fn test_context_menu_comment_entry(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+
+            select(&editor, 4..7, cx);
+            assert!(!has_comment_entry(&editor, cx), "comments are off");
+
+            let store = enable_comments(&editor, cx);
+            select(&editor, 9..9, cx);
+            assert!(has_comment_entry(&editor, cx), "shown without a selection");
+
+            select(&editor, 4..7, cx);
+            run_comment_entry(&editor, cx);
+            assert!(!editor_focused(&editor, cx), "the input takes focus");
+            cx.simulate_input("Two.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx), ["Two."]);
+            assert_eq!(comment_text(&store, 0, cx), "two");
+
+            select(&editor, 5..5, cx);
+            run_comment_entry(&editor, cx);
+            cx.simulate_input(" Edited.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx), ["Two. Edited."], "the entry edits");
+
+            set_comments_enabled(false, cx);
+            assert!(!has_comment_entry(&editor, cx), "comments are off again");
+        }
+
+        /// A file shown at a past revision, as in a commit view.
+        struct HistoricFile(Arc<dyn language::File>);
+
+        impl language::File for HistoricFile {
+            fn as_local(&self) -> Option<&dyn language::LocalFile> {
+                None
+            }
+
+            fn disk_state(&self) -> DiskState {
+                DiskState::Historic { was_deleted: false }
+            }
+
+            fn path(&self) -> &Arc<util::rel_path::RelPath> {
+                self.0.path()
+            }
+
+            fn full_path(&self, cx: &App) -> PathBuf {
+                self.0.full_path(cx)
+            }
+
+            fn path_style(&self, cx: &App) -> util::paths::PathStyle {
+                self.0.path_style(cx)
+            }
+
+            fn file_name<'a>(&'a self, cx: &'a App) -> &'a str {
+                self.0.file_name(cx)
+            }
+
+            fn worktree_id(&self, cx: &App) -> settings::WorktreeId {
+                self.0.worktree_id(cx)
+            }
+
+            fn to_proto(&self, cx: &App) -> language::proto::File {
+                self.0.to_proto(cx)
+            }
+
+            fn is_private(&self) -> bool {
+                self.0.is_private()
+            }
+        }
+
+        #[gpui::test]
+        async fn test_context_menu_hides_comment_entry_in_historic_file(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+            enable_comments(&editor, cx);
+            select(&editor, 4..7, cx);
+            assert!(has_comment_entry(&editor, cx));
+
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
+                buffer.update(cx, |buffer, cx| {
+                    let file = buffer.file().expect("file").clone();
+                    buffer.file_updated(Arc::new(HistoricFile(file)), cx);
+                });
+            });
+            cx.run_until_parked();
+            assert!(!has_comment_entry(&editor, cx));
+        }
+
+        fn add_comment_at(
+            editor: &Entity<Editor>,
+            store: &Entity<AgentCommentStore>,
+            range: Range<usize>,
+            body: &str,
+            cx: &mut VisualTestContext,
+        ) {
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).as_singleton().expect("singleton");
+                let snapshot = buffer.read(cx).snapshot();
+                let range = comment_anchor_range(&snapshot, range);
+                store.update(cx, |store, cx| {
+                    store.add(buffer, range, body.to_string(), cx)
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        async fn test_toggle_comment_overlap_rule(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor("one two three\n", cx).await;
+            let store = enable_comments(&editor, cx);
+            add_comment_at(&editor, &store, 0..3, "One.", cx);
+            add_comment_at(&editor, &store, 4..7, "Two.", cx);
+
+            // A cursor at a comment's start or end edits it.
+            for cursor in [4, 7] {
+                select(&editor, cursor..cursor, cx);
+                cx.dispatch_action(ToggleComment);
+                cx.run_until_parked();
+                assert!(!editor_focused(&editor, cx), "cursor {cursor} edits");
+                cx.simulate_input("!");
+                cx.dispatch_action(Submit);
+                cx.run_until_parked();
+            }
+            assert_eq!(bodies(&store, cx), ["One.", "Two.!!"]);
+
+            // A selection touching both comments lists them.
+            select(&editor, 1..5, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            assert!(
+                editor.read_with(cx, |editor, _| editor.has_mouse_context_menu()),
+                "the comment list opens"
+            );
+            let menu = editor
+                .read_with(cx, |editor, _| editor.mouse_context_menu_entity())
+                .expect("the comment list is open");
+            menu.update_in(cx, |menu, window, cx| {
+                menu.select_first(&menu::SelectFirst, window, cx);
+                menu.confirm(&menu::Confirm, window, cx);
+            });
+            cx.run_until_parked();
+            cx.simulate_input("?");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx), ["One.?", "Two.!!"]);
+            assert_eq!(bodies(&store, cx).len(), 2, "no comment is added");
+
+            // A selection only sharing a boundary with comments touches none.
+            select(&editor, 7..8, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input("Space.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx).len(), 3);
+
+            // A selection ending at a comment's start touches none either.
+            select(&editor, 3..4, cx);
+            cx.dispatch_action(ToggleComment);
+            cx.run_until_parked();
+            cx.simulate_input("Gap.");
+            cx.dispatch_action(Submit);
+            cx.run_until_parked();
+            assert_eq!(bodies(&store, cx).len(), 4);
         }
 
         #[gpui::test]
@@ -2674,8 +3052,6 @@ mod tests {
         }
 
         fn comment_on_selection(body: &str, cx: &mut VisualTestContext) {
-            cx.executor().advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT);
-            cx.run_until_parked();
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
             cx.simulate_input(body);
@@ -2746,7 +3122,6 @@ mod tests {
 
             select(&editor, 5..5, cx);
             cx.run_until_parked();
-            assert!(buttons(&editor, cx).1, "cursor inside the comment");
 
             cx.dispatch_action(ToggleComment);
             cx.run_until_parked();
@@ -2759,6 +3134,16 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(comment_texts(&store, cx), [("old".to_string(), true)]);
             assert_eq!(bodies(&store, cx), ["Why removed? Still needed."]);
+        }
+
+        #[gpui::test]
+        async fn test_cursor_on_removed_line_comments_on_it(cx: &mut TestAppContext) {
+            let (editor, cx) = open_editor_with_diff("one\nold\ntwo\n", "one\ntwo\n", cx).await;
+            let store = enable_comments(&editor, cx);
+
+            select(&editor, 5..5, cx);
+            comment_on_selection("Why removed?", cx);
+            assert_eq!(comment_texts(&store, cx), [("old".to_string(), true)]);
         }
 
         #[gpui::test]
