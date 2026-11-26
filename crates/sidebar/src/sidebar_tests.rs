@@ -16592,3 +16592,143 @@ fn test_new_entry_options_omits_terminals_when_unsupported() {
     );
     assert_eq!(new_entry_options(false, false, Vec::new()), Vec::new());
 }
+
+#[gpui::test]
+async fn test_panel_rename_request_starts_rename_on_terminal_row(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Dev Server", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+    let group_id = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some(terminal.metadata.group_id)
+                }
+                _ => None,
+            })
+            .expect("sidebar should have a terminal entry")
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar(window, cx);
+    });
+    cx.run_until_parked();
+
+    panel.update(cx, |_panel, cx| {
+        cx.emit(AgentPanelEvent::RenameTerminalThread { group_id });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert!(multi_workspace.sidebar_open());
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        assert_eq!(sidebar.rename_target, Some(RenameTarget::Terminal(group_id)));
+        assert!(sidebar.rename_editor.focus_handle(cx).is_focused(window));
+    });
+}
+
+#[gpui::test]
+async fn test_panel_rename_request_expands_collapsed_group(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Dev Server", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+    let group_id = panel.read_with(cx, |panel, cx| {
+        panel
+            .terminals(cx)
+            .into_iter()
+            .find(|terminal| terminal.id == terminal_id)
+            .map(|terminal| terminal.group_id)
+            .expect("terminal should be in the panel")
+    });
+
+    let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.toggle_collapse(&project_group_key, window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(
+            !sidebar
+                .contents
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, ListEntry::Terminal(_)))
+        );
+    });
+
+    panel.update(cx, |_panel, cx| {
+        cx.emit(AgentPanelEvent::RenameTerminalThread { group_id });
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_eq!(sidebar.rename_target, Some(RenameTarget::Terminal(group_id)));
+    });
+}
+
+#[gpui::test]
+async fn test_panel_rename_request_clears_hiding_filter(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Dev Server", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+    let group_id = panel.read_with(cx, |panel, cx| {
+        panel
+            .terminals(cx)
+            .into_iter()
+            .find(|terminal| terminal.id == terminal_id)
+            .map(|terminal| terminal.group_id)
+            .expect("terminal should be in the panel")
+    });
+
+    type_in_search(&sidebar, "zzz-no-match", cx);
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(
+            !sidebar
+                .contents
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, ListEntry::Terminal(_)))
+        );
+    });
+
+    panel.update(cx, |_panel, cx| {
+        cx.emit(AgentPanelEvent::RenameTerminalThread { group_id });
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, cx| {
+        assert!(!sidebar.has_filter_query(cx));
+        assert_eq!(sidebar.rename_target, Some(RenameTarget::Terminal(group_id)));
+    });
+}

@@ -1360,6 +1360,11 @@ impl Sidebar {
                     this.record_thread_interacted(thread_id, cx);
                     this.schedule_update_entries(false, cx);
                 }
+                AgentPanelEvent::RenameTerminalThread { group_id } => {
+                    if let Some(workspace) = workspace.upgrade() {
+                        this.rename_terminal_thread(*group_id, &workspace, window, cx);
+                    }
+                }
             },
         )
         .detach();
@@ -6167,6 +6172,60 @@ impl Sidebar {
             return;
         };
         self.start_renaming_entry(ix, target, title, window, cx);
+    }
+
+    fn rename_terminal_thread(
+        &mut self,
+        group_id: TerminalId,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let find_row = |this: &Self| {
+            this.contents
+                .entries
+                .iter()
+                .enumerate()
+                .find_map(|(ix, entry)| match RenameTarget::from_entry(entry) {
+                    Some((RenameTarget::Terminal(id), title)) if id == group_id => {
+                        Some((ix, title))
+                    }
+                    _ => None,
+                })
+        };
+        let row = match find_row(self) {
+            Some(row) => Some(row),
+            None => {
+                // A collapsed project group or a filter query hides the row.
+                let key = workspace.read(cx).project_group_key(cx);
+                let collapsed = self.is_group_collapsed(&key, cx);
+                if collapsed {
+                    self.set_group_expanded(&key, true, cx);
+                }
+                let filtered = self.reset_filter_editor_text(window, cx);
+                if collapsed || filtered {
+                    self.update_entries(cx);
+                    find_row(self)
+                } else {
+                    None
+                }
+            }
+        };
+        let Some((ix, title)) = row else {
+            log::warn!("no sidebar row to rename terminal thread {group_id:?}");
+            return;
+        };
+        // Opening the sidebar reads this sidebar, so it waits for this update to end.
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            window.defer(cx, move |_window, cx| {
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    if !multi_workspace.sidebar_open() {
+                        multi_workspace.open_sidebar(cx);
+                    }
+                });
+            });
+        }
+        self.start_renaming_entry(ix, RenameTarget::Terminal(group_id), title, window, cx);
     }
 
     fn record_thread_access(&mut self, id: &ThreadId) {

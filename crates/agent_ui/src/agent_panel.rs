@@ -3282,18 +3282,19 @@ impl AgentPanel {
             });
         }
         self.normalize_group_split(group_id, cx);
-        // Without a tab strip, a tab rename would show as the thread title.
+        // A lone tab's header names the tab, so a thread rename there would
+        // look like a tab rename.
         if self.group_tab_count(group_id, cx) < 2 {
-            let tab_editors = self
+            let thread_editors = self
                 .loaded_group_member_ids(group_id)
                 .into_iter()
                 .filter(|member_id| {
-                    self.terminals
-                        .get(member_id)
-                        .is_some_and(|member| member.title_editor_in_tab)
+                    self.terminals.get(member_id).is_some_and(|member| {
+                        member.title_editor.is_some() && !member.title_editor_in_tab
+                    })
                 })
                 .collect::<Vec<_>>();
-            for member_id in tab_editors {
+            for member_id in thread_editors {
                 self.stop_editing_terminal_title(member_id, false, window, cx);
             }
         }
@@ -3767,6 +3768,23 @@ impl AgentPanel {
         } else {
             title
         }
+    }
+
+    /// Returns the header label and whether the header stands in for a lone
+    /// tab, which has no tab strip.
+    fn terminal_header_title(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<(SharedString, bool)> {
+        let terminal = self.terminals.get(&terminal_id)?;
+        if self.group_tab_count(terminal.group_id, cx) < 2 {
+            return Some((self.tab_title(terminal_id, cx), true));
+        }
+        let title = TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).group_display_title(terminal.group_id))
+            .unwrap_or_else(|| terminal.terminal_title(cx));
+        Some((title, false))
     }
 
     fn set_tab_placement(
@@ -4866,6 +4884,7 @@ impl AgentPanel {
                     this.dismiss_terminal_pop_up_if_visible(terminal_id, window, cx);
                 }
                 AgentPanelEvent::EntryChanged
+                | AgentPanelEvent::RenameTerminalThread { .. }
                 | AgentPanelEvent::TerminalCloseRequested { .. }
                 | AgentPanelEvent::ThreadInteracted { .. } => {}
             }
@@ -7162,6 +7181,7 @@ pub enum AgentPanelEvent {
     ActiveViewChanged,
     ActiveViewFocused,
     EntryChanged,
+    RenameTerminalThread { group_id: TerminalId },
     TerminalCloseRequested { metadata: TerminalThreadMetadata },
     ThreadInteracted { thread_id: ThreadId },
 }
@@ -7654,19 +7674,13 @@ impl AgentPanel {
                 }
             }
             VisibleSurface::Terminal(_) => {
-                if let Some((terminal_id, title_editor, title)) =
+                if let Some((terminal_id, title_editor, (title, lone_tab))) =
                     self.target_terminal_id(cx).and_then(|terminal_id| {
-                        self.terminals.get(&terminal_id).map(|terminal| {
-                            let thread_title = TerminalThreadMetadataStore::try_global(cx)
-                                .and_then(|store| {
-                                    store.read(cx).group_display_title(terminal.group_id)
-                                });
-                            (
-                                terminal_id,
-                                terminal.title_editor.clone(),
-                                thread_title.unwrap_or_else(|| terminal.terminal_title(cx)),
-                            )
-                        })
+                        Some((
+                            terminal_id,
+                            self.terminals.get(&terminal_id)?.title_editor.clone(),
+                            self.terminal_header_title(terminal_id, cx)?,
+                        ))
                     })
                 {
                     if let Some(title_editor) = title_editor {
@@ -7690,7 +7704,7 @@ impl AgentPanel {
                             .overflow_x_scroll()
                             .child(Label::new(title).color(Color::Muted).single_line())
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_terminal_title(terminal_id, window, cx);
+                                this.start_title_edit(terminal_id, lone_tab, window, cx);
                             }))
                             .into_any_element()
                     }
@@ -10208,7 +10222,20 @@ impl Render for AgentPanel {
                 let Some(terminal_id) = this.target_terminal_id(cx) else {
                     return;
                 };
-                this.edit_terminal_title(terminal_id, window, cx);
+                let Some(group_id) = this
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.group_id)
+                else {
+                    return;
+                };
+                // A lone tab's header renames the tab, so the thread is renamed
+                // from its sidebar row.
+                if this.group_tab_count(group_id, cx) < 2 {
+                    cx.emit(AgentPanelEvent::RenameTerminalThread { group_id });
+                } else {
+                    this.edit_terminal_title(terminal_id, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_configuration(window, cx);
@@ -10701,6 +10728,8 @@ mod tests {
     use project::{Project, WorktreePaths};
     use settings::{SettingsStore, WorkingDirectory};
     use std::any::Any;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -12501,6 +12530,12 @@ mod tests {
         // The oldest terminal names the thread, so its tab is the one whose
         // rename could leak into the thread title.
         let title_before = thread_title(&mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            let (_, lone_tab) = panel
+                .terminal_header_title(terminal_ids[0], cx)
+                .expect("the header should have a title");
+            assert!(!lone_tab);
+        });
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.edit_terminal_tab_title(terminal_ids[0], window, cx);
             let terminal = &panel.terminals[&terminal_ids[0]];
@@ -12526,7 +12561,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_tab_rename_stops_when_the_tab_strip_goes(cx: &mut TestAppContext) {
+    async fn test_tab_rename_survives_when_the_tab_strip_goes(cx: &mut TestAppContext) {
         let (panel, mut cx, terminal_ids) = setup_test_terminal_tabs(cx, 2).await;
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.edit_terminal_tab_title(terminal_ids[0], window, cx);
@@ -12534,10 +12569,101 @@ mod tests {
             panel.close_terminal(terminal_ids[1], window, cx);
         });
         cx.run_until_parked();
-        panel.read_with(&cx, |panel, _cx| {
+        let editor = panel.read_with(&cx, |panel, _cx| {
             let terminal = &panel.terminals[&terminal_ids[0]];
-            assert!(terminal.title_editor.is_none());
-            assert!(!terminal.title_editor_in_tab);
+            assert!(terminal.title_editor_in_tab);
+            terminal
+                .title_editor
+                .clone()
+                .expect("the tab rename should keep going")
+        });
+        cx.update(|window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |editor, cx| editor.set_text("Server", window, cx));
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.stop_editing_terminal_title(terminal_ids[0], true, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.terminals[&terminal_ids[0]]
+                    .custom_title(cx)
+                    .as_deref(),
+                Some("Server")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_rename_stops_when_the_tab_strip_goes(cx: &mut TestAppContext) {
+        let (panel, mut cx, terminal_ids) = setup_test_terminal_tabs(cx, 2).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.edit_terminal_title(terminal_ids[0], window, cx);
+            assert!(!panel.terminals[&terminal_ids[0]].title_editor_in_tab);
+            panel.close_terminal(terminal_ids[1], window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.terminals[&terminal_ids[0]].title_editor.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_lone_terminal_thread_rename_keeps_header_title(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+        let (header_before, group_id) = panel.read_with(&cx, |panel, cx| {
+            (
+                panel.terminal_header_title(terminal_id, cx),
+                panel.terminals[&terminal_id].group_id,
+            )
+        });
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.rename_group(group_id, SharedString::from("bar"), cx)
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let header = panel.terminal_header_title(terminal_id, cx);
+            assert_eq!(header, header_before);
+            assert_eq!(header, Some((panel.tab_title(terminal_id, cx), true)));
+            assert_eq!(panel.terminals[&terminal_id].view.read(cx).custom_title(), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rename_action_on_lone_terminal_asks_the_sidebar(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+        let group_id = panel.read_with(&cx, |panel, _| panel.terminals[&terminal_id].group_id);
+        let requested = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let requested = requested.clone();
+            cx.subscribe(&panel, move |_, event: &AgentPanelEvent, _| {
+                if let AgentPanelEvent::RenameTerminalThread { group_id } = event {
+                    requested.borrow_mut().push(*group_id);
+                }
+            })
+        });
+        focus_terminal(&panel, terminal_id, &mut cx);
+        cx.dispatch_action(RenameSelectedThread);
+        cx.run_until_parked();
+        assert_eq!(*requested.borrow(), vec![group_id]);
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.terminals[&terminal_id].title_editor.is_none());
         });
     }
 
@@ -17689,6 +17815,12 @@ mod tests {
                 panel.insert_test_terminal("Dev Server", true, window, cx)
             })
             .expect("test terminal should be inserted");
+        // A lone tab renames from the sidebar; a second tab keeps the
+        // panel's thread rename.
+        insert_test_terminal_with_parent(&panel, None, Some(terminal_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(terminal_id, true, window, cx);
+        });
         cx.run_until_parked();
 
         cx.dispatch_action(RenameSelectedThread);
@@ -17742,6 +17874,12 @@ mod tests {
                 panel.insert_test_terminal("Dev Server", true, window, cx)
             })
             .expect("test terminal should be inserted");
+        // A lone tab renames from the sidebar; a second tab keeps the
+        // panel's thread rename.
+        insert_test_terminal_with_parent(&panel, None, Some(terminal_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(terminal_id, true, window, cx);
+        });
         cx.run_until_parked();
 
         cx.dispatch_action(RenameSelectedThread);
@@ -17782,6 +17920,12 @@ mod tests {
                 panel.insert_test_terminal("Server", true, window, cx)
             })
             .expect("second test terminal should be inserted");
+        // A lone tab renames from the sidebar; a second tab keeps the
+        // panel's thread rename.
+        insert_test_terminal_with_parent(&panel, None, Some(second_terminal_id), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_terminal(second_terminal_id, true, window, cx);
+        });
         cx.run_until_parked();
 
         cx.dispatch_action(RenameSelectedThread);
@@ -18197,7 +18341,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.edit_terminal_title(terminal_id, window, cx);
+            panel.start_title_edit(terminal_id, true, window, cx);
         });
         cx.run_until_parked();
 
@@ -18230,27 +18374,27 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // A lone terminal's toolbar title is the thread title, so editing it
-        // names the thread and leaves the terminal's own title alone.
+        // A lone terminal's header is its tab, so editing it names the tab
+        // and the thread keeps following the shell title.
         terminal_view.read_with(&cx, |terminal_view, _cx| {
-            assert_eq!(terminal_view.custom_title(), None);
+            assert_eq!(terminal_view.custom_title(), Some("Fix bug"));
         });
         panel.read_with(&cx, |panel, cx| {
             let metadata = panel
                 .terminal_metadata(terminal_id, cx)
                 .expect("terminal metadata should be available");
             assert_eq!(metadata.title.as_ref(), "⠋ Thinking");
-            assert_eq!(metadata.custom_title, None);
+            assert_eq!(metadata.custom_title.as_deref(), Some("Fix bug"));
             let store = TerminalThreadMetadataStore::global(cx).read(cx);
             assert_eq!(
                 store.group_display_title(metadata.group_id).as_deref(),
-                Some("⠋ Fix bug")
+                Some("⠋ Thinking")
             );
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.stop_editing_terminal_title(terminal_id, false, window, cx);
-            panel.edit_terminal_title(terminal_id, window, cx);
+            panel.start_title_edit(terminal_id, true, window, cx);
         });
         cx.run_until_parked();
 
