@@ -5985,6 +5985,69 @@ async fn test_keyboard_confirm_on_terminal_preserves_selection(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_only_dotted_row_activation_jumps_to_terminal_that_rang(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let fixture = SidebarClickFixture::new(&multi_workspace, cx);
+    let parent_id = fixture.insert_terminal("Parent", cx);
+    let child_id = fixture
+        .panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_group_member(parent_id, "Child", window, cx)
+        })
+        .expect("group member should be inserted");
+    cx.run_until_parked();
+
+    let ring_child_while_parent_active = |cx: &mut gpui::VisualTestContext| {
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.activate_terminal(parent_id, true, window, cx);
+        });
+        cx.run_until_parked();
+        fixture
+            .panel
+            .update(cx, |panel, cx| panel.emit_test_terminal_bell(child_id, cx));
+        cx.run_until_parked();
+        fixture
+            .sidebar
+            .update(cx, |sidebar, cx| sidebar.update_entries(cx));
+        cx.run_until_parked();
+        assert!(terminal_entry(&fixture.sidebar, parent_id, cx).has_notification);
+    };
+    let assert_active =
+        |expected: TerminalId, child_rang: bool, cx: &mut gpui::VisualTestContext| {
+            fixture.panel.read_with(cx, |panel, _cx| {
+                assert_eq!(panel.active_terminal_id(), Some(expected));
+            });
+            fixture
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.update_entries(cx));
+            cx.run_until_parked();
+            assert_eq!(
+                terminal_entry(&fixture.sidebar, parent_id, cx).has_notification,
+                child_rang
+            );
+        };
+
+    ring_child_while_parent_active(cx);
+    fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.cycle_thread(true, window, cx);
+    });
+    cx.run_until_parked();
+    assert_active(parent_id, true, cx);
+
+    let row_index = fixture.terminal_index(parent_id, cx);
+    fixture.select_and_focus(row_index, cx);
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    assert_active(child_id, false, cx);
+
+    ring_child_while_parent_active(cx);
+    fixture.click(fixture.terminal_index(parent_id, cx), cx);
+    assert_active(child_id, false, cx);
+}
+
+#[gpui::test]
 async fn test_keyboard_confirm_on_thread_preserves_selection(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

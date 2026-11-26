@@ -3448,14 +3448,19 @@ impl AgentPanel {
         &mut self,
         metadata: TerminalThreadMetadata,
         focus: bool,
+        jump_to_notified: bool,
         source: AgentThreadSource,
         workspace: Option<&Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(metadata) =
-            self.activate_loaded_group_or_resolve_main(metadata, focus, source, window, cx)
-        else {
+        let Some(metadata) = self.activate_loaded_group_or_resolve_main(
+            metadata,
+            focus,
+            jump_to_notified,
+            window,
+            cx,
+        ) else {
             return;
         };
 
@@ -3503,23 +3508,22 @@ impl AgentPanel {
         );
     }
 
-    /// Activates the group of `metadata` when any member is loaded. Otherwise
+    /// Activates the group of `metadata` when any member is loaded: its most
+    /// recently notified tab when `jump_to_notified` is set, else the focused
+    /// side's active tab. Otherwise
     /// returns the member to restore first: the focused side's active tab,
     /// so it survives a restart.
     fn activate_loaded_group_or_resolve_main(
         &mut self,
         metadata: TerminalThreadMetadata,
         focus: bool,
-        source: AgentThreadSource,
+        jump_to_notified: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<TerminalThreadMetadata> {
         let group_id = metadata.group_id;
         if let Some(loaded_id) = self.any_loaded_group_member(group_id) {
-            // Selecting the row (click, keyboard or thread navigation) focuses;
-            // the thread switcher preview passes through without focus and
-            // must not change the layout.
-            let notified_id = (focus && matches!(source, AgentThreadSource::Sidebar))
+            let notified_id = jump_to_notified
                 .then(|| self.most_recently_notified_member(group_id))
                 .flatten();
             let target = notified_id
@@ -4494,7 +4498,7 @@ impl AgentPanel {
             .log_err();
 
         #[cfg(not(test))]
-        self.restore_terminal(metadata, focus, source, workspace, window, cx);
+        self.restore_terminal(metadata, focus, false, source, workspace, window, cx);
     }
 
     fn terminal_restore_working_directory(
@@ -10558,7 +10562,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let Some(metadata) =
-            self.activate_loaded_group_or_resolve_main(metadata, focus, source, window, cx)
+            self.activate_loaded_group_or_resolve_main(metadata, focus, false, window, cx)
         else {
             return Ok(());
         };
@@ -11825,6 +11829,7 @@ mod tests {
             panel.restore_terminal(
                 child_metadata,
                 true,
+                false,
                 AgentThreadSource::Sidebar,
                 None,
                 window,
@@ -11888,6 +11893,7 @@ mod tests {
             panel.restore_terminal(
                 child_metadata,
                 true,
+                false,
                 AgentThreadSource::Sidebar,
                 None,
                 window,
@@ -11993,6 +11999,7 @@ mod tests {
             panel.restore_terminal(
                 child_terminal_metadata(child_id, parent_id),
                 true,
+                false,
                 AgentThreadSource::Sidebar,
                 None,
                 window,
@@ -12033,6 +12040,7 @@ mod tests {
             panel.restore_terminal(
                 parent_metadata,
                 true,
+                false,
                 AgentThreadSource::Sidebar,
                 None,
                 window,
@@ -12044,6 +12052,7 @@ mod tests {
             panel.restore_terminal(
                 child_terminal_metadata(child_id, parent_id),
                 true,
+                false,
                 AgentThreadSource::Sidebar,
                 None,
                 window,
@@ -12095,7 +12104,15 @@ mod tests {
                 window,
                 cx,
             );
-            panel.restore_terminal(metadata, true, AgentThreadSource::Sidebar, None, window, cx);
+            panel.restore_terminal(
+                metadata,
+                true,
+                false,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
             assert!(
                 panel.test_terminal_spawn_gate.is_none(),
                 "the gate should only have been taken by the first spawn"
@@ -12427,12 +12444,51 @@ mod tests {
             })
             .unwrap();
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.restore_terminal(metadata, true, AgentThreadSource::Sidebar, None, window, cx);
+            panel.restore_terminal(
+                metadata,
+                true,
+                true,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         panel.read_with(&cx, |panel, _| {
             assert_eq!(panel.active_terminal_id(), Some(terminal_ids[2]));
             assert!(panel.terminals[&terminal_ids[1]].has_notification);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restore_without_jump_keeps_last_active_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx, terminal_ids) = setup_test_terminal_tabs(cx, 3).await;
+        focus_terminal(&panel, terminal_ids[0], &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.emit_test_terminal_bell(terminal_ids[2], cx)
+        });
+        cx.run_until_parked();
+        let metadata = panel
+            .read_with(&cx, |panel, cx| {
+                panel.terminal_metadata(terminal_ids[0], cx)
+            })
+            .unwrap();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.restore_terminal(
+                metadata,
+                true,
+                false,
+                AgentThreadSource::Sidebar,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.active_terminal_id(), Some(terminal_ids[0]));
+            assert!(panel.terminals[&terminal_ids[2]].has_notification);
         });
     }
 
@@ -12825,13 +12881,7 @@ mod tests {
         });
         panel.update_in(&mut cx, |panel, window, cx| {
             let resolved = panel
-                .activate_loaded_group_or_resolve_main(
-                    metadata,
-                    true,
-                    AgentThreadSource::Sidebar,
-                    window,
-                    cx,
-                )
+                .activate_loaded_group_or_resolve_main(metadata, true, false, window, cx)
                 .expect("nothing is loaded, so a member should be restored");
             assert_eq!(resolved.terminal_id, right_id);
         });

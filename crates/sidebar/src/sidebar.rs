@@ -454,6 +454,19 @@ struct TerminalEntry {
     highlight_positions: Vec<usize>,
 }
 
+impl TerminalEntry {
+    fn row_glyph(&self) -> Option<SharedString> {
+        let own_glyph =
+            split_leading_icon_char(&self.metadata.display_title(), &[]).map(|(glyph, _, _)| glyph);
+        terminal_row_glyph(own_glyph, &self.member_glyphs)
+    }
+
+    /// Whether the row shows its bell dot.
+    fn row_notified(&self) -> bool {
+        terminal_row_notified(self.has_notification, self.row_glyph().as_ref())
+    }
+}
+
 impl ThreadEntry {
     /// Updates this thread entry with active thread information.
     ///
@@ -3875,7 +3888,8 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
-                self.activate_terminal_entry(metadata, workspace, false, window, cx);
+                let notified = terminal.row_notified();
+                self.activate_terminal_entry(metadata, workspace, false, notified, window, cx);
             }
         }
     }
@@ -4786,6 +4800,7 @@ impl Sidebar {
                     metadata.clone(),
                     workspace.clone(),
                     false,
+                    false,
                     window,
                     cx,
                 );
@@ -4799,12 +4814,20 @@ impl Sidebar {
         metadata: TerminalThreadMetadata,
         workspace: ThreadEntryWorkspace,
         retain: bool,
+        jump_to_notified: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match workspace {
             ThreadEntryWorkspace::Open(workspace) => {
-                self.activate_terminal_in_workspace(&workspace, metadata, retain, window, cx);
+                self.activate_terminal_in_workspace(
+                    &workspace,
+                    metadata,
+                    retain,
+                    jump_to_notified,
+                    window,
+                    cx,
+                );
             }
             ThreadEntryWorkspace::Closed {
                 folder_paths,
@@ -4825,6 +4848,7 @@ impl Sidebar {
         workspace: &Entity<Workspace>,
         metadata: &TerminalThreadMetadata,
         focus: bool,
+        jump_to_notified: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -4838,6 +4862,7 @@ impl Sidebar {
                 panel.restore_terminal(
                     metadata.clone(),
                     focus,
+                    jump_to_notified,
                     AgentThreadSource::Sidebar,
                     workspace,
                     window,
@@ -4894,6 +4919,7 @@ impl Sidebar {
         workspace: &Entity<Workspace>,
         metadata: TerminalThreadMetadata,
         retain: bool,
+        jump_to_notified: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4914,7 +4940,14 @@ impl Sidebar {
             }
         });
 
-        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, window, cx);
+        Self::load_agent_terminal_in_workspace(
+            workspace,
+            &metadata,
+            true,
+            jump_to_notified,
+            window,
+            cx,
+        );
 
         self.update_entries(cx);
     }
@@ -4955,7 +4988,7 @@ impl Sidebar {
             remote_connection::dismiss_connection_modal(&modal_workspace, cx);
             let workspace = result?;
             this.update_in(cx, |this, window, cx| {
-                this.activate_terminal_in_workspace(&workspace, metadata, false, window, cx);
+                this.activate_terminal_in_workspace(&workspace, metadata, false, false, window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -6361,7 +6394,9 @@ impl Sidebar {
                         workspace: workspace.clone(),
                     });
                     self.update_entries(cx);
-                    Self::load_agent_terminal_in_workspace(workspace, metadata, false, window, cx);
+                    Self::load_agent_terminal_in_workspace(
+                        workspace, metadata, false, false, window, cx,
+                    );
                 }
             }
         }
@@ -6399,7 +6434,14 @@ impl Sidebar {
                 workspace,
             } => {
                 self.dismiss_thread_switcher(cx);
-                self.activate_terminal_entry(metadata.clone(), workspace.clone(), true, window, cx);
+                self.activate_terminal_entry(
+                    metadata.clone(),
+                    workspace.clone(),
+                    true,
+                    false,
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -6961,13 +7003,13 @@ impl Sidebar {
         let show_actions = is_hovered && !is_renaming;
 
         let display_title = terminal.metadata.display_title();
-        let (own_icon_char, title, highlight_positions) =
+        let (title, highlight_positions) =
             match split_leading_icon_char(&display_title, &terminal.highlight_positions) {
-                Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
-                None => (None, display_title, terminal.highlight_positions.clone()),
+                Some((_, title, positions)) => (title, positions),
+                None => (display_title, terminal.highlight_positions.clone()),
             };
-        let icon_char = terminal_row_glyph(own_icon_char, &terminal.member_glyphs);
-        let notified = terminal_row_notified(terminal.has_notification, icon_char.as_ref());
+        let icon_char = terminal.row_glyph();
+        let notified = terminal.row_notified();
         let notified_tooltip =
             (notified && !terminal.notified_member_titles.is_empty()).then(|| {
                 SharedString::from(format!(
@@ -7044,6 +7086,7 @@ impl Sidebar {
                         metadata.clone(),
                         workspace.clone(),
                         false,
+                        notified,
                         window,
                         cx,
                     );
@@ -7693,7 +7736,7 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
-                self.activate_terminal_entry(metadata, workspace, true, window, cx);
+                self.activate_terminal_entry(metadata, workspace, true, false, window, cx);
             }
             ListEntry::ProjectHeader { .. } => {}
         }
